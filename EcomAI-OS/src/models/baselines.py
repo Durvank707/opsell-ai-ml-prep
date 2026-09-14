@@ -37,3 +37,50 @@ def naive_forecast(
     )
 
     return baseline
+
+
+
+
+
+def moving_average_forecast(
+    history,
+    window=7,
+    target_column="units_sold",
+):
+    """
+    Forecast the next day's demand using a moving average.
+
+    Only historical observations available before the forecast
+    date should be provided.
+
+    Parameters
+    ----------
+    history : pandas.DataFrame
+        Historical product data.
+    window : int, default=7
+        Number of previous observations used for the forecast.
+    target_column : str, default="units_sold"
+        Demand column.
+
+    Returns
+    -------
+    float
+        Forecasted daily demand.
+    """
+
+    if target_column not in history.columns:
+        raise ValueError(
+            f"'{target_column}' column not found in history."
+        )
+
+    if len(history) < window:
+        raise ValueError(
+            f"At least {window} historical observations "
+            "are required."
+        )
+
+    return float(
+        history[target_column]
+        .tail(window)
+        .mean()
+    )
