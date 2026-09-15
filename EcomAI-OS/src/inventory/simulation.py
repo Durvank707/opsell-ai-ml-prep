@@ -754,3 +754,166 @@ def run_backtest(
         results.append(daily_result)
 
     return pd.DataFrame(results)
+
+
+
+
+
+def run_baseline_backtest(
+    product_history,
+    start_date,
+    end_date,
+    starting_stock,
+    safety_stock,
+    lead_time_days,
+    forecast_window=7,
+):
+    """
+    Run a historical inventory backtest using a moving-average forecast.
+
+    The same V1 inventory policy and simulation mechanics are used
+    as the XGBoost backtest. Only the forecasting method changes.
+    """
+
+    from src.models.baselines import moving_average_forecast
+
+    start_date = pd.Timestamp(start_date)
+    end_date = pd.Timestamp(end_date)
+
+    product_history = product_history.copy()
+    product_history["date"] = pd.to_datetime(
+        product_history["date"]
+    )
+
+    product_history = (
+        product_history
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+    backtest_days = product_history[
+        (product_history["date"] >= start_date)
+        & (product_history["date"] <= end_date)
+    ].copy()
+
+    if backtest_days.empty:
+        raise ValueError(
+            "No historical demand exists in the selected backtest period."
+        )
+
+    current_stock = int(starting_stock)
+    purchase_orders = []
+    results = []
+
+    for current_date in backtest_days["date"]:
+
+        history_before_today = product_history[
+            product_history["date"] < current_date
+        ].copy()
+
+        baseline_daily_forecast = moving_average_forecast(
+            history=history_before_today,
+            window=forecast_window,
+        )
+
+        baseline_total_forecast = (
+            baseline_daily_forecast * 30
+        )
+
+        baseline_lead_time_demand = (
+            baseline_daily_forecast * lead_time_days
+        )
+
+        arrival_qty = get_arrivals_for_date(
+            purchase_orders=purchase_orders,
+            date=current_date,
+        )
+
+        available_stock = current_stock + arrival_qty
+
+        today_rows = product_history[
+            product_history["date"] == current_date
+        ]
+
+        if today_rows.empty:
+            raise ValueError(
+                f"No historical demand found for {current_date}."
+            )
+
+        actual_demand = int(
+            today_rows["units_sold"].iloc[0]
+        )
+
+        units_fulfilled, stockout_units, closing_stock = (
+            process_daily_demand(
+                available_stock=available_stock,
+                demand=actual_demand,
+            )
+        )
+
+        inventory_position = calculate_inventory_position(
+            current_stock=closing_stock,
+            purchase_orders=purchase_orders,
+            current_date=current_date,
+        )
+
+        reorder_point = calculate_reorder_point(
+            lead_time_demand=baseline_lead_time_demand,
+            safety_stock=safety_stock,
+        )
+
+        reorder_required = should_reorder(
+            inventory_position=inventory_position,
+            reorder_point=reorder_point,
+        )
+
+        target_inventory = calculate_target_inventory(
+            total_forecast=baseline_total_forecast,
+            safety_stock=safety_stock,
+        )
+
+        order_qty = calculate_recommended_order_qty(
+            target_inventory=target_inventory,
+            inventory_position=inventory_position,
+            reorder_required=reorder_required,
+        )
+
+        order_qty = float(
+            np.asarray(order_qty).item()
+        )
+
+        new_order = None
+
+        if order_qty > 0:
+            new_order = create_purchase_order(
+                order_date=current_date,
+                quantity=int(order_qty),
+                lead_time_days=lead_time_days,
+            )
+
+            purchase_orders.append(new_order)
+
+        results.append(
+            {
+                "date": current_date,
+                "opening_stock": current_stock,
+                "arrival_qty": arrival_qty,
+                "demand": actual_demand,
+                "units_fulfilled": units_fulfilled,
+                "stockout_units": stockout_units,
+                "closing_stock": closing_stock,
+                "baseline_daily_forecast": baseline_daily_forecast,
+                "baseline_total_forecast": baseline_total_forecast,
+                "baseline_lead_time_demand": baseline_lead_time_demand,
+                "safety_stock": safety_stock,
+                "reorder_point": reorder_point,
+                "inventory_position": inventory_position,
+                "reorder_required": reorder_required,
+                "target_inventory": target_inventory,
+                "order_qty": int(order_qty),
+            }
+        )
+
+        current_stock = closing_stock
+
+    return pd.DataFrame(results)
