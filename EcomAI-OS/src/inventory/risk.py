@@ -5,29 +5,29 @@ def classify_stockout_risk(row):
     """
     Classify operational stockout risk based on
     expected stockout and replenishment timing.
-    """
 
-    # Stockout is not expected within the forecast horizon
-    if pd.isna(row["expected_stockout_date"]):
+    Risk Hierarchy:
+    - LOW: No stockout projected within horizon, or replenishment arrives
+           strictly before projected stockout.
+    - MEDIUM: Replenishment arrives on the exact day stockout is projected.
+    - HIGH: Stockout is projected and replenishment arrives after stockout,
+            or no replenishment is in transit.
+    """
+    stockout_date = row.get("expected_stockout_date")
+    replenishment_date = row.get("expected_replenishment_date")
+
+    # 1. Stockout is not expected within the forecast horizon
+    if pd.isna(stockout_date):
         return "LOW"
 
-    # Stockout is expected, but no reorder is currently triggered
-    if not row["reorder_required"]:
-        return "MEDIUM"
-
-    # Reorder is required and we know both dates
-    if (
-        pd.notna(row["expected_replenishment_date"])
-        and pd.notna(row["expected_stockout_date"])
-    ):
-        if row["expected_replenishment_date"] < row["expected_stockout_date"]:
+    # 2. Stockout is expected, check replenishment arrival timing
+    if pd.notna(replenishment_date):
+        if replenishment_date < stockout_date:
             return "LOW"
-
-        elif row["expected_replenishment_date"] == row["expected_stockout_date"]:
+        elif replenishment_date == stockout_date:
             return "MEDIUM"
-
         else:
             return "HIGH"
 
-    # Reorder required but replenishment timing is unknown
-    return "HIGH"
+    # 3. Stockout is projected and no replenishment is in transit
+    return "HIGH"
