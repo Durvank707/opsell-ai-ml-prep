@@ -1,4 +1,4 @@
-"""Pydantic schemas for EcomAI-OS API - Business-First Architecture."""
+"""Pydantic schemas for EcomAI-OS API."""
 
 from __future__ import annotations
 from typing import Optional, List, Dict, Any
@@ -26,38 +26,6 @@ class ProductInfo(BaseModel):
     stockout_risk: str = Field(description="LOW, MEDIUM, or HIGH")
     days_of_inventory: float
     historical_daily_avg: float
-    
-    # Business-first decision tags
-    decision: str = Field(description="REORDER, MONITOR, or NO_REORDER")
-    decision_badge: str = Field(description="🔴 Reorder, 🟡 Monitor, or 🟢 No Reorder")
-    recommended_order_qty: int
-    is_excess: bool
-    plain_english_insight: str
-
-
-# ---------------------------------------------------------------------------
-# Dashboard & Inventory Overview
-# ---------------------------------------------------------------------------
-
-class InventoryAlertItem(BaseModel):
-    product_id: str
-    product_name: str
-    condition: str  # "Low Stock", "Stockout Risk", "Excess Stock"
-    severity: str   # "high", "medium", "low"
-    recommended_reorder_qty: int
-    days_of_inventory: float
-    message: str
-
-
-class InventoryOverviewResponse(BaseModel):
-    total_products: int
-    products_to_reorder: int
-    stockout_risk_count: int
-    excess_inventory_count: int
-    total_inventory_value: float
-    portfolio_service_level: float
-    alerts: List[InventoryAlertItem]
-    products: List[ProductInfo]
 
 
 # ---------------------------------------------------------------------------
@@ -110,12 +78,22 @@ class ForecastResponse(BaseModel):
     baseline_total_units: float
     scenario_applied: bool
     scenario_lift_percent: Optional[float] = None
-    plain_english_summary: str
 
 
 # ---------------------------------------------------------------------------
-# Reorder & Timeline Schemas
+# Inventory Intelligence Schemas
 # ---------------------------------------------------------------------------
+
+class InventoryOverviewResponse(BaseModel):
+    total_products: int
+    total_inventory_units: int
+    total_inventory_value: float
+    high_risk_count: int
+    medium_risk_count: int
+    low_risk_count: int
+    portfolio_service_level: float
+    products: List[ProductInfo]
+
 
 class ReorderCalculateRequest(BaseModel):
     product_id: str
@@ -143,9 +121,6 @@ class ReorderRecommendation(BaseModel):
     stockout_risk: str
     expected_stockout_date: Optional[str] = None
     expected_replenishment_date: Optional[str] = None
-    decision: str
-    decision_badge: str
-    recommendation_text: str
 
 
 class StockoutTimelinePoint(BaseModel):
@@ -165,14 +140,13 @@ class StockoutTimelineResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Simulation Schemas
+# Backtest & Simulation Schemas
 # ---------------------------------------------------------------------------
 
 class BacktestRequest(BaseModel):
     product_id: str
     start_date: str = "2025-10-01"
     end_date: str = "2025-12-31"
-    policy_mode: str = Field(default="current", description="'current', 'conservative', or 'aggressive'")
     holding_cost_rate: float = 0.20
     ordering_cost_per_order: float = 500.0
     stockout_cost_per_unit: float = 1000.0
@@ -183,12 +157,14 @@ class BacktestRequest(BaseModel):
 class BacktestTrajectoryPoint(BaseModel):
     date: str
     actual_demand: int
-    policy_closing_stock: int
+    xgb_closing_stock: int
     baseline_closing_stock: int
-    policy_order_qty: int
+    xgb_order_qty: int
     baseline_order_qty: int
-    policy_stockout_units: int
+    xgb_stockout_units: int
     baseline_stockout_units: int
+    xgb_inventory_position: int
+    baseline_inventory_position: int
 
 
 class BacktestResponse(BaseModel):
@@ -197,18 +173,8 @@ class BacktestResponse(BaseModel):
     start_date: str
     end_date: str
     duration_days: int
-    policy_mode: str
     unit_cost: float
-    
-    # Clean high-level business scorecards
-    stockouts_count: int
-    excess_stock_units: int
-    service_level: float
-    total_inventory_cost: float
-    baseline_inventory_cost: float
-    cost_savings: float
-    
-    # Detailed comparisons
-    policy_metrics: Dict[str, Any]
+    xgb_metrics: Dict[str, Any]
     baseline_metrics: Dict[str, Any]
+    cost_comparison: Dict[str, Any]
     daily_trajectory: List[BacktestTrajectoryPoint]

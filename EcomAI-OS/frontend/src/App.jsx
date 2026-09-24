@@ -1,162 +1,103 @@
-import React, { useState, useEffect } from 'react';
-import Header from './components/Header';
-import Sidebar from './components/Sidebar';
-import DashboardView from './views/DashboardView';
-import InventoryTableView from './views/InventoryTableView';
-import ForecastView from './views/ForecastView';
-import SimulationView from './views/SimulationView';
-import ProductsView from './views/ProductsView';
-import SettingsView from './views/SettingsView';
-import { fetchHealth, fetchProducts, fetchInventoryOverview } from './api/client';
-import { CheckCircle2, AlertCircle } from 'lucide-react';
+import React, { Suspense, lazy, useEffect } from 'react';
+import { BrowserRouter, Routes, Route, Navigate, Outlet, useLocation } from 'react-router-dom';
+import { AuthProvider, useAuth } from './context/AuthContext';
+import { DataProvider } from './context/DataContext';
+import { ToastProvider } from './context/ToastContext';
+import ToastView from './components/ui/ToastView';
+import { FullPageLoader } from './components/ui/Skeleton';
+import AppShell from './components/layout/AppShell';
+import NotFoundPage from './pages/NotFoundPage';
+
+const LoginPage = lazy(() => import('./pages/auth/LoginPage'));
+const SignupPage = lazy(() => import('./pages/auth/SignupPage'));
+const ForgotPasswordPage = lazy(() => import('./pages/auth/ForgotPasswordPage'));
+const ResetPasswordPage = lazy(() => import('./pages/auth/ResetPasswordPage'));
+const DashboardPage = lazy(() => import('./pages/DashboardPage'));
+const InventoryPage = lazy(() => import('./pages/InventoryPage'));
+const ProductsPage = lazy(() => import('./pages/ProductsPage'));
+const ProductDetailPage = lazy(() => import('./pages/ProductDetailPage'));
+const SalesDataPage = lazy(() => import('./pages/SalesDataPage'));
+const ForecastPage = lazy(() => import('./pages/ForecastPage'));
+const RecommendationsPage = lazy(() => import('./pages/RecommendationsPage'));
+const SimulationPage = lazy(() => import('./pages/SimulationPage'));
+const SettingsPage = lazy(() => import('./pages/SettingsPage'));
+
+/** Routes that require a signed-in user. */
+function ProtectedRoute() {
+  const { user, initializing } = useAuth();
+  if (initializing) return <FullPageLoader label="Restoring your session…" />;
+  if (!user) return <Navigate to="/login" replace />;
+  return <Outlet />;
+}
+
+/** Routes that only make sense when signed out. */
+function GuestRoute() {
+  const { user, initializing } = useAuth();
+  if (initializing) return <FullPageLoader label="Restoring your session…" />;
+  if (user) return <Navigate to="/app" replace />;
+  return <Outlet />;
+}
+
+/** Root guard — send signed-in users to the app, everyone else to login. */
+function HomeRedirect() {
+  const { user, initializing } = useAuth();
+  if (initializing) return <FullPageLoader label="Restoring your session…" />;
+  return <Navigate to={user ? '/app' : '/login'} replace />;
+}
+
+/** Scroll to top on navigation (respecting hash anchors). */
+function ScrollManager() {
+  const { pathname, hash } = useLocation();
+  useEffect(() => {
+    if (hash) {
+      const el = document.querySelector(hash);
+      if (el) el.scrollIntoView({ behavior: 'smooth' });
+    } else {
+      window.scrollTo(0, 0);
+    }
+  }, [pathname, hash]);
+  return null;
+}
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('dashboard');
-  const [products, setProducts] = useState([]);
-  const [selectedProductId, setSelectedProductId] = useState('P001');
-  const [overviewData, setOverviewData] = useState(null);
-  const [backendConnected, setBackendConnected] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [toast, setToast] = useState(null);
-
-  const showToast = (message, type = 'success') => {
-    setToast({ message, type });
-    setTimeout(() => setToast(null), 3500);
-  };
-
-  const loadData = async () => {
-    try {
-      setLoading(true);
-      await fetchHealth();
-      setBackendConnected(true);
-
-      const [prods, overview] = await Promise.all([
-        fetchProducts(),
-        fetchInventoryOverview(),
-      ]);
-
-      setProducts(prods);
-      setOverviewData(overview);
-      if (prods.length > 0 && !selectedProductId) {
-        setSelectedProductId(prods[0].product_id);
-      }
-    } catch (err) {
-      console.error('Backend connection failed:', err);
-      setBackendConnected(false);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    loadData();
-  }, []);
-
-  const handleOrderPlaced = (qty) => {
-    showToast(`Purchase order for ${qty} units created successfully!`, 'success');
-    fetchInventoryOverview().then(setOverviewData).catch(console.error);
-    fetchProducts().then(setProducts).catch(console.error);
-  };
-
-  const handleSaveSettings = () => {
-    showToast('Business configuration updated successfully!', 'success');
-  };
-
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased">
-      {/* Top Header */}
-      <Header
-        alerts={overviewData?.alerts || []}
-        onSelectProduct={setSelectedProductId}
-        onNavigateTab={setActiveTab}
-      />
+    <BrowserRouter>
+      <ToastProvider>
+        <AuthProvider>
+          <DataProvider>
+            <ScrollManager />
+            <Suspense fallback={<FullPageLoader label="Loading…" />}>
+              <Routes>
+                <Route path="/" element={<HomeRedirect />} />
 
-      {/* Main Body */}
-      <div className="flex-1 flex overflow-hidden">
-        {/* Simple Sidebar */}
-        <Sidebar
-          activeTab={activeTab}
-          onTabChange={setActiveTab}
-          reorderCount={overviewData?.products_to_reorder || 0}
-        />
+                <Route element={<GuestRoute />}>
+                  <Route path="/login" element={<LoginPage />} />
+                  <Route path="/signup" element={<SignupPage />} />
+                  <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+                  <Route path="/reset-password" element={<ResetPasswordPage />} />
+                </Route>
 
-        {/* Content Area */}
-        <main className="flex-1 overflow-y-auto p-6 lg:p-8 bg-slate-950">
-          <div className="max-w-6xl mx-auto">
-            {!backendConnected && !loading && (
-              <div className="mb-6 p-4 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 shrink-0" />
-                  <span>
-                    Cannot reach FastAPI server at <code className="bg-rose-950 px-1 py-0.5 rounded">http://localhost:8000</code>.
-                  </span>
-                </div>
-                <button
-                  onClick={loadData}
-                  className="px-3 py-1 bg-rose-500 hover:bg-rose-400 text-slate-950 rounded-lg font-bold"
-                >
-                  Retry
-                </button>
-              </div>
-            )}
+                <Route element={<ProtectedRoute />}>
+                  <Route path="/app" element={<AppShell />}>
+                    <Route index element={<DashboardPage />} />
+                    <Route path="inventory" element={<InventoryPage />} />
+                    <Route path="products" element={<ProductsPage />} />
+                    <Route path="products/:productId" element={<ProductDetailPage />} />
+                    <Route path="sales" element={<SalesDataPage />} />
+                    <Route path="forecast" element={<ForecastPage />} />
+                    <Route path="recommendations" element={<RecommendationsPage />} />
+                    <Route path="simulation" element={<SimulationPage />} />
+                    <Route path="settings" element={<SettingsPage />} />
+                  </Route>
+                </Route>
 
-            {activeTab === 'dashboard' && (
-              <DashboardView
-                overviewData={overviewData}
-                onSelectProduct={setSelectedProductId}
-                onNavigateTab={setActiveTab}
-              />
-            )}
-
-            {activeTab === 'inventory' && (
-              <InventoryTableView
-                products={products}
-                selectedProductId={selectedProductId}
-                onSelectProduct={setSelectedProductId}
-                onOrderPlaced={handleOrderPlaced}
-              />
-            )}
-
-            {activeTab === 'forecast' && (
-              <ForecastView
-                products={products}
-                selectedProductId={selectedProductId}
-                onSelectProduct={setSelectedProductId}
-              />
-            )}
-
-            {activeTab === 'simulation' && (
-              <SimulationView
-                products={products}
-                selectedProductId={selectedProductId}
-                onSelectProduct={setSelectedProductId}
-              />
-            )}
-
-            {activeTab === 'products' && (
-              <ProductsView
-                products={products}
-                onSelectProduct={setSelectedProductId}
-                onNavigateTab={setActiveTab}
-              />
-            )}
-
-            {activeTab === 'settings' && (
-              <SettingsView
-                onSaveSettings={handleSaveSettings}
-              />
-            )}
-          </div>
-        </main>
-      </div>
-
-      {/* Floating Toast Notification */}
-      {toast && (
-        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-2.5 px-4 py-3 rounded-xl bg-emerald-500 text-slate-950 font-bold text-xs shadow-2xl shadow-emerald-500/20 animate-fadeIn">
-          <CheckCircle2 className="w-4 h-4" />
-          <span>{toast.message}</span>
-        </div>
-      )}
-    </div>
+                <Route path="*" element={<NotFoundPage />} />
+              </Routes>
+            </Suspense>
+            <ToastView />
+          </DataProvider>
+        </AuthProvider>
+      </ToastProvider>
+    </BrowserRouter>
   );
 }

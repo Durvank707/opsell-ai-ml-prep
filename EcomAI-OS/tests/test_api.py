@@ -21,8 +21,6 @@ def test_list_products():
     assert len(data) == 5
     product_ids = [p["product_id"] for p in data]
     assert "P001" in product_ids
-    assert "decision" in data[0]
-    assert "decision_badge" in data[0]
 
 
 def test_forecast_endpoint():
@@ -41,7 +39,6 @@ def test_forecast_endpoint():
     assert data["product_id"] == "P001"
     assert len(data["forecast_points"]) == 14
     assert data["scenario_applied"] is True
-    assert "plain_english_summary" in data
 
 
 def test_inventory_overview():
@@ -49,9 +46,8 @@ def test_inventory_overview():
     assert response.status_code == 200
     data = response.json()
     assert data["total_products"] == 5
-    assert data["total_inventory_value"] > 0
-    assert "products_to_reorder" in data
-    assert "alerts" in data
+    assert data["total_inventory_units"] > 0
+    assert data["portfolio_service_level"] > 90.0
 
 
 def test_reorder_recommendation():
@@ -61,7 +57,6 @@ def test_reorder_recommendation():
     assert data["product_id"] == "P001"
     assert "reorder_point" in data
     assert "target_inventory" in data
-    assert "recommendation_text" in data
 
 
 def test_stockout_timeline():
@@ -70,18 +65,3 @@ def test_stockout_timeline():
     data = response.json()
     assert data["product_id"] == "P001"
     assert len(data["timeline"]) == 30
-
-
-def test_simulation_policy_modes():
-    payload = {
-        "product_id": "P001",
-        "start_date": "2025-10-01",
-        "end_date": "2025-10-15",
-        "policy_mode": "conservative"
-    }
-    response = client.post("/api/simulation/backtest", json=payload)
-    assert response.status_code == 200
-    data = response.json()
-    assert data["policy_mode"] == "conservative"
-    assert "stockouts_count" in data
-    assert "service_level" in data
