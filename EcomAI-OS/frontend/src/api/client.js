@@ -1,27 +1,94 @@
-const API_BASE = '/api';
+import {
+  getAccessToken,
+  notifyAuthExpired,
+} from './tokenStore';
+
+// Vite proxies /api during local development. Set VITE_API_BASE_URL for a
+// separately hosted API; do not put a service-role key in this variable.
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/$/, '');
+
+async function readResponse(response) {
+  if (response.status === 204) return null;
+  const text = await response.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+function errorMessage(payload, fallback) {
+  if (typeof payload === 'string' && payload.trim()) return payload;
+  if (payload && typeof payload.detail === 'string' && payload.detail.trim()) {
+    return payload.detail;
+  }
+  return fallback;
+}
+
+/**
+ * Fetch a backend endpoint with optional bearer authentication.
+ *
+ * `auth: 'required'` is used for V2. `auth: 'none'` is useful for a future
+ * provider login endpoint. Existing wrappers below remain V1-compatible.
+ */
+export async function request(path, {
+  base = API_BASE,
+  auth = 'optional',
+  headers = {},
+  ...init
+} = {}) {
+  const token = getAccessToken();
+  if (auth === 'required' && !token) {
+    throw new Error('Authentication is required.');
+  }
+
+  const finalHeaders = new Headers(headers);
+  if (init.body != null && typeof init.body !== 'string' && !finalHeaders.has('Content-Type')) {
+    finalHeaders.set('Content-Type', 'application/json');
+  }
+  if (token && auth !== 'none') {
+    finalHeaders.set('Authorization', `Bearer ${token}`);
+  }
+
+  const url = /^https?:\/\//i.test(path) ? path : `${base}${path}`;
+  const response = await fetch(url, { ...init, headers: finalHeaders });
+  const payload = await readResponse(response);
+  if (response.status === 401 && token && auth !== 'none') {
+    notifyAuthExpired();
+  }
+  if (!response.ok) {
+    throw new Error(errorMessage(payload, `Request failed (${response.status})`));
+  }
+  return payload;
+}
+
+export function requestV1(path, options = {}) {
+  return request(path, { ...options, base: options.base || API_BASE });
+}
+
+export function requestV2(path, options = {}) {
+  return request(path, {
+    ...options,
+    base: options.base || `${API_BASE}/v2`,
+    auth: 'required',
+  });
+}
 
 export async function fetchHealth() {
-  const res = await fetch(`${API_BASE}/health`);
-  if (!res.ok) throw new Error('Health check failed');
-  return res.json();
+  return requestV1('/health', { auth: 'none' });
 }
 
 export async function fetchProducts() {
-  const res = await fetch(`${API_BASE}/products`);
-  if (!res.ok) throw new Error('Failed to fetch products');
-  return res.json();
+  return requestV1('/products');
 }
 
 export async function fetchProduct(productId) {
-  const res = await fetch(`${API_BASE}/products/${productId}`);
-  if (!res.ok) throw new Error(`Failed to fetch product ${productId}`);
-  return res.json();
+  return requestV1(`/products/${encodeURIComponent(productId)}`);
 }
 
 export async function fetchInventoryOverview() {
-  const res = await fetch(`${API_BASE}/inventory/overview`);
-  if (!res.ok) throw new Error('Failed to fetch inventory overview');
-  return res.json();
+  return requestV1('/inventory/overview');
 }
 
 export async function generateForecast(productId, horizon = 30, scenario = null) {
@@ -30,13 +97,10 @@ export async function generateForecast(productId, horizon = 30, scenario = null)
     horizon,
     scenario: scenario || null,
   };
-  const res = await fetch(`${API_BASE}/forecast`, {
+  return requestV1('/forecast', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) throw new Error('Failed to generate forecast');
-  return res.json();
 }
 
 export async function fetchReorderRecommendation(productId, moq = 0, packSize = 1) {
@@ -44,26 +108,42 @@ export async function fetchReorderRecommendation(productId, moq = 0, packSize = 
     moq: moq.toString(),
     pack_size: packSize.toString(),
   });
-  const res = await fetch(`${API_BASE}/inventory/reorder/${productId}?${params.toString()}`);
-  if (!res.ok) throw new Error('Failed to fetch reorder recommendation');
-  return res.json();
+  return requestV1(
+    `/inventory/reorder/${encodeURIComponent(productId)}?${params.toString()}`,
+  );
 }
 
 export async function fetchStockoutTimeline(productId) {
-  const res = await fetch(`${API_BASE}/inventory/timeline/${productId}`);
-  if (!res.ok) throw new Error('Failed to fetch stockout timeline');
-  return res.json();
+  return requestV1(`/inventory/timeline/${encodeURIComponent(productId)}`);
 }
 
 export async function runBacktest(requestPayload) {
-  const res = await fetch(`${API_BASE}/simulation/backtest`, {
+  return requestV1('/simulation/backtest', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(requestPayload),
   });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: 'Backtest failed' }));
-    throw new Error(err.detail || 'Backtest failed');
-  }
-  return res.json();
 }
+
+// Small V2 helpers used by an authenticated shell or future feature modules.
+// They intentionally require the real token store; no tenant id is derived in
+// the browser. Callers pass the server-verified user id returned by their auth
+// provider/profile response.
+export function fetchTenantOverview(userId) {
+  return requestV2(`/overview/${encodeURIComponent(userId)}`);
+}
+
+export function fetchTenantAudit(userId) {
+  return requestV2(`/audit/${encodeURIComponent(userId)}`);
+}
+
+export function createValidationJob(userId, jobType = 'validation') {
+  const params = new URLSearchParams({ user_id: userId, job_type: jobType });
+  return requestV2(`/jobs?${params.toString()}`, { method: 'POST' });
+}
+
+export function fetchJobStatus(jobId, userId) {
+  const params = new URLSearchParams({ user_id: userId });
+  return requestV2(`/jobs/${encodeURIComponent(jobId)}?${params.toString()}`);
+}
+
+export { API_BASE };

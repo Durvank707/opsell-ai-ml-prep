@@ -48,6 +48,22 @@ To connect the real API:
    Vite `/api` proxy) with the same return shapes the pages already consume.
 3. No component or page changes required.
 
+For the opt-in local FastAPI issuer, set `VITE_AUTH_MODE=backend`, enable
+`LOCAL_AUTH_ENABLED=true` in the backend environment, and use a real
+`JWT_SECRET` (32+ bytes). The backend returns a short-lived HS256 bearer token
+and `/api/auth/me` restores the session; this mode is rejected in production
+and with Supabase.
+
+For a managed identity provider, set `VITE_AUTH_MODE=external` in
+`frontend/.env.local`. The host provider can expose
+`window.__ECOMAI_OS_AUTH__` with `login`, `signup`, `logout`, and account-action
+methods, or the app can use the optional `VITE_AUTH_LOGIN_URL` /
+`VITE_AUTH_SIGNUP_URL` endpoints. Issued access tokens are kept in
+`sessionStorage` by `src/api/tokenStore.js`; `src/api/client.js` attaches them
+as `Authorization: Bearer ...` and never uses the mock hash as a JWT. The
+backend remains responsible for verifying the token and binding `sub` to the
+tenant. The default `mock` mode remains fully local.
+
 The mock layer intentionally reproduces network latency (`latency()`), so loading
 skeletons and error handling behave identically against both backends.
 
@@ -106,7 +122,10 @@ src/
 
 ## Notes
 
-- Auth is mocked via `localStorage` (see `src/services/authService.js`). Swap for JWT
-  endpoints when the backend is ready.
+- Auth is mocked via `localStorage` by default (see `src/services/authService.js`).
+  Set `VITE_AUTH_MODE=backend` only with the opt-in local FastAPI issuer, or set
+  `VITE_AUTH_MODE=external` and provide a real identity-provider adapter when
+  connecting the UI to the JWT-protected backend. Mock hashes are never sent as
+  bearer tokens.
 - Key numeric proofs (seeded deterministically): 245 products, 20 critical,
   32 to reorder, 21 overstocked, 8 stockout-risk, inventory value ≈ ₹12.4L.

@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
 import * as auth from '../services/authService';
+import { onAuthExpired } from '../api/tokenStore';
 
 const AuthContext = createContext(null);
 
@@ -19,8 +20,12 @@ export function AuthProvider({ children }) {
         if (mounted) setInitializing(false);
       }
     })();
+    const removeExpiredListener = onAuthExpired(() => {
+      if (mounted) setUser(null);
+    });
     return () => {
       mounted = false;
+      removeExpiredListener();
     };
   }, []);
 
@@ -37,8 +42,11 @@ export function AuthProvider({ children }) {
   }, []);
 
   const logout = useCallback(async () => {
-    await auth.logout();
-    setUser(null);
+    try {
+      await auth.logout();
+    } finally {
+      setUser(null);
+    }
   }, []);
 
   const refreshProfile = useCallback(async () => {
