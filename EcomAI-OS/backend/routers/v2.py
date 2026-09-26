@@ -20,6 +20,7 @@ fails the whole job) — exactly per §42/§43.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path as APIPath, Query, Response
@@ -36,6 +37,8 @@ from backend.tenant import (
 )
 from backend.contracts import contract_for
 from backend.validation import SEV_ERROR, validate_rows
+
+_logger = logging.getLogger(__name__)
 
 # Every V2 route is authenticated. Tenant-bearing route parameters and bodies
 # are checked again against the signed principal inside each handler.
@@ -204,6 +207,26 @@ class V2IngestRequest(BaseModel):
 # tenant schema, so anything else is refused rather than silently validated and
 # dropped. ``inventory`` is deliberately absent by design.
 _INGESTABLE_CONTRACTS = frozenset({"sales", "product"})
+
+
+class V2ProductUpdateRequest(BaseModel):
+    """Partial product update.
+
+    Every field is optional and only supplied fields are applied, so an update
+    can never silently reset a value the caller did not mention. ``product_id``
+    is the business key and is intentionally not updatable: renaming a product
+    would orphan its sales history.
+    """
+
+    product_name: Optional[str] = Field(default=None, min_length=1)
+    category: Optional[str] = Field(default=None, min_length=1)
+    unit_price: Optional[float] = Field(default=None, ge=0)
+    unit_cost: Optional[float] = Field(default=None, ge=0)
+    current_stock: Optional[int] = Field(default=None, ge=0)
+    open_order_qty: Optional[int] = Field(default=None, ge=0)
+    lead_time_days: Optional[int] = Field(default=None, ge=0)
+    safety_stock: Optional[float] = Field(default=None, ge=0)
+    expected_arrival_date: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +666,295 @@ async def tenant_overview(
         "sales_rows": len(ws.sales_records),
         "audit_entries": len(ws.audit),
     }
+
+
+# ---------------------------------------------------------------------------
+# Tenant read/write surface for the application UI.
+#
+# These routes are the API the frontend talks to. They read and write through
+# ``TenantWorkspace`` only, so tenant scoping, canonical validation, and
+# Supabase persistence are inherited rather than reimplemented per route.
+# ---------------------------------------------------------------------------
+
+
+def _principal_workspace(principal: AuthPrincipal, user_id: str):
+    """Resolve the tenant and open its workspace, mapping failures to HTTP."""
+
+    resolved = resolve_tenant_id(principal, user_id)
+    return get_workspace(resolved, email=principal.email)
+
+
+@router.get("/products")
+async def list_products_v2(
+    principal: AuthPrincipal = Depends(require_auth),
+    user_id: str = Query(..., min_length=1, description="Tenant id; must match the token."),
+):
+    """Every product in the caller's catalog with its derived metrics."""
+    ws = _principal_workspace(principal, user_id)
+    return {"user_id": ws.user_id, "products": ws.list_products()}
+
+
+@router.get("/products/{product_id}")
+async def get_product_v2(
+    product_id: str,
+    principal: AuthPrincipal = Depends(require_auth),
+    user_id: str = Query(..., min_length=1),
+):
+    """One product with its derived metrics."""
+    ws = _principal_workspace(principal, user_id)
+    try:
+        return ws.product_metrics(product_id)
+    except TenantIsolationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@router.patch("/products/{product_id}")
+async def update_product_v2(
+    product_id: str,
+    body: V2ProductUpdateRequest,
+    principal: AuthPrincipal = Depends(require_auth),
+    user_id: str = Query(..., min_length=1),
+):
+    """Partially update one product the caller already owns."""
+    ws = _principal_workspace(principal, user_id)
+    patch = body.model_dump(exclude_none=True, exclude_unset=True)
+    try:
+        return ws.update_product(product_id, patch)
+    except TenantIsolationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except RuntimeError as exc:
+        from backend.supabase import friendly_hint_for
+
+        raise HTTPException(status_code=503, detail=friendly_hint_for(exc)) from exc
+
+
+@router.delete("/products/{product_id}")
+async def delete_product_v2(
+    product_id: str,
+    principal: AuthPrincipal = Depends(require_auth),
+    user_id: str = Query(..., min_length=1),
+):
+    """Delete one product and the sales rows that belong to it."""
+    ws = _principal_workspace(principal, user_id)
+    try:
+        removed = ws.delete_product(product_id)
+    except TenantIsolationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except RuntimeError as exc:
+        from backend.supabase import friendly_hint_for
+
+        raise HTTPException(status_code=503, detail=friendly_hint_for(exc)) from exc
+    return {"deleted": product_id, "sales_rows_removed": removed}
+
+
+@router.get("/sales")
+async def list_sales_v2(
+    principal: AuthPrincipal = Depends(require_auth),
+    user_id: str = Query(..., min_length=1),
+    product_id: Optional[str] = Query(default=None),
+    date_from: Optional[str] = Query(default=None),
+    date_to: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    """Paginated, tenant-scoped sales records for the records table."""
+    ws = _principal_workspace(principal, user_id)
+    try:
+        return ws.list_sales(
+            product_id=product_id,
+            date_from=date_from,
+            date_to=date_to,
+            search=search,
+            limit=limit,
+            offset=offset,
+        )
+    except TenantIsolationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.get("/sales/summary")
+async def sales_summary_v2(
+    principal: AuthPrincipal = Depends(require_auth),
+    user_id: str = Query(..., min_length=1),
+):
+    """Portfolio sales totals for the signed-in tenant."""
+    ws = _principal_workspace(principal, user_id)
+    return ws.sales_summary()
+
+
+# ---------------------------------------------------------------------------
+# Demand forecasting, inventory intelligence and recommendations.
+#
+# These are read paths: rendering a page is not a decision, so none of them
+# write an audit row. The forecasts come from the same eligibility gate and
+# trained model the ingest path uses, and every row carries the label saying
+# whether it came from the model or a baseline.
+# ---------------------------------------------------------------------------
+
+
+def _intelligence_error(exc: Exception) -> HTTPException:
+    """Map a workspace failure onto the status it actually deserves.
+
+    Only a genuine persistence failure is reported as 503. Anything unexpected
+    is a bug in this code path, so it is logged and reported as 500 rather than
+    being dressed up as an upstream outage — a mislabelled 503 sends whoever is
+    on call looking at Supabase for a problem that is really here.
+    """
+    if isinstance(exc, TenantIsolationError):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=422, detail=str(exc))
+
+    from backend.supabase import SupabasePersistenceError
+
+    if isinstance(exc, SupabasePersistenceError):
+        from backend.supabase import friendly_hint_for
+
+        return HTTPException(status_code=503, detail=friendly_hint_for(exc))
+
+    _logger.exception("Unhandled error in a V2 intelligence endpoint")
+    return HTTPException(
+        status_code=500,
+        detail="The requested operation could not be completed.",
+    )
+
+
+@router.get("/forecast/portfolio")
+async def portfolio_forecast_v2(
+    principal: AuthPrincipal = Depends(require_auth),
+    user_id: str = Query(..., min_length=1),
+    horizon: int = Query(default=30, ge=1, le=180),
+    category: Optional[str] = Query(default=None),
+):
+    """Portfolio demand forecast: summed daily points plus one row per product."""
+    ws = _principal_workspace(principal, user_id)
+    try:
+        return ws.portfolio_forecast(horizon=horizon, category=category)
+    except Exception as exc:  # noqa: BLE001 - mapped to an honest status below
+        raise _intelligence_error(exc) from exc
+
+
+@router.get("/forecast/{product_id}")
+async def get_forecast_v2(
+    product_id: str,
+    principal: AuthPrincipal = Depends(require_auth),
+    user_id: str = Query(..., min_length=1),
+    horizon: int = Query(default=30, ge=1, le=180),
+):
+    """One product's demand forecast with a confidence band and trend."""
+    ws = _principal_workspace(principal, user_id)
+    try:
+        return ws.demand_forecast(product_id, horizon=horizon, audit=False)
+    except Exception as exc:  # noqa: BLE001 - mapped to an honest status below
+        raise _intelligence_error(exc) from exc
+
+
+@router.get("/inventory/overview")
+async def inventory_overview_v2(
+    principal: AuthPrincipal = Depends(require_auth),
+    user_id: str = Query(..., min_length=1),
+):
+    """Portfolio inventory KPIs, health distribution and category breakdown."""
+    ws = _principal_workspace(principal, user_id)
+    try:
+        return ws.inventory_overview()
+    except Exception as exc:  # noqa: BLE001 - mapped to an honest status below
+        raise _intelligence_error(exc) from exc
+
+
+@router.get("/inventory/reorder/{product_id}")
+async def reorder_recommendation_v2(
+    product_id: str,
+    principal: AuthPrincipal = Depends(require_auth),
+    user_id: str = Query(..., min_length=1),
+    moq: int = Query(default=0, ge=0, description="Supplier minimum order quantity."),
+    pack_size: int = Query(default=1, ge=1, description="Supplier pack / case size."),
+):
+    """Recommended order quantity for one product, with supplier batching."""
+    ws = _principal_workspace(principal, user_id)
+    try:
+        return ws.reorder_recommendation(product_id, moq=moq, pack_size=pack_size)
+    except Exception as exc:  # noqa: BLE001 - mapped to an honest status below
+        raise _intelligence_error(exc) from exc
+
+
+@router.get("/inventory/timeline/{product_id}")
+async def stockout_timeline_v2(
+    product_id: str,
+    principal: AuthPrincipal = Depends(require_auth),
+    user_id: str = Query(..., min_length=1),
+    days: int = Query(default=45, ge=1, le=180),
+):
+    """Day-by-day stock projection for one product, with and without a reorder."""
+    ws = _principal_workspace(principal, user_id)
+    try:
+        return ws.stockout_timeline(product_id, days=days)
+    except Exception as exc:  # noqa: BLE001 - mapped to an honest status below
+        raise _intelligence_error(exc) from exc
+
+
+@router.get("/recommendations")
+async def recommendations_v2(
+    principal: AuthPrincipal = Depends(require_auth),
+    user_id: str = Query(..., min_length=1),
+    category: Optional[str] = Query(default=None),
+):
+    """Ranked, plain-language inventory actions for the whole catalog."""
+    ws = _principal_workspace(principal, user_id)
+    try:
+        return ws.recommendations(category=category)
+    except Exception as exc:  # noqa: BLE001 - mapped to an honest status below
+        raise _intelligence_error(exc) from exc
+
+
+class V2BacktestRequest(BaseModel):
+    """Historical policy backtest parameters for one of the tenant's products."""
+
+    product_id: str = Field(..., min_length=1)
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    holding_cost_rate: float = Field(default=0.20, ge=0)
+    ordering_cost_per_order: float = Field(default=500.0, ge=0)
+    stockout_cost_per_unit: float = Field(default=1000.0, ge=0)
+    inventory_days: int = Field(default=5, ge=1, le=180)
+
+
+@router.post("/simulation/backtest")
+async def simulation_backtest_v2(
+    body: V2BacktestRequest,
+    principal: AuthPrincipal = Depends(require_auth),
+    user_id: str = Query(..., min_length=1),
+):
+    """Backtest the ML replenishment policy against a moving-average baseline.
+
+    Runs on this tenant's own sales history, so the comparison reflects their
+    demand rather than a shared demo dataset.
+    """
+    ws = _principal_workspace(principal, user_id)
+    try:
+        result = ws.backtest(
+            body.product_id,
+            start_date=body.start_date,
+            end_date=body.end_date,
+            holding_cost_rate=body.holding_cost_rate,
+            ordering_cost_per_order=body.ordering_cost_per_order,
+            stockout_cost_per_unit=body.stockout_cost_per_unit,
+            inventory_days=body.inventory_days,
+        )
+    except Exception as exc:  # noqa: BLE001 - mapped to an honest status below
+        raise _intelligence_error(exc) from exc
+    ws._audit("simulation_backtested", body.product_id, {
+        "start_date": result["start_date"],
+        "end_date": result["end_date"],
+        "duration_days": result["duration_days"],
+        "recommended_strategy": result["cost_comparison"]["recommended_strategy"],
+    })
+    return result
 
 
 @router.get("/audit/{user_id}")

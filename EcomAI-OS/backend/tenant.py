@@ -59,6 +59,17 @@ from backend.validation import (
 DEMO_USER_ID = "demo@ecomai.app"
 DEMO_EMAIL = "demo@ecomai.app"
 
+# Default demand-forecast horizon, in days. Matches the order-up-to policy
+# window the inventory engine is built around.
+FORECAST_HORIZON = 30
+
+# Multiplier for the lower/upper band. 1.28 is the ~80% normal interval, the
+# same confidence the rest of the application reports.
+BAND_Z = 1.28
+
+# Horizon the ML engine runs at when a caller does not ask for a specific one.
+DEFAULT_ML_HORIZON = 30
+
 
 class TenantIsolationError(PermissionError):
     """Raised when code attempts to touch another tenant's row — always a bug."""
@@ -77,6 +88,7 @@ class ProductRow:
     expected_arrival_date: Optional[str] = None
     lead_time_days: int = 7
     unit_cost: float = 0.0
+    safety_stock: float = 0.0
     created_at: str = ""
     updated_at: str = ""
 
@@ -168,6 +180,10 @@ def _product_row_payload(product: "ProductRow") -> Dict[str, Any]:
         "open_order_qty": int(product.open_order_qty),
         "unit_cost": float(product.unit_cost),
     }
+    if product.safety_stock:
+        # Only sent when the tenant actually set one; a zero would otherwise
+        # overwrite a previously stored safety stock on every re-ingest.
+        payload["safety_stock"] = float(product.safety_stock)
     if product.expected_arrival_date:
         payload["expected_arrival_date"] = product.expected_arrival_date
     return payload
@@ -213,6 +229,7 @@ def _product_row_from_hydrated(row: Dict[str, Any]) -> "ProductRow":
         expected_arrival_date=arrival,
         lead_time_days=_optional_nonnegative_int(row, "lead_time_days", 7),
         unit_cost=_optional_nonnegative_number(row, "unit_cost", 0.0),
+        safety_stock=_optional_nonnegative_number(row, "safety_stock", 0.0),
         created_at=now,
         updated_at=now,
     )
@@ -529,6 +546,7 @@ class TenantWorkspace:
             expected_arrival_date=arrival,
             lead_time_days=_optional_nonnegative_int(row, "lead_time_days", 7),
             unit_cost=_optional_nonnegative_number(row, "unit_cost", 0.0),
+            safety_stock=_optional_nonnegative_number(row, "safety_stock", 0.0),
             created_at=_now(),
             updated_at=_now(),
         )
@@ -584,6 +602,75 @@ class TenantWorkspace:
             ))
         self._audit_many(pending_audit)
         return len(prepared)
+
+    def update_product(self, product_id: str, patch: Dict[str, Any]) -> ProductRow:
+        """Apply a partial update to one of this tenant's products.
+
+        Only fields the caller actually supplied are changed, so an update can
+        never silently reset a value it did not mention. The product must
+        already exist in this workspace: this is an update, not an upsert, and
+        an unknown id is refused rather than conjuring a catalog row.
+        """
+
+        self._check_product(product_id)
+        if not isinstance(patch, dict):
+            raise ValueError("A product update must be a JSON object.")
+
+        current = self.products[product_id]
+        merged: Dict[str, Any] = {
+            "product_id": current.product_id,
+            "product_name": current.product_name,
+            "category": current.category,
+            "unit_price": current.unit_price,
+            "current_stock": current.current_stock,
+            "open_order_qty": current.open_order_qty,
+            "expected_arrival_date": current.expected_arrival_date,
+            "lead_time_days": current.lead_time_days,
+            "unit_cost": current.unit_cost,
+            "safety_stock": current.safety_stock,
+        }
+        # ``product_id`` is the business key and is deliberately immutable here;
+        # renaming a product would orphan its sales history.
+        for field in (
+            "product_name", "category", "unit_price", "current_stock",
+            "open_order_qty", "expected_arrival_date", "lead_time_days",
+            "unit_cost", "safety_stock",
+        ):
+            if field in patch:
+                merged[field] = patch[field]
+
+        updated = self._build_product_row(merged)
+        updated.created_at = current.created_at
+        self._commit_product_rows([updated])
+        return updated
+
+    def delete_product(self, product_id: str) -> int:
+        """Delete one of this tenant's products and its sales history.
+
+        The remote delete happens before local state changes, so a failed
+        delete never leaves a product that looks removed but is still durable.
+        Sales rows for the product are removed with it: they are meaningless
+        without the product they belong to.
+        """
+
+        self._check_product(product_id)
+
+        from backend.supabase import delete_product as remote_delete, supabase_enabled
+
+        if supabase_enabled():
+            remote_delete(self.user_id, product_id)
+
+        product = self.products.pop(product_id)
+        removed_sales = [
+            key for key in self.sales_records if key[0] == product_id
+        ]
+        for key in removed_sales:
+            del self.sales_records[key]
+        self._audit("product_deleted", product_id, {
+            "sales_rows_removed": len(removed_sales),
+            "product_name": product.product_name,
+        })
+        return len(removed_sales)
 
     def _prepare_sales_row(
         self, row: Dict[str, Any]
@@ -738,6 +825,8 @@ class TenantWorkspace:
         *,
         model_available: bool = True,
         history: Optional[Sequence[Dict[str, Any]]] = None,
+        audit: bool = True,
+        horizon: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Eligibility-gated forecast with an auditable, labeled fallback.
 
@@ -747,6 +836,14 @@ class TenantWorkspace:
         traceback.  When ``history`` is supplied it is treated as a transient,
         explicitly validated input for this owned product; it is never used to
         read or copy another tenant's workspace.
+
+        ``audit=False`` is for *read* paths — a dashboard rendering a portfolio
+        forecast is not a decision and must not append one audit row per
+        product. Suppressed ML failures are still reported on the result as
+        ``ml_unavailable`` so the caller can surface or aggregate them instead
+        of losing them. ``horizon`` is honoured on the ML path; the baseline
+        path always returns its own default-length series because the caller's
+        requested window has no effect on a mean.
         """
         self._check_product(product_id)
         history_warnings: List[Dict[str, Any]] = []
@@ -756,6 +853,10 @@ class TenantWorkspace:
             history, history_warnings = self._validated_request_history(
                 product_id, history
             )
+        history, derived_warnings = self._enrich_history(product_id, history)
+        if derived_warnings:
+            history_warnings = [*history_warnings, *derived_warnings]
+        requested_horizon = int(horizon) if horizon is not None else None
         product_category = self.products[product_id].category
         decision = _eligibility_for_history(
             history,
@@ -765,7 +866,7 @@ class TenantWorkspace:
 
         if decision.eligible:
             try:
-                forecast = _ml_forecast(history)
+                forecast = _ml_forecast(history, horizon=requested_horizon)
                 if not forecast:
                     raise RuntimeError("The ML forecast engine returned no forecast rows.")
                 result = {
@@ -783,14 +884,15 @@ class TenantWorkspace:
                         "The ML forecast is available, but the history is "
                         "limited; treat it as a lower-confidence estimate."
                     )
-                self._audit("forecast_generated", product_id, {
-                    "model_version": decision.model_version,
-                    "eligibility": decision.tier,
-                    "fallback_used": "ml",
-                    "confidence": decision.confidence_label,
-                    "forecast_rows": len(forecast),
-                    "decision": decision.to_dict(),
-                })
+                if audit:
+                    self._audit("forecast_generated", product_id, {
+                        "model_version": decision.model_version,
+                        "eligibility": decision.tier,
+                        "fallback_used": "ml",
+                        "confidence": decision.confidence_label,
+                        "forecast_rows": len(forecast),
+                        "decision": decision.to_dict(),
+                    })
                 if history_warnings:
                     result["history_warnings"] = history_warnings
                 return result
@@ -811,13 +913,15 @@ class TenantWorkspace:
                     "warning": "The ML forecast was unavailable for this product; "
                                "a labeled baseline estimate is shown instead.",
                 }
-                self._audit("forecast_ml_failed", product_id, {
-                    "model_version": MODEL_VERSION,
-                    "eligibility": fallback_decision.tier,
-                    "fallback_used": "baseline",
-                    "confidence": fallback_decision.confidence_label,
-                    "decision": fallback_decision.to_dict(),
-                })
+                if audit:
+                    self._audit("forecast_ml_failed", product_id, {
+                        "model_version": MODEL_VERSION,
+                        "eligibility": fallback_decision.tier,
+                        "fallback_used": "baseline",
+                        "confidence": fallback_decision.confidence_label,
+                        "decision": fallback_decision.to_dict(),
+                    })
+                result["ml_unavailable"] = True
                 if history_warnings:
                     result["history_warnings"] = history_warnings
                 return result
@@ -841,16 +945,69 @@ class TenantWorkspace:
                 "No baseline estimate was generated because the available "
                 "history did not contain a usable positive demand series."
             )
-        self._audit("forecast_generated", product_id, {
-            "model_version": decision.model_version,
-            "eligibility": decision.tier,
-            "fallback_used": decision.fallback_used,
-            "forecast_rows": len(baseline),
-            "decision": decision.to_dict(),
-        })
+        if audit:
+            self._audit("forecast_generated", product_id, {
+                "model_version": decision.model_version,
+                "eligibility": decision.tier,
+                "fallback_used": decision.fallback_used,
+                "forecast_rows": len(baseline),
+                "decision": decision.to_dict(),
+            })
         if history_warnings:
             result["history_warnings"] = history_warnings
         return result
+
+    def _enrich_history(
+        self,
+        product_id: str,
+        history: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Fill in ML feature inputs the tenant's own records already imply.
+
+        ``category``, ``price`` and ``promotion`` are optional on a sales row,
+        but the eligibility gate needs them before it will trust the model. They
+        do not need to be invented: the category and price are carried by this
+        tenant's own product record, and an unrecorded promotion is a real
+        business state ("no promotion ran") rather than missing data.
+
+        The gate itself is left untouched. If the product has no usable category
+        the row still goes in without one and the gate still refuses ML -- this
+        only stops a well-formed tenant from being permanently locked out of the
+        model. Every derived value is reported back so the caller can disclose
+        that the forecast rests on it.
+        """
+        product = self.products[product_id]
+        rows: List[Dict[str, Any]] = []
+        derived_fields: set = set()
+
+        for row in history:
+            enriched = dict(row)
+            if not str(enriched.get("category") or "").strip():
+                if product.category:
+                    enriched["category"] = product.category
+                    derived_fields.add("category")
+            if enriched.get("price") is None:
+                enriched["price"] = product.unit_price
+                derived_fields.add("price")
+            if enriched.get("promotion") is None:
+                enriched["promotion"] = False
+                derived_fields.add("promotion")
+            rows.append(enriched)
+
+        warnings: List[Dict[str, Any]] = []
+        if derived_fields:
+            names = ", ".join(sorted(derived_fields))
+            warnings.append({
+                "code": "ml_features_derived",
+                "fields": sorted(derived_fields),
+                "message": (
+                    f"{names} were taken from the product record rather than "
+                    "from each sales row, so the forecast assumes no promotion "
+                    "ran and used the listed price. Supply these per sale for "
+                    "an exact forecast."
+                ),
+            })
+        return rows, warnings
 
     def _validated_request_history(
         self,
@@ -918,7 +1075,22 @@ class TenantWorkspace:
         return normalized, history_warnings + warnings
 
     def recompute_metrics(self, product_id: str) -> Dict[str, Any]:
-        """Inventory intelligence for one product (user-scoped, decision-transparent)."""
+        """Inventory intelligence for one product (user-scoped, decision-transparent).
+
+        This is the *audited* entry point: it records that metrics were
+        recomputed. List endpoints that surface metrics for many products use
+        :meth:`product_metrics` instead, because rendering a page is not a
+        decision and must not append an audit row per product.
+        """
+        result = self.product_metrics(product_id)
+        self._audit("metrics_recomputed", product_id, {
+            "stockout_risk": result["stockout_risk"]
+        })
+        return result
+
+    def product_metrics(self, product_id: str) -> Dict[str, Any]:
+        """Read-only inventory intelligence for one product; writes nothing."""
+
         self._check_product(product_id)
         p = self.products[product_id]
         history = self.sales_history_for(product_id)
@@ -932,30 +1104,829 @@ class TenantWorkspace:
         )
         lead_days = max(p.lead_time_days, 1)
         lead_time_demand = round(daily_avg * lead_days, 2)
-        safety_stock = round(1.645 * max(daily_avg * 0.4, 0.5), 2)
+        # A tenant-supplied safety stock is authoritative; the derived value is
+        # only the fallback for a product that has never set one.
+        safety_stock = (
+            round(float(p.safety_stock), 2)
+            if p.safety_stock
+            else round(1.645 * max(daily_avg * 0.4, 0.5), 2)
+        )
         reorder_point = round(lead_time_demand + safety_stock, 2)
         inv_pos = p.inventory_position
         risk = "HIGH" if inv_pos < reorder_point else ("MEDIUM" if inv_pos < reorder_point * 1.4 else "LOW")
         days_covered = round(inv_pos / max(daily_avg, 0.0001), 1)
 
-        result = {
+        return {
             "product_id": product_id,
             "product_name": p.product_name,
             "category": p.category,
             "unit_price": p.unit_price,
+            "unit_cost": p.unit_cost,
             "current_stock": p.current_stock,
             "open_order_qty": p.open_order_qty,
             "inventory_position": inv_pos,
             "lead_time_days": p.lead_time_days,
             "daily_avg": daily_avg,
+            "lead_time_demand": lead_time_demand,
             "safety_stock": safety_stock,
             "reorder_point": reorder_point,
             "days_covered": days_covered,
             "stockout_risk": risk,
+            "expected_arrival_date": p.expected_arrival_date,
+            "updated_at": p.updated_at,
+            "history_days": len(history),
             "eligibility": decision.to_dict(),
         }
-        self._audit("metrics_recomputed", product_id, {"stockout_risk": risk})
-        return result
+
+    def list_products(self) -> List[Dict[str, Any]]:
+        """Every product in this workspace with its derived metrics attached.
+
+        Per-product metric failures are isolated: a single product that cannot
+        be scored is reported with an ``error`` marker instead of failing the
+        whole listing.
+        """
+
+        rows: List[Dict[str, Any]] = []
+        for product_id in sorted(self.products):
+            try:
+                rows.append(self.product_metrics(product_id))
+            except Exception:
+                p = self.products[product_id]
+                rows.append({
+                    "product_id": p.product_id,
+                    "product_name": p.product_name,
+                    "category": p.category,
+                    "current_stock": p.current_stock,
+                    "open_order_qty": p.open_order_qty,
+                    "inventory_position": p.inventory_position,
+                    "lead_time_days": p.lead_time_days,
+                    "unit_cost": p.unit_cost,
+                    "unit_price": p.unit_price,
+                    "expected_arrival_date": p.expected_arrival_date,
+                    "updated_at": p.updated_at,
+                    "error": "metrics_unavailable",
+                })
+        return rows
+
+    def list_sales(
+        self,
+        *,
+        product_id: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        search: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """Paginated, user-scoped sales records for the records table."""
+
+        if product_id is not None:
+            self._check_product(product_id)
+        needle = (search or "").strip().casefold()
+        selected: List[Tuple[str, str, Dict[str, Any]]] = []
+        for (pid, day), row in self.sales_records.items():
+            if product_id is not None and pid != product_id:
+                continue
+            if date_from and day < date_from:
+                continue
+            if date_to and day > date_to:
+                continue
+            if needle and needle not in f"{pid} {day} {row.get('category', '')}".casefold():
+                continue
+            selected.append((pid, day, row))
+        selected.sort(key=lambda item: (item[1], item[0]), reverse=True)
+
+        total = len(selected)
+        page = selected[max(0, offset):max(0, offset) + max(1, limit)]
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "rows": [
+                {
+                    "product_id": pid,
+                    "product_name": self.products[pid].product_name
+                    if pid in self.products else pid,
+                    **row,
+                }
+                for pid, day, row in page
+            ],
+        }
+
+    def sales_summary(self) -> Dict[str, Any]:
+        """Portfolio sales totals for the signed-in tenant."""
+
+        total_rows = len(self.sales_records)
+        units = 0
+        revenue = 0.0
+        for row in self.sales_records.values():
+            sold = int(row.get("units_sold", 0) or 0)
+            units += sold
+            price = row.get("price")
+            if isinstance(price, (int, float)):
+                revenue += sold * float(price)
+        dates = sorted({day for (_pid, day) in self.sales_records})
+        return {
+            "total_records": total_rows,
+            "total_units": units,
+            "total_revenue": round(revenue, 2),
+            "products_covered": len({
+                pid for (pid, _day) in self.sales_records
+                if pid in self.products
+            }),
+            "date_from": dates[0] if dates else None,
+            "date_to": dates[-1] if dates else None,
+        }
+
+    # -- demand forecasting -------------------------------------------------
+
+    def demand_forecast(
+        self,
+        product_id: str,
+        *,
+        horizon: Optional[int] = None,
+        audit: bool = False,
+    ) -> Dict[str, Any]:
+        """One product's demand forecast with a confidence band and trend.
+
+        Wraps the eligibility-gated :meth:`forecast_for` (so a labeled
+        baseline is used when the ML gate does not pass) and normalizes the
+        engine's output into ``{date, forecast, lower, upper}`` points. The band
+        width comes from the residual error of the product's *own* history, so a
+        volatile product is shown a wider interval than a steady one.
+        """
+        self._check_product(product_id)
+        requested = FORECAST_HORIZON if horizon is None else int(horizon)
+        horizon = max(1, min(requested, 180))
+        result = self.forecast_for(product_id, horizon=horizon, audit=audit)
+        raw_points = result.get("forecast") or []
+        history = self.sales_history_for(product_id)
+        sigma = _forecast_error_std([r.get("units_sold", 0) for r in history])
+
+        points: List[Dict[str, Any]] = []
+        for row in raw_points:
+            date = row.get("date")
+            if isinstance(date, str):
+                date = date[:10]
+            else:
+                # pandas Timestamp / datetime: keep the calendar date only.
+                date = str(date)[:10]
+            units = _as_float(
+                row.get("forecast_units", row.get("forecast_units_actual", row.get("units_sold")))
+            )
+            points.append({
+                "date": date,
+                "forecast": round(max(0.0, units), 2),
+                "lower": round(max(0.0, units - BAND_Z * sigma), 2),
+                "upper": round(max(0.0, units + BAND_Z * sigma), 2),
+            })
+
+        total = round(sum(pt["forecast"] for pt in points), 2)
+        actuals = [
+            {"date": r["date"], "units": int(r.get("units_sold", 0) or 0)}
+            for r in history[-60:]
+        ]
+        peak = max(points, key=lambda pt: pt["forecast"], default=None)
+        trend, growth_pct = _trend_from_history(history)
+
+        return {
+            "product_id": product_id,
+            "product_name": self.products[product_id].product_name,
+            "category": self.products[product_id].category,
+            "horizon": horizon,
+            "points": points,
+            "actuals": actuals,
+            "total": total,
+            "avg_daily": round(total / horizon, 2) if points else 0.0,
+            "peak_date": peak["date"] if peak else None,
+            "peak_units": peak["forecast"] if peak else None,
+            "trend": trend,
+            "growth_pct": growth_pct,
+            "error_std": round(sigma, 3),
+            "fallback_used": result.get("fallback_used"),
+            "model_version": result.get("model_version"),
+            "eligibility": result.get("eligibility"),
+            "warning": result.get("warning"),
+            "ml_unavailable": bool(result.get("ml_unavailable")),
+        }
+
+    def portfolio_forecast(
+        self,
+        *,
+        horizon: int = FORECAST_HORIZON,
+        category: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Portfolio-wide forecast: summed daily points plus per-product rows.
+
+        Products are evaluated independently, so one ineligible product is
+        skipped rather than failing the whole portfolio. Suppressed per-product
+        ML failures are aggregated into a single audit entry instead of one
+        row per product, so a broken model cannot flood the trail.
+        """
+        horizon = max(1, min(int(horizon), 180))
+        scope = sorted(
+            pid for pid in self.products
+            if category is None or self.products[pid].category == category
+        )
+
+        buckets: List[Dict[str, float]] = [
+            {"forecast": 0.0, "lower": 0.0, "upper": 0.0} for _ in range(horizon)
+        ]
+        rows: List[Dict[str, Any]] = []
+        ml_failures: List[str] = []
+        for pid in scope:
+            try:
+                fc = self.demand_forecast(pid, horizon=horizon, audit=False)
+            except Exception:
+                continue
+            if fc["ml_unavailable"]:
+                ml_failures.append(pid)
+            for index, point in enumerate(fc["points"][:horizon]):
+                buckets[index]["forecast"] += point["forecast"]
+                buckets[index]["lower"] += point["lower"]
+                buckets[index]["upper"] += point["upper"]
+            rows.append({
+                "product_id": pid,
+                "product_name": fc["product_name"],
+                "category": fc["category"],
+                "current_daily_avg": round(
+                    sum(a["units"] for a in fc["actuals"])
+                    / max(len(fc["actuals"]), 1),
+                    2,
+                ),
+                "forecast_total": fc["total"],
+                "forecast_avg_daily": fc["avg_daily"],
+                "change_pct": fc["growth_pct"],
+                "trend": fc["trend"],
+                "fallback_used": fc["fallback_used"],
+            })
+
+        if ml_failures:
+            self._audit("forecast_ml_failed", None, {
+                "model_version": MODEL_VERSION,
+                "affected_products": len(ml_failures),
+                "product_ids": ml_failures[:25],
+                "fallback_used": "baseline",
+            })
+
+        series: List[Dict[str, Any]] = []
+        for index, totals in enumerate(buckets):
+            if not any(totals.values()):
+                continue
+            anchor = self._forecast_anchor(horizon)
+            shifted = _step_days(anchor, index + 1)
+            if not shifted:
+                continue
+            series.append({
+                "date": shifted,
+                "forecast": round(totals["forecast"], 2),
+                "lower": round(totals["lower"], 2),
+                "upper": round(totals["upper"], 2),
+            })
+
+        total_units = round(sum(pt["forecast"] for pt in series), 2)
+        increasing = sum(1 for r in rows if r["trend"] == "increasing")
+        decreasing = sum(1 for r in rows if r["trend"] == "decreasing")
+        return {
+            "horizon": horizon,
+            "scope": "portfolio",
+            "category": category,
+            "points": series,
+            "actuals": self.portfolio_daily_actual(horizon),
+            "total": total_units,
+            "avg_daily": round(total_units / horizon, 2) if series else 0.0,
+            "rows": rows,
+            "products_forecast": len(rows),
+            "products_in_scope": len(scope),
+            "increasing": increasing,
+            "decreasing": decreasing,
+            "stable": len(rows) - increasing - decreasing,
+            "portfolio_trend": (
+                "increasing" if increasing > decreasing
+                else "decreasing" if decreasing > increasing
+                else "stable"
+            ),
+            "ml_unavailable_count": len(ml_failures),
+        }
+
+    def portfolio_daily_actual(self, days: int = FORECAST_HORIZON) -> List[Dict[str, Any]]:
+        """Actual daily units summed across the whole catalog, oldest first."""
+        window = max(int(days), 1)
+        totals: Dict[str, int] = {}
+        for (_pid, day), row in self.sales_records.items():
+            totals[day] = totals.get(day, 0) + int(row.get("units_sold", 0) or 0)
+        recent = sorted(totals.items())[-window:]
+        return [{"date": day, "units": units} for day, units in recent]
+
+    def _forecast_anchor(self, horizon: int) -> str:
+        """The last day with recorded sales, which forecasts project forward from."""
+
+        history = self.sales_records
+        return max((day for (_pid, day) in history), default=None) or _step_days(
+            datetime.now(timezone.utc).date().isoformat(), 0
+        )
+
+    # -- inventory intelligence ---------------------------------------------
+
+    def _inventory_state(self, product_id: str) -> Dict[str, Any]:
+        """The four-bucket health status the UI groups products by.
+
+        Mirrors the existing ``classifyStatus`` rule (critical / low /
+        overstocked / healthy) but computed from this tenant's real history and
+        any safety stock it has set, never from seeded mock values.
+        """
+
+        metrics = self.product_metrics(product_id)
+        product = self.products[product_id]
+        safety = float(metrics["safety_stock"])
+        reorder_point = float(metrics["reorder_point"])
+        horizon_forecast = self.demand_forecast(product_id, audit=False)
+        total_forecast = float(horizon_forecast["total"])
+        target = total_forecast + safety
+        stock = float(product.current_stock)
+
+        if stock <= safety:
+            status = "critical"
+        elif stock <= reorder_point:
+            status = "low"
+        elif target > 0 and stock > target * 1.35:
+            status = "overstocked"
+        else:
+            status = "healthy"
+
+        metrics.update({
+            "status": status,
+            "target_stock": round(target, 2),
+            "forecast_total": round(total_forecast, 2),
+            "forecast_avg_daily": horizon_forecast["avg_daily"],
+            "trend": horizon_forecast["trend"],
+            "growth_pct": horizon_forecast["growth_pct"],
+            "forecast_error_std": horizon_forecast["error_std"],
+            "fallback_used": horizon_forecast["fallback_used"],
+            "eligibility": horizon_forecast["eligibility"],
+        })
+        return metrics
+
+    def inventory_overview(self) -> Dict[str, Any]:
+        """Portfolio KPIs, health distribution and category breakdown."""
+
+        products: List[Dict[str, Any]] = []
+        for product_id in sorted(self.products):
+            try:
+                products.append(self._inventory_state(product_id))
+            except Exception:
+                continue
+
+        buckets = {name: [] for name in ("critical", "low", "overstocked", "healthy")}
+        for row in products:
+            buckets.get(row.get("status"), buckets["healthy"]).append(row)
+
+        total_units = sum(int(self.products[r["product_id"]].current_stock) for r in products)
+        total_value = sum(
+            int(self.products[r["product_id"]].current_stock) * float(r.get("unit_cost") or 0.0)
+            for r in products
+        )
+        at_risk = [r for r in products if r.get("stockout_risk") in {"HIGH", "MEDIUM"}]
+
+        categories: Dict[str, Dict[str, Any]] = {}
+        for row in products:
+            name = row.get("category") or "Uncategorised"
+            entry = categories.setdefault(
+                name, {"category": name, "products": 0, "units": 0, "value": 0.0, "critical": 0}
+            )
+            entry["products"] += 1
+            entry["units"] += int(self.products[row["product_id"]].current_stock)
+            entry["value"] += int(self.products[row["product_id"]].current_stock) * float(
+                row.get("unit_cost") or 0.0
+            )
+            if row.get("status") == "critical":
+                entry["critical"] += 1
+
+        return {
+            "user_id": self.user_id,
+            "kpis": {
+                "total_products": len(products),
+                "products_to_reorder": len(buckets["low"]),
+                "stockout_risk": len(at_risk),
+                "excess_inventory": len(buckets["overstocked"]),
+                "inventory_value": round(total_value, 2),
+                "total_units": total_units,
+            },
+            "health": {
+                "healthy": len(buckets["healthy"]) + len(buckets["overstocked"]),
+                "at_risk": len(buckets["low"]),
+                "critical": len(buckets["critical"]),
+                "total": len(products),
+            },
+            "buckets": {name: rows for name, rows in buckets.items()},
+            "categories": [
+                {**entry, "value": round(entry["value"], 2)}
+                for entry in sorted(categories.values(), key=lambda e: e["category"])
+            ],
+            "ml_unavailable_count": sum(1 for r in products if r.get("fallback_used") == "baseline"),
+        }
+
+    def stockout_timeline(
+        self, product_id: str, *, days: int = 45
+    ) -> Dict[str, Any]:
+        """Day-by-day stock depletion for one product, with/without a reorder.
+
+        Both paths are projected from the same demand series: ``with_reorder``
+        places a single order at the reorder point, ``without_reorder`` never
+        reorders. The divergence is what tells a user whether waiting matters.
+        """
+
+        state = self._inventory_state(product_id)
+        product = self.products[product_id]
+        history = self.sales_history_for(product_id)
+        days = max(1, min(int(days), 180))
+        forecast = self.demand_forecast(product_id, audit=False)
+
+        anchor = self._forecast_anchor(days)
+        recent_units = [int(r.get("units_sold", 0) or 0) for r in history[-7:]]
+        past_average = (
+            round(sum(recent_units) / len(recent_units), 2) if recent_units else 0.0
+        )
+
+        def demand_at(offset: int) -> float:
+            if offset < 0:
+                index = len(history) + offset
+                if -len(history) <= index < 0:
+                    return float(history[index].get("units_sold", 0) or 0)
+                return past_average
+            if offset < len(forecast["points"]):
+                return float(forecast["points"][offset]["forecast"])
+            return past_average or float(forecast["avg_daily"])
+
+        points: List[Dict[str, Any]] = []
+        with_stock = float(product.current_stock)
+        without_stock = float(product.inventory_position)
+        reordered = False
+        reorder_date: Optional[str] = None
+        depletion_date: Optional[str] = None
+
+        for offset in range(-7, days):
+            day = _step_days(anchor, offset)
+            if not day:
+                continue
+            demand = max(0.0, demand_at(offset))
+            if (
+                not reordered
+                and offset >= 0
+                and float(state["inventory_position"]) <= float(state["reorder_point"])
+            ):
+                reordered = True
+                reorder_date = day
+                with_stock = float(state["target_stock"])
+            with_stock = max(0.0, with_stock - demand)
+            without_stock = max(0.0, without_stock - demand)
+            if without_stock <= 0 and depletion_date is None and offset >= 0:
+                depletion_date = day
+            points.append({
+                "date": day,
+                "stock": round(with_stock, 2),
+                "stock_without_reorder": round(without_stock, 2),
+                "demand": round(demand, 2),
+            })
+
+        return {
+            "product_id": product_id,
+            "product_name": product.product_name,
+            "points": points,
+            "current_stock": product.current_stock,
+            "inventory_position": product.inventory_position,
+            "reorder_point": round(float(state["reorder_point"]), 2),
+            "safety_stock": round(float(state["safety_stock"]), 2),
+            "target_stock": round(float(state["target_stock"]), 2),
+            "status": state["status"],
+            "expected_depletion": depletion_date,
+            "reorder_placed_on": reorder_date,
+            "past_average": past_average,
+            "days_of_cover": state.get("days_covered"),
+        }
+
+    def reorder_recommendation(
+        self,
+        product_id: str,
+        *,
+        moq: int = 0,
+        pack_size: int = 1,
+    ) -> Dict[str, Any]:
+        """Recommended order quantity, using the shared inventory policy."""
+
+        from src.inventory.policy import (
+            calculate_recommended_order_qty,
+            calculate_target_inventory,
+        )
+        from src.inventory.reorder import should_reorder
+
+        state = self._inventory_state(product_id)
+        product = self.products[product_id]
+        position = float(product.inventory_position)
+        reorder_point = float(state["reorder_point"])
+        reorder_required = bool(should_reorder(position, reorder_point))
+        target = float(calculate_target_inventory(state["forecast_total"], state["safety_stock"]))
+        quantity = float(
+            calculate_recommended_order_qty(
+                target_inventory=target,
+                inventory_position=position,
+                reorder_required=reorder_required,
+                moq=max(0, int(moq)),
+                pack_size=max(1, int(pack_size)),
+            )
+        )
+        return {
+            "product_id": product_id,
+            "product_name": product.product_name,
+            "reorder_required": reorder_required,
+            "recommended_order_qty": int(round(max(0.0, quantity))),
+            "reorder_point": round(reorder_point, 2),
+            "safety_stock": round(float(state["safety_stock"]), 2),
+            "target_inventory": round(target, 2),
+            "inventory_position": position,
+            "current_stock": product.current_stock,
+            "open_order_qty": product.open_order_qty,
+            "lead_time_days": product.lead_time_days,
+            "moq": max(0, int(moq)),
+            "pack_size": max(1, int(pack_size)),
+            "status": state["status"],
+        }
+
+    def recommendations(self, *, category: Optional[str] = None) -> Dict[str, Any]:
+        """Ranked, plain-language inventory actions for the whole catalog.
+
+        Each row is the business decision itself (what to do and why), derived
+        from the same real metrics the inventory page shows, so the
+        recommendations page can never disagree with the numbers behind it.
+        """
+
+        if category is not None and not any(
+            p.category == category for p in self.products.values()
+        ):
+            # Refuse rather than return an empty page that looks like "nothing
+            # needs attention" when in fact the filter matched nothing at all.
+            raise ValueError(
+                f"'{category}' is not a category in this workspace; it cannot "
+                "be read as 'no recommendations'."
+            )
+
+        items: List[Dict[str, Any]] = []
+        for product_id in sorted(self.products):
+            try:
+                items.append(self._recommendation_row(product_id))
+            except Exception:
+                continue
+
+        counts = {
+            "all": len(items),
+            "critical": sum(1 for r in items if r["type"] == "critical"),
+            "reorder": sum(1 for r in items if r["type"] == "reorder"),
+            "monitor": sum(1 for r in items if r["type"] == "monitor"),
+            "no_action": sum(1 for r in items if r["type"] == "no_action"),
+        }
+        if category:
+            items = [r for r in items if r.get("category") == category]
+
+        priority = {"critical": 0, "reorder": 1, "monitor": 2, "no_action": 3}
+        items.sort(key=lambda r: (priority.get(r["type"], 4), r["current_stock"]))
+        return {"items": items, "counts": counts, "total": len(items)}
+
+    # -- simulation ---------------------------------------------------------
+
+    def backtest(
+        self,
+        product_id: str,
+        *,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        holding_cost_rate: float = 0.20,
+        ordering_cost_per_order: float = 500.0,
+        stockout_cost_per_unit: float = 1000.0,
+        inventory_days: int = 5,
+    ) -> Dict[str, Any]:
+        """Historical policy backtest for one of this tenant's products.
+
+        Reuses the shared simulation engine unchanged; only the *input data*
+        differs from V1 — it is this tenant's own sales history and this
+        tenant's own error spread, never the global CSV. The comparison is
+        therefore a like-for-like test of the XGBoost policy against a moving
+        average baseline on the customer's own demand.
+        """
+
+        import pandas as pd
+
+        from src.inventory.config import prepare_product_inventory_config
+        from src.inventory.simulation import (
+            run_backtest,
+            run_baseline_backtest,
+        )
+        from src.evaluation.metrics import compare_inventory_strategies
+        from backend.services import MODEL_FEATURES
+
+        self._check_product(product_id)
+        product = self.products[product_id]
+        history = self.sales_history_for(product_id)
+        if not history:
+            raise ValueError(
+                f"'{product_id}' has no sales history, so there is nothing to "
+                "backtest."
+            )
+
+        enriched, _warnings = self._enrich_history(product_id, history)
+        frame = pd.DataFrame(enriched)
+        frame["date"] = pd.to_datetime(frame["date"])
+        frame = frame.sort_values("date").reset_index(drop=True)
+
+        span = frame["date"].max() - frame["date"].min()
+        if start_date is None:
+            # Backtest over the most recent ~90 days that still has at least a
+            # quarter of the series in front of it to train the starting stock.
+            backtest_end = frame["date"].max()
+            backtest_start = max(
+                frame["date"].min() + pd.Timedelta(days=28),
+                backtest_end - pd.Timedelta(days=89),
+            )
+        else:
+            backtest_start = pd.Timestamp(start_date)
+            backtest_end = pd.Timestamp(end_date) if end_date else frame["date"].max()
+
+        if backtest_end <= backtest_start:
+            raise ValueError(
+                "The backtest end date must be after its start date."
+            )
+        if backtest_start < frame["date"].min():
+            raise ValueError(
+                "The backtest starts before this product's first recorded sale."
+            )
+
+        lead_time_days = max(int(product.lead_time_days or 0), 1)
+        units = [r.get("units_sold", 0) for r in history]
+        config = prepare_product_inventory_config(
+            product_id=product_id,
+            product_history=frame,
+            # The tenant's own residual spread, not the global error table.
+            forecast_error_std=_forecast_error_std(units),
+            backtest_start=backtest_start,
+            lead_time_days=lead_time_days,
+            inventory_days=max(1, int(inventory_days)),
+        )
+
+        from backend.main import get_service
+
+        model = get_service().model
+        xgb_results = run_backtest(
+            product_history=frame,
+            start_date=backtest_start,
+            end_date=backtest_end,
+            starting_stock=config["starting_stock"],
+            model=model,
+            model_features=MODEL_FEATURES,
+            safety_stock=config["safety_stock"],
+            lead_time_days=lead_time_days,
+        )
+        baseline_results = run_baseline_backtest(
+            product_history=frame,
+            start_date=backtest_start,
+            end_date=backtest_end,
+            starting_stock=config["starting_stock"],
+            safety_stock=config["safety_stock"],
+            lead_time_days=lead_time_days,
+        )
+
+        comparison = compare_inventory_strategies(
+            strategy_a_name="xgboost",
+            strategy_a_results=xgb_results,
+            strategy_b_name="baseline",
+            strategy_b_results=baseline_results,
+            unit_cost=float(product.unit_cost or 0.0),
+            holding_cost_rate=holding_cost_rate,
+            ordering_cost_per_order=ordering_cost_per_order,
+            stockout_cost_per_unit=stockout_cost_per_unit,
+        )
+
+        trajectory: List[Dict[str, Any]] = []
+        for index in range(len(xgb_results)):
+            xgb_row = xgb_results.iloc[index]
+            base_row = baseline_results.iloc[index]
+            trajectory.append({
+                "date": str(pd.Timestamp(xgb_row["date"]).date()),
+                "actual_demand": int(xgb_row["demand"]),
+                "xgb_closing_stock": int(xgb_row["closing_stock"]),
+                "baseline_closing_stock": int(base_row["closing_stock"]),
+                "xgb_order_qty": int(xgb_row["order_qty"]),
+                "baseline_order_qty": int(base_row["order_qty"]),
+                "xgb_stockout_units": int(xgb_row["stockout_units"]),
+                "baseline_stockout_units": int(base_row["stockout_units"]),
+                "xgb_inventory_position": int(xgb_row["inventory_position"]),
+                "baseline_inventory_position": int(base_row["inventory_position"]),
+            })
+
+        return {
+            "product_id": product_id,
+            "product_name": product.product_name,
+            "start_date": str(backtest_start.date()),
+            "end_date": str(backtest_end.date()),
+            "duration_days": (backtest_end - backtest_start).days + 1,
+            "unit_cost": float(product.unit_cost or 0.0),
+            "starting_stock": config["starting_stock"],
+            "safety_stock": round(float(config["safety_stock"]), 2),
+            "forecast_error_std": round(float(config["forecast_error_std"]), 3),
+            "lead_time_days": lead_time_days,
+            "xgb_metrics": comparison["xgboost"],
+            "baseline_metrics": comparison["baseline"],
+            "cost_comparison": {
+                "recommended_strategy": comparison["recommended_strategy"],
+                "expected_savings": comparison["expected_savings"],
+                "cost_difference": comparison["cost_difference"],
+            },
+            "daily_trajectory": trajectory,
+        }
+
+    def _recommendation_row(self, product_id: str) -> Dict[str, Any]:
+        state = self._inventory_state(product_id)
+        product = self.products[product_id]
+        position = float(product.inventory_position)
+        lead_days = max(int(product.lead_time_days or 0), 1)
+        forecast = self.demand_forecast(product_id, audit=False)
+
+        projected_lead_demand = round(
+            sum(pt["forecast"] for pt in forecast["points"][:lead_days]), 2
+        )
+        daily_demand = float(forecast["avg_daily"] or state["daily_avg"])
+        growth = float(forecast["growth_pct"])
+        status = state["status"]
+
+        reorder = self.reorder_recommendation(product_id)
+        quantity = int(reorder["recommended_order_qty"])
+
+        if status == "critical":
+            kind = "critical"
+            title = "Reorder Required"
+            reason = (
+                f"Projected demand of {projected_lead_demand:g} units during the "
+                f"{lead_days}-day lead time exceeds available inventory of "
+                f"{position:g} units."
+                if projected_lead_demand > position
+                else f"Current inventory of {position:g} units is below the "
+                     f"safety stock level of {state['safety_stock']:g} units."
+            )
+            action = "Reorder now"
+        elif status == "low":
+            kind = "reorder"
+            title = "Reorder Recommended"
+            reason = (
+                f"Inventory of {position:g} units is below the reorder point of "
+                f"{state['reorder_point']:g} units, with a {lead_days}-day supplier "
+                "lead time."
+            )
+            action = "Review reorder"
+        elif status == "overstocked":
+            kind = "reorder"
+            title = "Excess Inventory"
+            reason = (
+                f"Stock of {position:g} units is well above the {lead_days}-day "
+                f"target of {state['target_stock']:g} units. Consider a promotion "
+                "or slower replenishment."
+            )
+            action = "Review stock"
+        elif growth > 2:
+            kind = "monitor"
+            title = "Monitor"
+            reason = (
+                "Inventory is currently sufficient, but demand is increasing. "
+                "Keep an eye on stock levels."
+            )
+            action = "View product"
+        else:
+            kind = "no_action"
+            title = "No Action"
+            reason = "Inventory levels are healthy."
+            action = "View product"
+
+        return {
+            "product_id": product_id,
+            "product_name": product.product_name,
+            "category": product.category,
+            "type": kind,
+            "title": title,
+            "reason": reason,
+            "action_label": action,
+            "current_stock": product.current_stock,
+            "inventory_position": position,
+            "reorder_point": round(float(state["reorder_point"]), 2),
+            "safety_stock": round(float(state["safety_stock"]), 2),
+            "lead_time_days": lead_days,
+            "projected_demand": projected_lead_demand,
+            "daily_demand": round(daily_demand, 2),
+            "growth_pct": round(growth, 2),
+            "recommended_order_qty": quantity,
+            "reorder_required": bool(reorder["reorder_required"]),
+            "stockout_risk": state["stockout_risk"],
+            "status": status,
+            "fallback_used": forecast["fallback_used"],
+            "eligibility": forecast["eligibility"],
+            "last_updated": product.updated_at,
+        }
 
     # -- internal ------------------------------------------------------------
 
@@ -1289,7 +2260,84 @@ def _step_days(start: str, days: int) -> str:
         return ""
 
 
-def _ml_forecast(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _as_float(value: Any, default: float = 0.0) -> float:
+    """Best-effort finite float, never raising on unexpected input.
+
+    Used on values that already passed validation or came from a numeric
+    engine, so this only guards against ``None``/NaN rather than hiding bad
+    data — an unparseable value falls back to ``default``.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(number) or math.isinf(number):
+        return default
+    return number
+
+
+def _forecast_error_std(units: Sequence[Any]) -> float:
+    """Residual spread of demand around a 7-day rolling mean.
+
+    This is the tenant's own forecast uncertainty: a product whose daily sales
+    swing wildly gets a wide confidence band, a steady one gets a narrow band.
+    With too little history to measure anything meaningful a conservative
+    fraction of the mean is used, so the band is never falsely reported as
+    near-zero.
+    """
+    values = [max(0.0, _as_float(u)) for u in units]
+    values = [v for v in values if v > 0]
+    if len(values) < 8:
+        return round(max(values, default=0.0) * 0.4, 4) if values else 0.0
+    window = min(7, max(3, len(values) // 4))
+    residuals: List[float] = []
+    for index in range(window, len(values)):
+        baseline = sum(values[index - window:index]) / window
+        residuals.append(values[index] - baseline)
+    if len(residuals) < 2:
+        return round(max(values) * 0.4, 4)
+    mean = sum(residuals) / len(residuals)
+    variance = sum((r - mean) ** 2 for r in residuals) / (len(residuals) - 1)
+    # Floor the spread at 5% of the mean so a suspiciously perfect history
+    # never produces a band of literally zero width.
+    floor = 0.05 * (sum(values) / len(values))
+    return round(max(math.sqrt(max(variance, 0.0)), floor), 4)
+
+
+def _trend_from_history(
+    history: Sequence[Dict[str, Any]],
+) -> Tuple[str, float]:
+    """Compare the last 7 days against the 21 before them.
+
+    Returns ``(trend, growth_pct)`` where trend is one of
+    ``increasing`` / ``decreasing`` / ``stable`` using the same 2% dead band
+    the rest of the application applies to growth.
+    """
+    units = [
+        _as_float(r.get("units_sold")) for r in history if _as_float(r.get("units_sold")) > 0
+    ]
+    if len(units) < 28:
+        if len(units) < 2:
+            return "stable", 0.0
+        half = len(units) // 2
+        recent = sum(units[half:]) / (len(units) - half)
+        prior = sum(units[:half]) / half
+    else:
+        recent = sum(units[-7:]) / 7
+        prior = sum(units[-28:-7]) / 21
+    if prior <= 0.001:
+        return "stable", 0.0
+    growth = (recent / prior - 1.0) * 100.0
+    if growth > 2:
+        return "increasing", round(growth, 2)
+    if growth < -2:
+        return "decreasing", round(growth, 2)
+    return "stable", round(growth, 2)
+
+
+def _ml_forecast(
+    history: List[Dict[str, Any]], *, horizon: Optional[int] = None
+) -> List[Dict[str, Any]]:
     """ML adapter for the eligibility-approved path.
 
     The heavy imports stay local so validation, tenant, and job routes remain
@@ -1312,7 +2360,7 @@ def _ml_forecast(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             model=service.model,
             product_history=history_df,
             model_features=MODEL_FEATURES,
-            horizon=30,
+            horizon=DEFAULT_ML_HORIZON if horizon is None else max(1, int(horizon)),
         )
         if forecast_df is None or getattr(forecast_df, "empty", False):
             raise RuntimeError("The ML forecast engine returned no forecast rows.")

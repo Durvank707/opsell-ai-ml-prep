@@ -629,6 +629,25 @@ def _normalize_product_rows(
     return normalized
 
 
+def delete_product(user_id: str, product_id: str) -> int:
+    """Delete one product and its sales rows for exactly one user.
+
+    Both deletes are user-scoped by the ``user_id`` filter, so this can only
+    ever remove the calling tenant's own rows. Raises rather than reporting a
+    partial delete if either table cannot be updated.
+    """
+
+    normalized_user = _validate_user_id(user_id)
+    normalized_product = str(product_id or "").strip()
+    if not normalized_product or len(normalized_product) > 255:
+        raise SupabasePersistenceError("Product id is invalid.")
+
+    scope = {"user_id": f"eq.{normalized_user}", "product_id": f"eq.{normalized_product}"}
+    for table in ("sales", "products"):
+        _request("DELETE", table=table, query=scope, prefer="return=minimal")
+    return 1
+
+
 def _redact_persistence_value(value: Any) -> Any:
     """Keep credential-shaped values out of remote audit JSON."""
 
