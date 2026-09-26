@@ -35,7 +35,7 @@ from backend.tenant import (
     seed_canonical_demo,
 )
 from backend.contracts import contract_for
-from backend.validation import validate_rows
+from backend.validation import SEV_ERROR, validate_rows
 
 # Every V2 route is authenticated. Tenant-bearing route parameters and bodies
 # are checked again against the signed principal inside each handler.
@@ -79,7 +79,11 @@ def workspace_for(user_id: str, email: Optional[str] = None) -> TenantWorkspace:
     from backend.supabase import supabase_enabled
 
     if supabase_enabled() and not ws.remote_hydrated:
-        ws.hydrate_sales()
+        # Products, sales, and audit history are all durable when Supabase is
+        # enabled, so the workspace is restored in one pass rather than sales
+        # only. A failure raises out of here and is surfaced as a 503; it is
+        # never downgraded to an empty in-memory workspace.
+        ws.hydrate_from_supabase()
     if ws.user_id == DEMO_USER_ID and not ws.products and not ws.sales_records:
         _seed_canonical_demo()
     return ws
@@ -173,6 +177,33 @@ class V2ForecastRequest(BaseModel):
 
 class V2JobStatusRequest(BaseModel):
     job_id: str
+
+
+class V2IngestRequest(BaseModel):
+    """Canonical rows to persist into the authenticated tenant's workspace.
+
+    ``user_id`` is accepted for symmetry with the other V2 bodies but is
+    re-checked against the signed principal: a caller can never write into
+    another tenant's workspace by changing this field.
+    """
+
+    user_id: str = Field(..., min_length=1)
+    record_type: str = Field(
+        default="sales",
+        min_length=1,
+        description="Canonical contract key to ingest: 'sales' or 'product'.",
+    )
+    rows: List[Dict[str, Any]] = Field(default_factory=list)
+    mapping: Dict[str, str] = Field(default_factory=dict)
+    columns: List[str] = Field(default_factory=list)
+    known_categories: List[str] = Field(default_factory=list)
+    max_rows: Optional[int] = Field(default=None, ge=1)
+
+
+# Ingest is a *write*. Only these two contracts have a durable home in the
+# tenant schema, so anything else is refused rather than silently validated and
+# dropped. ``inventory`` is deliberately absent by design.
+_INGESTABLE_CONTRACTS = frozenset({"sales", "product"})
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +351,156 @@ async def validate_rows_v2(
 
 
 _INLINE_LIMIT = 500
+
+
+@router.post("/ingest")
+async def ingest_rows_v2(
+    request: V2IngestRequest,
+    principal: AuthPrincipal = Depends(require_auth),
+):
+    """Validate canonical rows and persist them into the caller's workspace.
+
+    This is the authenticated write path that makes Supabase (when
+    ``USE_SUPABASE=true``) the durable store instead of a read-only mirror. It
+    deliberately mirrors :func:`validate_rows_v2`'s validation semantics and
+    adds the one thing that route intentionally does not do: commit.
+
+    Guarantees:
+
+    * The tenant is the **signed** subject. A mismatched ``user_id`` is a 403
+      and nothing is written.
+    * All-or-nothing. If any row fails canonical validation the whole batch is
+      refused with 422 and no row and no audit entry is written, so a tenant
+      never ends up with a half-ingested dataset.
+    * The server upload cap is enforced and can never be raised by the client.
+    * A failed remote write propagates as 503. It is never downgraded to a
+      local-only success.
+    """
+
+    user_id = resolve_tenant_id(principal, request.user_id)
+
+    if request.record_type not in _INGESTABLE_CONTRACTS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"'{request.record_type}' cannot be ingested. Ingestable "
+                f"contracts: {sorted(_INGESTABLE_CONTRACTS)}."
+            ),
+        )
+    try:
+        contract = contract_for(request.record_type)
+    except NameError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    if not request.rows:
+        raise HTTPException(
+            status_code=422, detail="No rows were supplied to ingest."
+        )
+
+    configured_limit = _configured_max_rows()
+    row_limit = (
+        min(request.max_rows, configured_limit)
+        if request.max_rows is not None
+        else configured_limit
+    )
+    if len(request.rows) > row_limit:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"{len(request.rows)} rows exceeds the accepted limit of "
+                f"{row_limit}."
+            ),
+        )
+
+    category_fields = getattr(request, "model_fields_set", None)
+    if category_fields is None:  # Pydantic v1 compatibility
+        category_fields = getattr(request, "__fields_set__", set())
+    if request.known_categories:
+        known_categories: Optional[set] = set(request.known_categories)
+    elif "known_categories" in category_fields:
+        known_categories = set()
+    else:
+        known_categories = None
+
+    result = validate_rows(
+        request.rows,
+        contract,
+        mapping=request.mapping,
+        columns=request.columns or None,
+        known_categories=known_categories,
+        max_rows=row_limit,
+    )
+    blocking = [
+        problem
+        for problem in result.problems
+        if problem.severity == SEV_ERROR
+    ]
+    if result.rejected_rows or result.schema_problems or blocking:
+        # Nothing is persisted: report the problems and let the caller fix the
+        # source. A partial write would leave the tenant's history unreproducible.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    "No rows were ingested because the batch did not validate. "
+                    "Fix the reported rows and resubmit the whole batch."
+                ),
+                "total_rows": result.total_rows,
+                "accepted_rows": result.accepted_rows,
+                "rejected_rows": result.rejected_rows,
+                "problems": [p.to_dict() for p in result.problems],
+                "schema_problems": [p.to_dict() for p in result.schema_problems],
+            },
+        )
+
+    ws = get_workspace(user_id, email=getattr(principal, "email", None))
+    canonical_rows = [row.values for row in result.rows]
+    try:
+        if request.record_type == "product":
+            written = len(ws.add_products(canonical_rows))
+            persisted_table = "products"
+        else:
+            missing = sorted({
+                str(row["product_id"])
+                for row in canonical_rows
+                if str(row["product_id"]) not in ws.products
+            })
+            if missing:
+                # Refuse rather than auto-creating catalog rows from a sales
+                # file: the product catalog is the tenant's own metadata and a
+                # typo must not silently invent a product.
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "No rows were ingested because these product_id values "
+                        f"are not in your catalog: {missing}. Ingest the "
+                        "'product' contract first."
+                    ),
+                )
+            written = ws.upsert_sales_rows(canonical_rows)
+            persisted_table = "sales"
+    except HTTPException:
+        raise
+    except TenantIsolationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except RuntimeError as exc:
+        from backend.supabase import friendly_hint_for
+
+        raise HTTPException(status_code=503, detail=friendly_hint_for(exc)) from exc
+
+    from backend.supabase import supabase_enabled
+
+    durable = supabase_enabled()
+    return {
+        "record_type": request.record_type,
+        "total_rows": result.total_rows,
+        "ingested_rows": written,
+        "persisted_to": persisted_table if durable else "memory",
+        "durable": durable,
+        "warnings": [p.to_dict() for p in result.problems],
+    }
 
 
 @router.post("/eligibility/check")

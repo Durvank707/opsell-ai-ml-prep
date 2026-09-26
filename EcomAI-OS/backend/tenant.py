@@ -148,6 +148,76 @@ def _optional_nonnegative_int(
     return int(value)
 
 
+def _product_row_payload(product: "ProductRow") -> Dict[str, Any]:
+    """Render a canonical :class:`ProductRow` for the Supabase products table.
+
+    Only fields that belong to the canonical ``PRODUCT_RECORD`` contract are
+    emitted. ``unit_price`` is intentionally omitted: the remote products
+    table stores ``unit_cost``, and inventing a price column here would write
+    a value no contract defines. Unset optional values are omitted rather than
+    sent as ``None`` so the adapter's canonical validation applies its own
+    documented missing-value behaviour instead of being handed a null.
+    """
+
+    payload: Dict[str, Any] = {
+        "product_id": product.product_id,
+        "product_name": product.product_name,
+        "category": product.category,
+        "current_stock": int(product.current_stock),
+        "lead_time_days": int(product.lead_time_days),
+        "open_order_qty": int(product.open_order_qty),
+        "unit_cost": float(product.unit_cost),
+    }
+    if product.expected_arrival_date:
+        payload["expected_arrival_date"] = product.expected_arrival_date
+    return payload
+
+
+def _product_row_from_hydrated(row: Dict[str, Any]) -> "ProductRow":
+    """Rebuild the local :class:`ProductRow` shape from a validated remote row.
+
+    The remote row has already been revalidated by ``fetch_products`` and
+    confirmed to belong to this tenant, so the same documented defaults that
+    :meth:`TenantWorkspace.add_product` applies are reused here. This keeps
+    hydrated products indistinguishable from locally created ones.
+    """
+
+    remote_arrival = row.get("expected_arrival_date")
+    if remote_arrival is None or (
+        isinstance(remote_arrival, str) and not remote_arrival.strip()
+    ):
+        arrival = None
+    elif isinstance(remote_arrival, datetime):
+        arrival = remote_arrival.date().isoformat()
+    elif isinstance(remote_arrival, date):
+        arrival = remote_arrival.isoformat()
+    else:
+        parsed_arrival = parse_date_iso(remote_arrival)
+        if parsed_arrival is None:
+            raise ValueError(
+                "A hydrated expected_arrival_date must be an unambiguous ISO date."
+            )
+        arrival = parsed_arrival.isoformat()
+
+    product_id = str(row["product_id"])
+    now = _now()
+    return ProductRow(
+        product_id=product_id,
+        product_name=_text_value(
+            row.get("product_name"), "product_name", default=product_id
+        ),
+        category=_text_value(row.get("category"), "category", default="Unknown"),
+        unit_price=0.0,
+        current_stock=_optional_nonnegative_int(row, "current_stock", 0),
+        open_order_qty=_optional_nonnegative_int(row, "open_order_qty", 0),
+        expected_arrival_date=arrival,
+        lead_time_days=_optional_nonnegative_int(row, "lead_time_days", 7),
+        unit_cost=_optional_nonnegative_number(row, "unit_cost", 0.0),
+        created_at=now,
+        updated_at=now,
+    )
+
+
 @dataclass
 class TenantWorkspace:
     """One user's isolated workspace. All state lives under ``user_id``."""
@@ -172,20 +242,164 @@ class TenantWorkspace:
         if not self.created_at:
             self.created_at = _now()
 
+    def hydrate_from_supabase(self) -> Dict[str, int]:
+        """Load every persisted collection for this tenant in one pass.
+
+        Products, sales, and audit history are all durable when
+        ``USE_SUPABASE=true``.  Each collection is hydrated through its own
+        existing adapter and is rolled back on failure, so a partial read can
+        never leave a half-populated workspace that claims to be persisted.
+
+        Every read is scoped to ``self.user_id``, which comes from the verified
+        tenant identity.  No other tenant's rows are ever fetched, and the
+        ``remote_hydrated`` flag is only set once all three reads succeed.
+        """
+
+        if self.remote_hydrated:
+            return {
+                "products": len(self.products),
+                "sales": len(self.sales_records),
+                "audit": len(self.audit),
+            }
+        from backend.supabase import supabase_enabled
+
+        if not supabase_enabled():
+            return {"products": 0, "sales": 0, "audit": 0}
+
+        audit = self._hydrate_audit_rows()
+        products = self._hydrate_product_rows()
+        sales = self._hydrate_sales_rows()
+        self.remote_hydrated = True
+        # Ordering note: remote history is restored BEFORE the ``*_hydrated``
+        # audit events are recorded, so the freshly emitted events append to
+        # the end of the restored timeline rather than jumping ahead of it.
+        return {"products": products, "sales": sales, "audit": audit}
+
+    def _hydrate_product_rows(self) -> int:
+        """Fetch and revalidate this tenant's product rows."""
+
+        from backend.supabase import fetch_products
+
+        products_before = dict(self.products)
+        audit_before = list(self.audit)
+        try:
+            remote_rows = fetch_products(self.user_id)
+            for row in remote_rows:
+                self._store_hydrated_product_row(row)
+        except Exception:
+            self.products = products_before
+            self.audit = audit_before
+            raise
+
+        if remote_rows:
+            self._audit(
+                "products_hydrated",
+                None,
+                {"rows": len(remote_rows), "source": "supabase"},
+            )
+        return len(remote_rows)
+
+    def _store_hydrated_product_row(self, row: Dict[str, Any]) -> None:
+        """Cache one already-fetched remote product without re-writing it.
+
+        ``fetch_products`` has already revalidated the row and confirmed the
+        remote ``user_id`` matches this workspace, so the record is trusted for
+        storage.  It is still stored through :meth:`add_product` semantics
+        (identical defaults and bounds) by rebuilding the same local shape.
+        """
+
+        if not isinstance(row, dict):
+            raise ValueError("A hydrated product row must be a JSON object.")
+        # Defence in depth: ``fetch_products`` already refuses a foreign row, so
+        # a mismatch here means the adapter's tenant check was bypassed.
+        if "user_id" in row and str(row.get("user_id")) != self.user_id:
+            raise TenantIsolationError(
+                "A hydrated product row belongs to another tenant; it was refused."
+            )
+        product_id = str(row.get("product_id", "")).strip()
+        if not product_id:
+            raise ValueError("A hydrated product row is missing product_id.")
+        # Keyed by product_id, so re-hydrating an already-known product replaces
+        # it instead of appending a duplicate.
+        self.products[product_id] = _product_row_from_hydrated(row)
+
+    def _hydrate_audit_rows(self) -> int:
+        """Restore this tenant's append-only audit history.
+
+        Hydrated rows are appended directly rather than through :meth:`_audit`
+        so restoring history never re-persists it. The remote ``created_at``
+        order is preserved as returned, and no re-sorting happens: the next
+        locally recorded event appends at the end, which is where it belongs.
+        """
+
+        from backend.supabase import fetch_audit_entries
+
+        known_ids = {entry.id for entry in self.audit}
+        audit_before = list(self.audit)
+        restored = 0
+        try:
+            remote_rows = fetch_audit_entries(self.user_id)
+            for row in remote_rows:
+                if not isinstance(row, dict):
+                    raise ValueError("A hydrated audit row must be a JSON object.")
+                # Defence in depth, as in ``_store_hydrated_product_row``.
+                if "user_id" in row and str(row.get("user_id")) != self.user_id:
+                    raise TenantIsolationError(
+                        "A hydrated audit row belongs to another tenant; "
+                        "it was refused."
+                    )
+                entry_id = str(row.get("id", "")).strip()
+                if not entry_id or entry_id in known_ids:
+                    # Dedupe by id: a workspace that already recorded this entry
+                    # must not gain a second copy of the same decision.
+                    continue
+                detail = row.get("detail")
+                self.audit.append(AuditEntry(
+                    id=entry_id,
+                    user_id=self.user_id,
+                    action=str(row.get("action", "")),
+                    product_id=(
+                        str(row["product_id"]) if row.get("product_id") else None
+                    ),
+                    detail=dict(detail) if isinstance(detail, dict) else {},
+                    created_at=str(row.get("created_at", "")),
+                ))
+                known_ids.add(entry_id)
+                restored += 1
+        except Exception:
+            # Same atomicity contract as products and sales: a failed restore
+            # leaves the local workspace exactly as it was.
+            self.audit = audit_before
+            raise
+
+        return restored
+
     def hydrate_sales(self) -> int:
         """Load this user's canonical sales rows when Supabase is enabled.
 
         Hydration is user-scoped, validated, and atomic.  A failed or malformed
         remote read leaves the local workspace unchanged; it never falls back
         to another tenant or marks unverified rows as persisted.
+
+        Prefer :meth:`hydrate_from_supabase`, which also restores products and
+        audit history.  This method remains for sales-only callers.
         """
 
         if self.remote_hydrated:
             return len(self.sales_records)
-        from backend.supabase import fetch_sales, supabase_enabled
+        from backend.supabase import supabase_enabled
 
         if not supabase_enabled():
             return 0
+
+        rows = self._hydrate_sales_rows()
+        self.remote_hydrated = True
+        return rows
+
+    def _hydrate_sales_rows(self) -> int:
+        """Fetch and store this tenant's sales rows; roll back on failure."""
+
+        from backend.supabase import fetch_sales
 
         sales_before = dict(self.sales_records)
         audit_before = list(self.audit)
@@ -198,7 +412,6 @@ class TenantWorkspace:
             self.audit = audit_before
             raise
 
-        self.remote_hydrated = True
         if remote_rows:
             self._audit(
                 "sales_hydrated",
@@ -262,6 +475,24 @@ class TenantWorkspace:
         converted through a permissive ``or`` fallback.  Uploaded canonical
         product records go through ``validate_rows(..., PRODUCT_RECORD)``.
         """
+        p = self._build_product_row(row)
+        # Persist the canonical product BEFORE touching local state, matching
+        # the sales convention: a failed remote write must never leave a local
+        # record claiming a remote success that did not occur. The payload is
+        # built from the validated ProductRow and stamped with this workspace's
+        # verified user_id; the adapter overrides any caller-supplied user_id,
+        # so a product can never be written into another tenant.
+        self._commit_product_rows([p])
+        return p
+
+    def _build_product_row(self, row: Dict[str, Any]) -> ProductRow:
+        """Validate one raw product dict into a canonical :class:`ProductRow`.
+
+        Raises :class:`ValueError` for a non-object row or an invalid
+        product_id/arrival date, so callers can refuse a whole batch before
+        anything is written.
+        """
+
         if not isinstance(row, dict):
             raise ValueError("A product row must be a JSON object.")
         pid = _text_value(row.get("product_id"), "product_id")
@@ -288,7 +519,7 @@ class TenantWorkspace:
                     )
                 arrival = parsed_arrival.isoformat()
 
-        p = ProductRow(
+        return ProductRow(
             product_id=pid,
             product_name=product_name,
             category=category,
@@ -301,9 +532,58 @@ class TenantWorkspace:
             created_at=_now(),
             updated_at=_now(),
         )
-        self.products[pid] = p
-        self._audit("product_upserted", pid, {"current_stock": p.current_stock})
-        return p
+
+    def add_products(self, rows: Sequence[Dict[str, Any]]) -> List[ProductRow]:
+        """Validate and atomically persist a batch of canonical product rows.
+
+        The batched counterpart to :meth:`add_product`, mirroring
+        :meth:`upsert_sales_rows`. Validation happens for every row first, so an
+        invalid row anywhere refuses the whole batch instead of leaving a
+        half-written catalog behind.
+        """
+
+        try:
+            materialized = list(rows)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Product rows must be a sequence of JSON objects."
+            ) from exc
+        prepared = [self._build_product_row(row) for row in materialized]
+        seen: set = set()
+        for product in prepared:
+            if product.product_id in seen:
+                raise ValueError(
+                    "A product batch contains duplicate product_id "
+                    f"{product.product_id!r}."
+                )
+            seen.add(product.product_id)
+        self._commit_product_rows(prepared)
+        return prepared
+
+    def _commit_product_rows(self, prepared: Sequence["ProductRow"]) -> int:
+        """Persist a validated product batch, then update the local shadow."""
+
+        if not prepared:
+            return 0
+
+        # Same ordering contract as sales and audit: remote first, local second.
+        from backend.supabase import supabase_enabled, upsert_products
+
+        if supabase_enabled():
+            upsert_products(
+                self.user_id, [_product_row_payload(p) for p in prepared]
+            )
+
+        pending_audit: List[AuditEntry] = []
+        for product in prepared:
+            self.products[product.product_id] = product
+            pending_audit.append(self._new_audit_entry(
+                "product_upserted",
+                product.product_id,
+                {"current_stock": product.current_stock},
+            ))
+        self._audit_many(pending_audit)
+        return len(prepared)
 
     def _prepare_sales_row(
         self, row: Dict[str, Any]
@@ -392,6 +672,7 @@ class TenantWorkspace:
             upsert_sales(self.user_id, remote_rows)
 
         written = 0
+        pending_audit: List[AuditEntry] = []
         for stored, validation_warnings in prepared:
             pid = str(stored["product_id"])
             key = (pid, str(stored["date"]))
@@ -407,8 +688,14 @@ class TenantWorkspace:
                 # but the warning remains auditable rather than disappearing at
                 # the storage boundary.
                 audit_detail["validation_warnings"] = validation_warnings
-            self._audit("sales_upserted", pid, audit_detail)
+            pending_audit.append(
+                self._new_audit_entry("sales_upserted", pid, audit_detail)
+            )
             written += 1
+        # One batched append for the whole ingest instead of one round trip per
+        # row. Same ordering contract: if this fails, the error propagates and
+        # the caller can treat the batch as unpersisted.
+        self._audit_many(pending_audit)
         return written
 
     def upsert_sales_row(self, row: Dict[str, Any]) -> None:
@@ -680,16 +967,61 @@ class TenantWorkspace:
                 "tenant. Nothing was read or written."
             )
 
-    def _audit(self, action: str, product_id: Optional[str] = None,
-               detail: Optional[Dict[str, Any]] = None) -> None:
-        self.audit.append(AuditEntry(
+    def _new_audit_entry(self, action: str, product_id: Optional[str],
+                         detail: Optional[Dict[str, Any]]) -> AuditEntry:
+        """Build one tenant-owned audit record without writing it anywhere."""
+
+        return AuditEntry(
             id=str(uuid4())[:12],
             user_id=self.user_id,
             action=action,
             product_id=product_id,
             detail=detail or {},
             created_at=_now(),
-        ))
+        )
+
+    def _audit_many(self, entries: Sequence[AuditEntry]) -> None:
+        """Persist and record a batch of audit entries as one unit.
+
+        This is the batched form of :meth:`_audit` and shares its ordering
+        contract: the remote write happens first, so if it fails the error
+        propagates and *none* of the entries are appended locally. Entries are
+        stamped with this workspace's verified user_id, and the adapter refuses
+        an entry owned by anyone else. Batching exists only to bound the number
+        of round trips for a bulk ingest; it does not relax any check.
+        """
+
+        materialized = list(entries)
+        if not materialized:
+            return
+        from backend.supabase import append_audit_entries, supabase_enabled
+
+        if supabase_enabled():
+            append_audit_entries(self.user_id, [
+                {
+                    "id": entry.id,
+                    "action": entry.action,
+                    "product_id": entry.product_id,
+                    "detail": entry.detail,
+                    "created_at": entry.created_at,
+                }
+                for entry in materialized
+            ])
+        self.audit.extend(materialized)
+        return None
+
+    def _audit(self, action: str, product_id: Optional[str] = None,
+               detail: Optional[Dict[str, Any]] = None) -> None:
+        # Every audit event flows through this one method, so persisting here
+        # keeps product, sales, forecast, and metrics history durable without
+        # touching any individual call site. As with sales and products, the
+        # remote write happens first: if it fails the error propagates and
+        # nothing is appended locally, so a decision is never recorded as
+        # persisted when it was not. The entry is stamped with this workspace's
+        # verified user_id; the adapter refuses an entry owned by anyone else.
+        self._audit_many([
+            self._new_audit_entry(action, product_id, detail)
+        ])
         # Audit history is append-only.  Do not silently discard old decisions
         # just because a tenant has been active for a long time; a production
         # persistence layer can archive them explicitly if retention is needed.
@@ -1010,9 +1342,14 @@ def seed_canonical_demo(ws: "TenantWorkspace", *, limit: int = _DEMO_SEED_LIMIT)
     is_weekend, units_sold).
 
     This is the ONLY module that ever walks the canonical store to seed a demo
-    tenant. It reuses ``TenantWorkspace.add_product`` / ``upsert_sales_row``
+    tenant. It reuses ``TenantWorkspace.add_products`` / ``upsert_sales_rows``
     exclusively (never another tenant's rows), returns the number of sales rows
     written, and is a no-op for an empty store. Nothing here invents rows.
+
+    Rows are collected first and committed in one batch per collection. The
+    canonical result is identical to a per-row walk, but a seeded demo tenant
+    costs a handful of remote requests instead of one per row, which matters
+    once Supabase is enabled and each request is a real network round trip.
     """
     from backend.config import RAW_SALES_CSV
 
@@ -1024,7 +1361,6 @@ def seed_canonical_demo(ws: "TenantWorkspace", *, limit: int = _DEMO_SEED_LIMIT)
     products_before = dict(ws.products)
     sales_before = dict(ws.sales_records)
     audit_before = list(ws.audit)
-    written = 0
     required_seed_columns = {
         "date",
         "product_id",
@@ -1034,6 +1370,8 @@ def seed_canonical_demo(ws: "TenantWorkspace", *, limit: int = _DEMO_SEED_LIMIT)
         "promotion",
         "units_sold",
     }
+    catalog: Dict[str, Dict[str, Any]] = {}
+    sales_rows: List[Dict[str, Any]] = []
     try:
         with RAW_SALES_CSV.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -1048,14 +1386,13 @@ def seed_canonical_demo(ws: "TenantWorkspace", *, limit: int = _DEMO_SEED_LIMIT)
                         f"columns: {', '.join(missing_columns)}."
                     )
                 pid = str(r["product_id"])
-                ws.add_product(
-                    {
-                        "product_id": pid,
-                        "product_name": str(r["product_name"]),
-                        "category": str(r["category"]),
-                    }
-                )
-                ws.upsert_sales_row(
+                # One catalog entry per product, not one per row.
+                catalog.setdefault(pid, {
+                    "product_id": pid,
+                    "product_name": str(r["product_name"]),
+                    "category": str(r["category"]),
+                })
+                sales_rows.append(
                     {
                         "date": r["date"],
                         "product_id": pid,
@@ -1069,7 +1406,11 @@ def seed_canonical_demo(ws: "TenantWorkspace", *, limit: int = _DEMO_SEED_LIMIT)
                         "category": r["category"],
                     }
                 )
-                written += 1
+        if not sales_rows:
+            return 0
+        # Products first: the sales contract requires the product to exist.
+        ws.add_products(list(catalog.values()))
+        written = ws.upsert_sales_rows(sales_rows)
     except Exception:
         ws.products = products_before
         ws.sales_records = sales_before

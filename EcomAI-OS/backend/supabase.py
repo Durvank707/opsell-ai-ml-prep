@@ -158,6 +158,13 @@ def _max_upload_rows() -> int:
     return _positive_env_int("MAX_UPLOAD_ROWS", 250000)
 
 
+def _audit_batch_size() -> int:
+    # Audit rows are small, but a full upload can mean hundreds of thousands of
+    # them. Chunking keeps each POST body bounded and keeps a single request
+    # from becoming the thing that fails under load.
+    return min(500, _max_upload_rows())
+
+
 def _fetch_page_size() -> int:
     # PostgREST's default/max row window is commonly 1000.  Keeping the page
     # at or below that value avoids server-side silent truncation while the
@@ -705,18 +712,55 @@ def _audit_payload(user_id: str, entry: Any) -> Dict[str, Any]:
     }
 
 
-def append_audit_entry(user_id: str, entry: Any) -> Dict[str, Any]:
-    """Append one immutable, tenant-owned audit record."""
+def append_audit_entries(user_id: str, entries: Sequence[Any]) -> List[Dict[str, Any]]:
+    """Append a batch of immutable, tenant-owned audit records.
+
+    Every entry is validated and stamped with the same normalized ``user_id``
+    before a single request is issued, so a batch can never mix owners. The
+    batch is sent in bounded chunks: a large ingest must not build one
+    unbounded request body, and a partial chunk failure raises rather than
+    reporting a success that did not occur.
+    """
 
     normalized_user = _validate_user_id(user_id)
-    payload = _audit_payload(normalized_user, entry)
-    _request(
-        "POST",
-        table="audit_entries",
-        body=[payload],
-        prefer="return=minimal",
-    )
-    return payload
+    try:
+        materialized = list(entries)
+    except (TypeError, ValueError) as exc:
+        raise SupabasePersistenceError(
+            "Audit entries must be a finite sequence of records."
+        ) from exc
+    if not materialized:
+        return []
+
+    payloads = [_audit_payload(normalized_user, entry) for entry in materialized]
+    seen: set = set()
+    for payload in payloads:
+        if payload["id"] in seen:
+            raise SupabasePersistenceError(
+                f"Audit batch contains duplicate entry id {payload['id']!r}; "
+                "the batch was refused."
+            )
+        seen.add(payload["id"])
+
+    chunk_size = _audit_batch_size()
+    for start in range(0, len(payloads), chunk_size):
+        _request(
+            "POST",
+            table="audit_entries",
+            body=payloads[start:start + chunk_size],
+            prefer="return=minimal",
+        )
+    return payloads
+
+
+def append_audit_entry(user_id: str, entry: Any) -> Dict[str, Any]:
+    """Append one immutable, tenant-owned audit record.
+
+    Thin wrapper over :func:`append_audit_entries` so there is exactly one
+    audit write path with one set of validation and redaction rules.
+    """
+
+    return append_audit_entries(user_id, [entry])[0]
 
 
 def fetch_audit_entries(
