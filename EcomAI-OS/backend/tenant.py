@@ -28,9 +28,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from itertools import islice
 import csv
 import math
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
@@ -89,6 +89,8 @@ class ProductRow:
     lead_time_days: int = 7
     unit_cost: float = 0.0
     safety_stock: float = 0.0
+    supplier: str = ""
+    description: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -164,11 +166,11 @@ def _product_row_payload(product: "ProductRow") -> Dict[str, Any]:
     """Render a canonical :class:`ProductRow` for the Supabase products table.
 
     Only fields that belong to the canonical ``PRODUCT_RECORD`` contract are
-    emitted. ``unit_price`` is intentionally omitted: the remote products
-    table stores ``unit_cost``, and inventing a price column here would write
-    a value no contract defines. Unset optional values are omitted rather than
-    sent as ``None`` so the adapter's canonical validation applies its own
-    documented missing-value behaviour instead of being handed a null.
+    emitted. Unset optional values are omitted rather than sent as ``None`` so
+    the adapter's canonical validation applies its own documented
+    missing-value behaviour instead of being handed a null -- except for
+    ``unit_price``/``unit_cost``, where zero is a real value the tenant set and
+    sending nothing would leave a stale price behind.
     """
 
     payload: Dict[str, Any] = {
@@ -179,6 +181,7 @@ def _product_row_payload(product: "ProductRow") -> Dict[str, Any]:
         "lead_time_days": int(product.lead_time_days),
         "open_order_qty": int(product.open_order_qty),
         "unit_cost": float(product.unit_cost),
+        "unit_price": float(product.unit_price),
     }
     if product.safety_stock:
         # Only sent when the tenant actually set one; a zero would otherwise
@@ -186,6 +189,10 @@ def _product_row_payload(product: "ProductRow") -> Dict[str, Any]:
         payload["safety_stock"] = float(product.safety_stock)
     if product.expected_arrival_date:
         payload["expected_arrival_date"] = product.expected_arrival_date
+    if product.supplier:
+        payload["supplier"] = product.supplier
+    if product.description:
+        payload["description"] = product.description
     return payload
 
 
@@ -223,13 +230,15 @@ def _product_row_from_hydrated(row: Dict[str, Any]) -> "ProductRow":
             row.get("product_name"), "product_name", default=product_id
         ),
         category=_text_value(row.get("category"), "category", default="Unknown"),
-        unit_price=0.0,
+        unit_price=_optional_nonnegative_number(row, "unit_price", 0.0),
         current_stock=_optional_nonnegative_int(row, "current_stock", 0),
         open_order_qty=_optional_nonnegative_int(row, "open_order_qty", 0),
         expected_arrival_date=arrival,
         lead_time_days=_optional_nonnegative_int(row, "lead_time_days", 7),
         unit_cost=_optional_nonnegative_number(row, "unit_cost", 0.0),
         safety_stock=_optional_nonnegative_number(row, "safety_stock", 0.0),
+        supplier=_text_value(row.get("supplier"), "supplier", default=""),
+        description=_text_value(row.get("description"), "description", default=""),
         created_at=now,
         updated_at=now,
     )
@@ -547,6 +556,8 @@ class TenantWorkspace:
             lead_time_days=_optional_nonnegative_int(row, "lead_time_days", 7),
             unit_cost=_optional_nonnegative_number(row, "unit_cost", 0.0),
             safety_stock=_optional_nonnegative_number(row, "safety_stock", 0.0),
+            supplier=_text_value(row.get("supplier"), "supplier", default=""),
+            description=_text_value(row.get("description"), "description", default=""),
             created_at=_now(),
             updated_at=_now(),
         )
@@ -628,13 +639,15 @@ class TenantWorkspace:
             "lead_time_days": current.lead_time_days,
             "unit_cost": current.unit_cost,
             "safety_stock": current.safety_stock,
+            "supplier": current.supplier,
+            "description": current.description,
         }
         # ``product_id`` is the business key and is deliberately immutable here;
         # renaming a product would orphan its sales history.
         for field in (
             "product_name", "category", "unit_price", "current_stock",
             "open_order_qty", "expected_arrival_date", "lead_time_days",
-            "unit_cost", "safety_stock",
+            "unit_cost", "safety_stock", "supplier", "description",
         ):
             if field in patch:
                 merged[field] = patch[field]
@@ -1122,6 +1135,8 @@ class TenantWorkspace:
             "category": p.category,
             "unit_price": p.unit_price,
             "unit_cost": p.unit_cost,
+            "supplier": p.supplier,
+            "description": p.description,
             "current_stock": p.current_stock,
             "open_order_qty": p.open_order_qty,
             "inventory_position": inv_pos,
@@ -1156,12 +1171,14 @@ class TenantWorkspace:
                     "product_id": p.product_id,
                     "product_name": p.product_name,
                     "category": p.category,
+                    "unit_price": p.unit_price,
+                    "unit_cost": p.unit_cost,
+                    "supplier": p.supplier,
+                    "description": p.description,
                     "current_stock": p.current_stock,
                     "open_order_qty": p.open_order_qty,
                     "inventory_position": p.inventory_position,
                     "lead_time_days": p.lead_time_days,
-                    "unit_cost": p.unit_cost,
-                    "unit_price": p.unit_price,
                     "expected_arrival_date": p.expected_arrival_date,
                     "updated_at": p.updated_at,
                     "error": "metrics_unavailable",
@@ -2380,7 +2397,85 @@ def _ml_forecast(
 # every other tenant starts EMPTY and never copies another tenant's rows").
 # ---------------------------------------------------------------------------
 
-_DEMO_SEED_LIMIT = 200
+# The canonical store records 5 products over 731 days each, in one contiguous
+# block per product. The default row budget is therefore spread as 200 days per
+# product, which is what a demo tenant needs to be worth looking at: 200 days is
+# the forecaster's ``preferred_range`` (180-364), so the seeded dashboard shows
+# real ML forecasts instead of a labeled ``baseline`` fallback.
+_DEMO_SEED_LIMIT = 1000
+
+
+def apply_inventory_snapshot(catalog: Dict[str, Dict[str, Any]]) -> int:
+    """Overlay the canonical inventory snapshot onto a seeded catalog.
+
+    ``data/raw/inventory_snapshot.csv`` carries the stock, lead time and unit
+    cost for the same product ids as the sales store. Without it a seeded
+    catalog starts at zero stock everywhere, so every product reads as
+    critically short and the inventory pages say nothing true about the tenant.
+
+    Only ids already present in ``catalog`` are touched, so the snapshot can
+    never add a product the sales store does not have. A missing or unreadable
+    snapshot leaves the catalog exactly as it was rather than failing the seed:
+    the history is still worth loading, and zero stock is a documented default
+    rather than an invented number.
+    """
+
+    from backend.config import RAW_INVENTORY_CSV
+
+    if not RAW_INVENTORY_CSV.exists():
+        return 0
+
+    applied = 0
+    with RAW_INVENTORY_CSV.open("r", encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            pid = str(row.get("product_id") or "").strip()
+            entry = catalog.get(pid)
+            if entry is None:
+                continue
+            for column, canonical in (
+                ("current_stock", "current_stock"),
+                ("open_order_qty", "open_order_qty"),
+                ("lead_time_days", "lead_time_days"),
+                ("unit_cost", "unit_cost"),
+                ("expected_arrival_date", "expected_arrival_date"),
+            ):
+                value = (row.get(column) or "").strip()
+                if not value:
+                    continue
+                entry[canonical] = value
+            applied += 1
+    return applied
+
+
+def _seed_product_budget(path: Path, limit: int) -> Dict[str, int]:
+    """Divide ``limit`` sales rows evenly across the products in the raw store.
+
+    The canonical store keeps one contiguous block of days per product, so
+    taking the first ``limit`` rows would hand the entire budget to whichever
+    product happens to be recorded first and leave the demo tenant with a
+    one-product catalog. Each product instead gets ``limit // count`` rows and
+    the remainder is handed out in sorted product order, which makes the result
+    deterministic for a given ``limit``.
+
+    A product with fewer recorded rows than its share contributes only what it
+    has, so the caller may still come in under ``limit`` — the budget is a
+    ceiling, never a promise.
+    """
+
+    recorded: Dict[str, int] = {}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for r in csv.DictReader(handle):
+            pid = str(r.get("product_id") or "").strip()
+            if pid:
+                recorded[pid] = recorded.get(pid, 0) + 1
+    if not recorded:
+        return {}
+    ordered = sorted(recorded)
+    share, extra = divmod(limit, len(ordered))
+    return {
+        pid: min(recorded[pid], share + (1 if index < extra else 0))
+        for index, pid in enumerate(ordered)
+    }
 
 
 def seed_canonical_demo(ws: "TenantWorkspace", *, limit: int = _DEMO_SEED_LIMIT) -> int:
@@ -2394,12 +2489,21 @@ def seed_canonical_demo(ws: "TenantWorkspace", *, limit: int = _DEMO_SEED_LIMIT)
     exclusively (never another tenant's rows), returns the number of sales rows
     written, and is a no-op for an empty store. Nothing here invents rows.
 
+    The catalog is overlaid with ``data/raw/inventory_snapshot.csv`` (see
+    :func:`apply_inventory_snapshot`) so seeded products carry the stock, lead
+    time and unit cost the same raw dataset records for them.
+
     Rows are collected first and committed in one batch per collection. The
     canonical result is identical to a per-row walk, but a seeded demo tenant
     costs a handful of remote requests instead of one per row, which matters
     once Supabase is enabled and each request is a real network round trip.
+
+    ``limit`` is a ceiling on sales rows, never a head-of-file slice: it is
+    divided evenly across every product in the store (see
+    :func:`_seed_product_budget`) so a demo tenant gets the whole catalog
+    instead of one product and four empty slots.
     """
-    from backend.config import RAW_SALES_CSV
+    from backend.config import RAW_INVENTORY_CSV, RAW_SALES_CSV
 
     if limit <= 0 or not RAW_SALES_CSV.exists():
         return 0
@@ -2418,12 +2522,24 @@ def seed_canonical_demo(ws: "TenantWorkspace", *, limit: int = _DEMO_SEED_LIMIT)
         "promotion",
         "units_sold",
     }
+    budget = _seed_product_budget(RAW_SALES_CSV, limit)
     catalog: Dict[str, Dict[str, Any]] = {}
     sales_rows: List[Dict[str, Any]] = []
     try:
+        taken: Dict[str, int] = {}
         with RAW_SALES_CSV.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
-            for row_number, r in enumerate(islice(reader, limit), start=2):
+            for row_number, r in enumerate(reader, start=2):
+                pid = str(r.get("product_id") or "").strip()
+                if not pid:
+                    # A row that cannot be attributed to a product cannot be
+                    # budgeted, and the canonical store is byte-verified, so
+                    # this is corruption rather than something to skip.
+                    raise ValueError(
+                        f"Demo seed row {row_number} has no product_id."
+                    )
+                if taken.get(pid, 0) >= budget.get(pid, 0):
+                    continue
                 missing_columns = sorted(
                     column for column in required_seed_columns
                     if r.get(column) is None
@@ -2433,13 +2549,17 @@ def seed_canonical_demo(ws: "TenantWorkspace", *, limit: int = _DEMO_SEED_LIMIT)
                         f"Demo seed row {row_number} is missing required source "
                         f"columns: {', '.join(missing_columns)}."
                     )
-                pid = str(r["product_id"])
-                # One catalog entry per product, not one per row.
-                catalog.setdefault(pid, {
+                # One catalog entry per product, not one per row. The listing
+                # price is taken from the row's own recorded price so a product
+                # whose sales history carries no price still has a real catalog
+                # price for the forecaster to fall back to.
+                entry = catalog.setdefault(pid, {
                     "product_id": pid,
                     "product_name": str(r["product_name"]),
                     "category": str(r["category"]),
+                    "unit_price": r["price"],
                 })
+                taken[pid] = taken.get(pid, 0) + 1
                 sales_rows.append(
                     {
                         "date": r["date"],
@@ -2454,8 +2574,11 @@ def seed_canonical_demo(ws: "TenantWorkspace", *, limit: int = _DEMO_SEED_LIMIT)
                         "category": r["category"],
                     }
                 )
+                if len(sales_rows) >= limit:
+                    break
         if not sales_rows:
             return 0
+        apply_inventory_snapshot(catalog)
         # Products first: the sales contract requires the product to exist.
         ws.add_products(list(catalog.values()))
         written = ws.upsert_sales_rows(sales_rows)

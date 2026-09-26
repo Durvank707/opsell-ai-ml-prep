@@ -164,10 +164,17 @@ the database policies do and do not currently guarantee.
 
 The service-role key can only reach PostgREST; it cannot run DDL. Create the
 tables once, in the Supabase **SQL Editor**, by running
-`supabase/migrations/0007_full_schema.sql` (or `0000`–`0006` in order). Every
-statement is idempotent, so re-running is safe. `scripts/probe_supabase.py`
-then confirms connectivity and which tables exist without printing any key
-material.
+`supabase/migrations/0007_full_schema.sql` (or `0000`–`0006` in order), then
+`supabase/migrations/0008_product_price_and_display_fields.sql`. Every statement
+is idempotent, so re-running is safe. `scripts/probe_supabase.py` then confirms
+connectivity and which tables exist without printing any key material.
+
+`0008` is required, not optional. It adds the three nullable columns the product
+record and the product form need beyond the original schema — `unit_price`,
+`supplier` and `description`. Without it a product saves but its selling price
+and supplier are dropped on the way to the database, and every forecast built
+from that history sees a price of `0`. The columns are nullable and additive
+precisely so the migration cannot lose existing rows.
 
 #### Never put credentials in `.env.example`
 
@@ -219,6 +226,12 @@ cd frontend
 npm run dev
 ```
 - Web Application: `http://localhost:5173`
+
+Out of the box the UI serves its own mock data. To run it against this backend and
+Supabase instead, set `VITE_DATA_MODE=api` (and `VITE_AUTH_MODE=external`) in
+`frontend/.env.local` — see `frontend/.env.example` and
+`frontend/README.md` § *Data modes*. In that mode a failed request is reported on the
+page; the app never falls back to generated data behind your back.
 
 ---
 

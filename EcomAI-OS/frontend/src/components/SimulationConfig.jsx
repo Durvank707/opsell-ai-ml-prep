@@ -12,18 +12,57 @@ const POLICIES = [
   { key: 'custom', label: 'Custom Policy', desc: 'Define your own safety stock and reorder levels' },
 ];
 
-export default function SimulationConfig({ products, onRun, running = false, progressStep = '' }) {
+// The window the form previews when the user has not chosen one.
+//
+// This mirrors `TenantWorkspace.backtest`'s own default: the most recent ~90
+// days of recorded demand, never starting earlier than a 28-day lead-in. The
+// lead-in is not cosmetic — the engine derives the starting stock from rows
+// strictly before the window, so a start date on the first recorded sale has
+// nothing to work from and the run is refused. The server applies this rule
+// itself, so an untouched form sends no dates at all and lets it decide; these
+// values are what the user sees, and what the server would choose.
+const BACKTEST_WINDOW_DAYS = 89;
+const BACKTEST_LEAD_IN_DAYS = 28;
+
+function defaultWindow(dataRange) {
   const today = new Date();
-  const defaultEnd = today.toISOString().slice(0, 10);
-  const startDateDefault = new Date(today);
-  startDateDefault.setDate(today.getDate() - 89);
-  const defaultStart = startDateDefault.toISOString().slice(0, 10);
+  const end = dataRange?.to ? new Date(dataRange.to) : today;
+  if (Number.isNaN(end.getTime())) {
+    return { start: null, end: null };
+  }
+  const first = dataRange?.from ? new Date(dataRange.from) : null;
+  const ninetyDaysAgo = new Date(end);
+  ninetyDaysAgo.setDate(end.getDate() - BACKTEST_WINDOW_DAYS);
+  let start = ninetyDaysAgo;
+  if (first && !Number.isNaN(first.getTime())) {
+    const leadIn = new Date(first);
+    leadIn.setDate(first.getDate() + BACKTEST_LEAD_IN_DAYS);
+    if (leadIn > start) start = leadIn;
+  }
+  const toIso = (d) => d.toISOString().slice(0, 10);
+  return { start: toIso(start), end: toIso(end) };
+}
+
+export default function SimulationConfig({ products, dataRange = null, onRun, running = false, progressStep = '' }) {
+  const fallback = defaultWindow(null);
+  const preview = defaultWindow(dataRange);
+  const defaultStart = preview.start || fallback.start;
+  const defaultEnd = preview.end || fallback.end;
 
   const [config, setConfig] = useState({
     startDate: defaultStart,
     endDate: defaultEnd,
-    productSelection: 'all',
-    productIds: [],
+    // Whether the period is still the preview above. While it is, no dates are
+    // sent and the server picks the window from this tenant's own history,
+    // which keeps the two from drifting apart.
+    periodIsDefault: true,
+    // A backtest compares two replenishment policies over one product's own
+    // recorded demand, so a single product is the scope that comparison is
+    // actually defined for. "All Products" stays selectable and says plainly
+    // that it cannot be simulated rather than quietly running one product and
+    // labelling it the catalog.
+    productSelection: 'selected',
+    productIds: products.length > 0 ? [products[0].id] : [],
     policy: 'current',
     customParams: {
       safetyStock: '',
@@ -59,7 +98,7 @@ export default function SimulationConfig({ products, onRun, running = false, pro
               type="date"
               value={config.startDate}
               max={config.endDate}
-              onChange={(e) => set({ startDate: e.target.value })}
+              onChange={(e) => set({ startDate: e.target.value, periodIsDefault: false })}
             />
           </Field>
           <Field label="End Date">
@@ -67,7 +106,7 @@ export default function SimulationConfig({ products, onRun, running = false, pro
               type="date"
               value={config.endDate}
               min={config.startDate}
-              onChange={(e) => set({ endDate: e.target.value })}
+              onChange={(e) => set({ endDate: e.target.value, periodIsDefault: false })}
             />
           </Field>
         </div>

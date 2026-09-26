@@ -1,14 +1,19 @@
 // Settings service — account, inventory defaults, notification prefs, security.
 
 import { getDB, latency, randomError } from './mock/db';
+import { usingApi } from './api/mode';
+import * as api from './api/catalog';
+import * as prefs from './api/preferences';
 
 export async function getSettings(user) {
+  if (usingApi()) return prefs.getSettings(user);
   await latency(300);
   const db = getDB(user);
   return { ...db.settings, user: { ...db.user } };
 }
 
 export async function updateSettings(user, patch) {
+  if (usingApi()) return prefs.updateSettings(user, patch);
   await latency(450);
   const db = getDB(user);
   const allowed = ['currency', 'defaultLeadTime', 'safetyStockMethod', 'fixedSafetyDays', 'notifications'];
@@ -19,14 +24,16 @@ export async function updateSettings(user, patch) {
   return { ...db.settings };
 }
 
-export async function updateNotificationPrefs(user, prefs) {
+export async function updateNotificationPrefs(user, preferences) {
+  if (usingApi()) return prefs.updateNotificationPrefs(user, preferences);
   await latency(300);
   const db = getDB(user);
-  db.settings.notifications = { ...db.settings.notifications, ...prefs };
+  db.settings.notifications = { ...db.settings.notifications, ...preferences };
   return { ...db.settings.notifications };
 }
 
 export async function placeSimulatedOrder(user, productId, qty) {
+  if (usingApi()) return api.placeSimulatedOrder(user, productId, qty);
   await latency(600);
   const db = getDB(user);
   const p = db.products.find((x) => x.id === productId);

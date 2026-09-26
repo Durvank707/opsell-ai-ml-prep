@@ -579,7 +579,8 @@ def fetch_products(user_id: str) -> List[Dict[str, Any]]:
         "select": (
             "user_id,product_id,product_name,category,current_stock,"
             "lead_time_days,safety_stock,reorder_point,open_order_qty,"
-            "unit_cost,expected_arrival_date,forecast_error_std"
+            "unit_cost,unit_price,supplier,description,expected_arrival_date,"
+            "forecast_error_std"
         ),
         "user_id": f"eq.{normalized_user}",
         "order": "product_id.asc",

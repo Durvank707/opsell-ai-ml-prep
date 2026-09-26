@@ -1,12 +1,20 @@
 // Inventory service — portfolio KPIs, health distribution and product tables.
+//
+// Two implementations sit behind these signatures. The default `mock` mode is
+// the deterministic in-browser store, so the UI runs with no backend. With
+// `VITE_DATA_MODE=api` the same calls are served by the tenant API instead, and
+// the same shapes come back, so no page has to know which one it called.
 
 import { getDB, latency, randomError } from './mock/db';
 import { get30DayForecast, getTrendAndGrowth } from './forecastService';
 import { classifyStatus } from './mock/catalog';
+import { usingApi } from './api/mode';
+import * as api from './api/catalog';
 
 const URGENCY = { critical: 0, low: 1, overstocked: 2, healthy: 3 };
 
 export async function getInventoryOverview(user) {
+  if (usingApi()) return api.getInventoryOverview(user);
   await latency(450);
   const db = getDB(user);
   const { products } = db;
@@ -62,6 +70,7 @@ function formatLakh(value) {
 }
 
 export async function listProducts(user, filters = {}) {
+  if (usingApi()) return api.listProducts(user, filters);
   await latency(400);
   const db = getDB(user);
   const {
@@ -124,6 +133,7 @@ function safeForecast30(db, p) {
 }
 
 export async function getProduct(user, productId) {
+  if (usingApi()) return api.getProduct(user, productId);
   await latency(400);
   const db = getDB(user);
   const p = db.products.find((x) => x.id === productId);
@@ -152,6 +162,7 @@ export async function getProduct(user, productId) {
 }
 
 export async function updateStock(user, productId, newStock) {
+  if (usingApi()) return api.updateStock(user, productId, newStock);
   await latency(450);
   const db = getDB(user);
   const p = db.products.find((x) => x.id === productId);
@@ -161,6 +172,7 @@ export async function updateStock(user, productId, newStock) {
 }
 
 export async function getInventoryTimeline(user, productId, { withReorder = true, days = 45 } = {}) {
+  if (usingApi()) return api.getInventoryTimeline(user, productId, { days });
   await latency(500);
   const db = getDB(user);
   const p = db.products.find((x) => x.id === productId);

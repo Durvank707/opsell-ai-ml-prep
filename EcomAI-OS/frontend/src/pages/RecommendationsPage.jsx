@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Lightbulb, AlertOctagon, PackagePlus, Eye, CheckCircle2, Package } from 'lucide-react';
+import { Lightbulb, AlertOctagon, PackagePlus, Eye, CheckCircle2, Package, RefreshCw } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import Card from '../components/ui/Card';
 import RecommendationCard from '../components/RecommendationCard';
@@ -57,7 +57,18 @@ export default function RecommendationsPage() {
 
       {loading && !data ? (
         <LoadingSkeleton variant="cards" />
-      ) : data?.items.length === 0 ? (
+      ) : !data ? (
+        <Card className="py-16">
+          <EmptyState
+            icon={Lightbulb}
+            title="Couldn’t load recommendations"
+            description="The last request to the server failed, so there is nothing to show. Nothing was lost — try again."
+            actionLabel="Retry"
+            actionIcon={RefreshCw}
+            onAction={load}
+          />
+        </Card>
+      ) : data.items.length === 0 ? (
         <Card className="py-16">
           <EmptyState
             icon={Lightbulb}

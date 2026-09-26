@@ -1,9 +1,17 @@
-// Demand forecasting service (mock ML engine).
-// Statistical + seasonal projection with confidence bands, presented to the
-// user as the "AI Demand Forecast". Deterministic per product.
+// Demand forecasting service.
+//
+// Two implementations sit behind the async API below. The default `mock` mode
+// projects demand in the browser from the deterministic store; with
+// `VITE_DATA_MODE=api` the same calls are served by the tenant API, where the
+// trained model is used wherever the eligibility gate passes and a labeled
+// baseline is used where it does not. The synchronous helpers further down are
+// mock-only by nature — they read the in-browser store directly and have no
+// API counterpart, so they are not reachable in `api` mode.
 
 import { getDB, latency, randomError } from './mock/db';
 import { mulberry32, hashString, timeAgo } from '../lib/utils';
+import { usingApi } from './api/mode';
+import * as api from './api/forecasting';
 
 const WEEKDAY_FACTOR = [0.8, 0.9, 0.95, 1.0, 1.08, 1.3, 1.18];
 const Z = 1.28; // ~80% interval lower/upper multiplier
@@ -162,12 +170,14 @@ export function portfolioForecast(db, horizon) {
 // ------------------------------------------------------------------ async API
 
 export async function getProductForecast(user, productId, horizon = 30) {
+  if (usingApi()) return api.getProductForecast(user, productId, horizon);
   await latency(450);
   const db = getDB(user);
   return computeProductForecastSync(db, productId, horizon);
 }
 
 export async function getForecastOverview(user, { horizon = 30, category = null, productId = null } = {}) {
+  if (usingApi()) return api.getForecastOverview(user, { horizon, category, productId });
   await latency(600);
   const db = getDB(user);
   if (productId) {
@@ -269,6 +279,7 @@ function buildOverview(user, db, fc, horizon, extra = {}) {
 
 /** Generate the portfolio forecast explicitly (onboarding step 3). */
 export async function generatePortfolioForecast(user) {
+  if (usingApi()) return api.generatePortfolioForecast(user);
   await latency(1500);
   const db = getDB(user);
   if (db.products.length === 0) {

@@ -80,7 +80,10 @@ export default function InventoryPage() {
           <div>
             <p className="text-sm font-bold text-slate-800">{p.name}</p>
             <p className="font-mono text-[11px] text-slate-400">
-              {p.id} · {p.sku}
+              {/* The second identifier is only shown when the record actually
+                  carries a distinct one. Against the canonical contract the SKU
+                  is the product id, and printing it twice reads as a bug. */}
+              {p.sku && p.sku !== p.id ? `${p.id} · ${p.sku}` : p.id}
             </p>
           </div>
         ),

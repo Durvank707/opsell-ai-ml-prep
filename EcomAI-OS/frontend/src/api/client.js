@@ -23,6 +23,19 @@ function errorMessage(payload, fallback) {
   if (payload && typeof payload.detail === 'string' && payload.detail.trim()) {
     return payload.detail;
   }
+  // The validation and ingest routes answer 422 with a structured detail that
+  // carries the per-row problems, not a sentence. Take its `message` and, when
+  // it reports failing rows, say how many so the caller knows a specific number
+  // is at fault rather than the whole request.
+  const detail = payload?.detail;
+  if (detail && typeof detail === 'object') {
+    const problems = [...(detail.problems || []), ...(detail.schema_problems || [])];
+    if (problems.length) {
+      const first = problems.find((p) => p?.severity === 'error') || problems[0];
+      return `${detail.message || fallback} First problem: ${first.detail || first.field || 'unknown'}`;
+    }
+    if (typeof detail.message === 'string' && detail.message.trim()) return detail.message;
+  }
   return fallback;
 }
 
@@ -44,15 +57,23 @@ export async function request(path, {
   }
 
   const finalHeaders = new Headers(headers);
-  if (init.body != null && typeof init.body !== 'string' && !finalHeaders.has('Content-Type')) {
+  // A non-string body is a JSON document the caller handed over as an object.
+  // `fetch` would stringify it to "[object Object]", so it is serialized here,
+  // once, alongside the content type the server needs to parse it. A caller
+  // that already holds a string is left alone.
+  let body = init.body;
+  if (body != null && typeof body !== 'string' && !finalHeaders.has('Content-Type')) {
     finalHeaders.set('Content-Type', 'application/json');
+  }
+  if (body != null && typeof body !== 'string') {
+    body = JSON.stringify(body);
   }
   if (token && auth !== 'none') {
     finalHeaders.set('Authorization', `Bearer ${token}`);
   }
 
   const url = /^https?:\/\//i.test(path) ? path : `${base}${path}`;
-  const response = await fetch(url, { ...init, headers: finalHeaders });
+  const response = await fetch(url, { ...init, body, headers: finalHeaders });
   const payload = await readResponse(response);
   if (response.status === 401 && token && auth !== 'none') {
     notifyAuthExpired();

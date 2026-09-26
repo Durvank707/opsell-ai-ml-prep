@@ -1,6 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { useAuth } from './AuthContext';
-import { getDB, subscribe } from '../services';
+import { notificationsService } from '../services';
+import { subscribe, usingApi } from '../services';
 
 const DataContext = createContext(null);
 
@@ -18,41 +19,60 @@ export function DataProvider({ children }) {
       setUnread(0);
       return undefined;
     }
-    const load = () => {
+
+    // The service layer picks the source: the in-browser store in `mock` mode,
+    // the tenant's audit trail in `api` mode. The in-browser store also pushes
+    // updates as it mutates, so a live subscription is only wired up for that
+    // one; in `api` mode a change is visible on the next load or refresh.
+    let cancelled = false;
+
+    const apply = (list) => {
+      if (cancelled) return;
+      setNotifications(list);
+      setUnread(list.filter((n) => !n.read).length);
+    };
+
+    const load = async () => {
       try {
-        const db = getDB(user);
-        setNotifications([...db.notifications]);
-        setUnread(db.unreadCount());
-      } catch {
-        /* ignore */
+        apply(await notificationsService.getNotifications(user));
+      } catch (error) {
+        // The shell has to keep rendering when the bell cannot load, but the
+        // failure is not swallowed: it is reported rather than silently leaving
+        // an empty bell that looks like "nothing new".
+        console.error('Could not load notifications', error);
       }
     };
+
     load();
-    const unsub = subscribe((db) => {
-      if (!user || db.user.id !== user.id) return;
-      setNotifications([...db.notifications]);
-      setUnread(db.unreadCount());
-    });
-    return unsub;
+
+    const unsub = usingApi()
+      ? undefined
+      : subscribe((db) => {
+          if (!user || db.user.id !== user.id) return;
+          apply([...db.notifications]);
+        });
+
+    return () => {
+      cancelled = true;
+      if (unsub) unsub();
+    };
   }, [user, version]);
 
   const markRead = useCallback(
-    (id) => {
+    async (id) => {
       if (!user) return;
-      const db = getDB(user);
-      db.markNotificationRead(id);
-      setNotifications([...db.notifications]);
-      setUnread(db.unreadCount());
+      const list = await notificationsService.markNotificationRead(user, id);
+      setNotifications(list);
+      setUnread(list.filter((n) => !n.read).length);
     },
     [user],
   );
 
-  const markAllRead = useCallback(() => {
+  const markAllRead = useCallback(async () => {
     if (!user) return;
-    const db = getDB(user);
-    db.markAllNotificationsRead();
-    setNotifications([...db.notifications]);
-    setUnread(db.unreadCount());
+    const list = await notificationsService.markAllNotificationsRead(user);
+    setNotifications(list);
+    setUnread(list.filter((n) => !n.read).length);
   }, [user]);
 
   const value = useMemo(

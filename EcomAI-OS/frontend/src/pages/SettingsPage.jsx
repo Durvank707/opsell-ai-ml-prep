@@ -209,10 +209,18 @@ export default function SettingsPage() {
           {/* Store settings */}
           <Card
             title="Store Settings"
-            subtitle="Inventory defaults used across the workspace."
+            subtitle="Saved in this browser for this account."
             actions={<Button size="sm" icon={Save} loading={saving === 'store'} onClick={saveStore}>Save</Button>}
           >
             <div className="space-y-4">
+              <p className="rounded-xl border border-amber-200 bg-amber-50 px-3.5 py-3 text-xs leading-relaxed text-amber-800">
+                These defaults are stored on this device, not on the server, so they do
+                not currently change any number the app computes. Every product carries
+                its own lead time, and safety stock, reorder points and forecasts are
+                derived from each product's own recorded demand by the forecasting
+                service. They are kept here so the preferences are ready to become
+                workspace-level settings.
+              </p>
               <div className="grid grid-cols-2 gap-4">
                 <Field label="Currency">
                   <Select value={store.currency} onChange={(e) => setStore((s) => ({ ...s, currency: e.target.value }))}>

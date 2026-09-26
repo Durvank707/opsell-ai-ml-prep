@@ -1,11 +1,19 @@
 // Dashboard service — KPIs, health donut, demand chart, alerts, activity.
+//
+// The default `mock` mode assembles the view from the in-browser store. With
+// `VITE_DATA_MODE=api` the same view is composed from the tenant API's
+// inventory, forecast, recommendation and audit reads, so every number on the
+// landing screen traces to an engine call rather than to generated data.
 
 import { getDB, latency } from './mock/db';
 import { getInventoryOverview } from './inventoryService';
 import { portfolioDailyActual, portfolioForecast } from './forecastService';
 import { formatINR, formatDate } from '../lib/utils';
+import { usingApi } from './api/mode';
+import * as api from './api/dashboard';
 
 export async function getDashboard(user, { period = 7 } = {}) {
+  if (usingApi()) return api.getDashboard(user, { period });
   await latency(500);
   const db = getDB(user);
   const ov = await getInventoryOverview(user);
@@ -69,6 +77,7 @@ export async function getDashboard(user, { period = 7 } = {}) {
 const URGENCY = { critical: 0, low: 1, overstocked: 2, healthy: 3 };
 
 export async function getWorkspace(user) {
+  if (usingApi()) return api.getWorkspace(user);
   await latency(250);
   const db = getDB(user);
   const setup = db.setupProgress();

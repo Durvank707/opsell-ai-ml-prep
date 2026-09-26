@@ -289,13 +289,46 @@ PRODUCT_RECORD = RecordContract(
         ),
         FieldContract(
             "unit_cost",
-            aliases=("unit_cost", "cost", "unit_price"),
+            aliases=("unit_cost", "cost", "buy_price"),
             data_type="float",
             required=False,
             unit="currency",
             min=0,
             missing_behaviour="flag",
             ml_requirement="IGNORED",
+        ),
+        FieldContract(
+            "unit_price",
+            aliases=("unit_price", "selling_price", "price", "sale_price"),
+            data_type="float",
+            required=False,
+            unit="currency",
+            min=0,
+            missing_behaviour="flag",
+            ml_requirement="USED",
+            description=(
+                "Catalog selling price. It is the price a sales row falls back to "
+                "when the row itself carries none, so a product with no price "
+                "here feeds the forecaster a zero rather than a real price."
+            ),
+        ),
+        FieldContract(
+            "supplier",
+            aliases=("supplier", "supplier_name", "vendor"),
+            data_type="string",
+            required=False,
+            missing_behaviour="fallback_unknown",
+            ml_requirement="IGNORED",
+            description="Display-only supplier label; not used by any engine.",
+        ),
+        FieldContract(
+            "description",
+            aliases=("description", "notes", "product_description"),
+            data_type="string",
+            required=False,
+            missing_behaviour="fallback_unknown",
+            ml_requirement="IGNORED",
+            description="Display-only product description; not used by any engine.",
         ),
         FieldContract(
             "expected_arrival_date",

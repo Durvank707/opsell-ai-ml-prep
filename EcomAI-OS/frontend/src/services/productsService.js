@@ -2,8 +2,11 @@
 
 import { getDB, latency, randomError } from './mock/db';
 import { getSuppliers } from './mock/catalog';
+import { usingApi } from './api/mode';
+import * as api from './api/catalog';
 
 export async function createProduct(user, payload) {
+  if (usingApi()) return api.createProduct(user, payload);
   await latency(600);
   const db = getDB(user);
   if (!payload.name?.trim()) throw randomError('Please provide a product name.');
@@ -28,6 +31,7 @@ export async function createProduct(user, payload) {
 }
 
 export async function updateProduct(user, productId, payload) {
+  if (usingApi()) return api.updateProduct(user, productId, payload);
   await latency(500);
   const db = getDB(user);
   const existing = db.products.find((p) => p.id === productId);
@@ -46,6 +50,7 @@ export async function updateProduct(user, productId, payload) {
 }
 
 export async function deleteProduct(user, productId) {
+  if (usingApi()) return api.deleteProduct(user, productId);
   await latency(550);
   const db = getDB(user);
   db.deleteProduct(productId);

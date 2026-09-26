@@ -21,6 +21,8 @@ function MetricValue({ row, idx }) {
   return formatNumber(val);
 }
 
+const plural = (count, word) => `${formatNumber(count)} ${word}${count === 1 ? '' : 's'}`;
+
 export default function SimulationResults({ results, onRunAnother }) {
   const { kpis, stockout, excess, chart, comparison, config, selectedPolicy } = results;
   const bestValues = comparison.rows.map((row) =>
@@ -43,7 +45,7 @@ export default function SimulationResults({ results, onRunAnother }) {
           <p className="mt-0.5 text-sm text-slate-500">
             {config.start && (
               <>
-                {formatDate(config.start)} → {formatDate(config.end)} · {config.productCount} products ·{' '}
+                {formatDate(config.start)} → {formatDate(config.end)} · {plural(config.productCount, 'product')} ·{' '}
                 <span className="font-semibold text-brand-700">{selectedPolicy}</span>
               </>
             )}
@@ -98,7 +100,11 @@ export default function SimulationResults({ results, onRunAnother }) {
       {/* Performance chart */}
       <Card
         title="Inventory Level Over Time"
-        subtitle="Aggregate portfolio stock position across the simulated period"
+        subtitle={
+          config.productCount === 1
+            ? `${config.productName} stock position across the simulated period`
+            : 'Aggregate stock position across the simulated period'
+        }
       >
         <StockLineChart
           points={chart}
@@ -114,7 +120,7 @@ export default function SimulationResults({ results, onRunAnother }) {
             <div className="grid grid-cols-3 gap-3">
               <StatBlock label="Events" value={formatNumber(stockout.events)} />
               <StatBlock label="Products affected" value={formatNumber(stockout.productsAffected.length)} />
-              <StatBlock label="Avg. duration" value={`${stockout.avgDuration} days`} />
+              <StatBlock label="Avg. duration" value={`${formatNumber(stockout.avgDuration)} ${stockout.avgDuration === 1 ? 'day' : 'days'}`} />
             </div>
             {stockout.productsAffected.length === 0 ? (
               <p className="rounded-xl bg-emerald-50 px-4 py-6 text-center text-sm font-medium text-emerald-700">
@@ -126,7 +132,7 @@ export default function SimulationResults({ results, onRunAnother }) {
                   <li key={p.productId} className="flex items-center justify-between px-4 py-2.5">
                     <span className="text-sm font-semibold text-slate-700">{p.name}</span>
                     <span className="flex items-center gap-3 text-xs text-slate-500">
-                      <span className="tnum">{p.stockoutEvents} events</span>
+                      <span className="tnum">{plural(p.stockoutEvents, 'event')}</span>
                       <span className="tnum font-bold text-rose-600">{formatNumber(p.stockoutUnits)} units</span>
                     </span>
                   </li>
@@ -165,7 +171,7 @@ export default function SimulationResults({ results, onRunAnother }) {
       {/* Policy comparison */}
       <Card
         title="Policy Comparison"
-        subtitle="How the standard inventory policies perform against the same historical demand"
+        subtitle="How each policy performed against the same historical demand"
       >
         <div className="overflow-x-auto">
           <table className="w-full min-w-[520px] text-left">

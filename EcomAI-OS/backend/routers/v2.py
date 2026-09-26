@@ -227,6 +227,8 @@ class V2ProductUpdateRequest(BaseModel):
     lead_time_days: Optional[int] = Field(default=None, ge=0)
     safety_stock: Optional[float] = Field(default=None, ge=0)
     expected_arrival_date: Optional[str] = None
+    supplier: Optional[str] = Field(default=None, max_length=160)
+    description: Optional[str] = Field(default=None, max_length=2000)
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +787,62 @@ async def sales_summary_v2(
     """Portfolio sales totals for the signed-in tenant."""
     ws = _principal_workspace(principal, user_id)
     return ws.sales_summary()
+
+
+class V2DemoSeedRequest(BaseModel):
+    """Optional bounds for the demo seed.
+
+    ``user_id`` is accepted for symmetry with the other V2 bodies and is
+    re-checked against the signed principal, exactly as ``V2IngestRequest`` is.
+    """
+
+    user_id: str = Field(..., min_length=1)
+    limit: Optional[int] = Field(default=None, ge=1, le=100_000)
+
+
+@router.post("/demo/seed")
+async def seed_demo_data(
+    body: V2DemoSeedRequest,
+    principal: AuthPrincipal = Depends(require_auth),
+):
+    """Load the canonical demo dataset into the *calling* tenant's workspace.
+
+    This is the server-side counterpart of the UI's "load sample data" action,
+    and it reads only the on-disk canonical raw store — the same rows, catalog
+    and inventory snapshot the training pipeline uses. It writes into the signed
+    tenant's own workspace and nowhere else, so pressing it cannot touch another
+    tenant's data.
+
+    Seeding is idempotent in the sense that matters: sales rows are upserted on
+    ``(product_id, date)`` and products on ``product_id``, so running it twice
+    converges rather than duplicating. It is still a write, and it overwrites the
+    stock levels of any product id present in the snapshot.
+    """
+    user_id = resolve_tenant_id(principal, body.user_id)
+    ws = get_workspace(user_id, email=principal.email)
+    if ws.products:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This workspace already holds products, so loading the demo "
+                "dataset would overwrite real catalog and stock data. Import a "
+                "CSV instead, or start from an empty workspace."
+            ),
+        )
+    try:
+        written = seed_canonical_demo(ws, **({"limit": body.limit} if body.limit else {}))
+    except Exception as exc:  # noqa: BLE001 - mapped to HTTP by the shared policy
+        raise _intelligence_error(exc)
+    if not written:
+        raise HTTPException(
+            status_code=409,
+            detail="The demo dataset is not available on this server.",
+        )
+    return {
+        "user_id": user_id,
+        "sales_rows": written,
+        "products": len(ws.products),
+    }
 
 
 # ---------------------------------------------------------------------------

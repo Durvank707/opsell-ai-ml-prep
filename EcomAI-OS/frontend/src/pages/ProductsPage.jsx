@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Plus, Package, LayoutGrid, List } from 'lucide-react';
+import { Plus, Package, LayoutGrid, List, RefreshCw } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
@@ -62,11 +62,16 @@ export default function ProductsPage() {
     setPage(1);
   }, [search, category, pageSize]);
 
+  // Each write refreshes two things: `refresh()` updates the shell KPIs and
+  // activity feed, and `load()` re-reads this page's own rows. The list lives in
+  // local state, so without the second call a newly saved product does not
+  // appear until a filter changes or the page reloads.
   const handleAdd = async (payload) => {
     setSubmitting(true);
     try {
       const created = await createProduct(user, payload);
       refresh();
+      await load();
       toast.success(`${created.name} was added to your catalog.`);
       setFormOpen(false);
     } catch (e) {
@@ -81,6 +86,7 @@ export default function ProductsPage() {
     try {
       await updateProduct(user, editing.id, payload);
       refresh();
+      await load();
       toast.success(`${editing.name} was updated.`);
       setFormOpen(false);
       setEditing(null);
@@ -97,6 +103,7 @@ export default function ProductsPage() {
     try {
       await deleteProduct(user, deleting.id);
       refresh();
+      await load();
       toast.success(`${deleting.name} was removed.`);
       setDeleting(null);
     } catch {
@@ -204,7 +211,18 @@ export default function ProductsPage() {
 
       {loading && !data ? (
         <LoadingSkeleton variant="cards" />
-      ) : data?.items.length === 0 ? (
+      ) : !data ? (
+        <Card bodyClassName="p-0" pad={false}>
+          <EmptyState
+            icon={Package}
+            title="Couldn’t load your products"
+            description="The last request to the server failed, so there is nothing to show. Nothing was lost — try again."
+            actionLabel="Retry"
+            actionIcon={RefreshCw}
+            onAction={load}
+          />
+        </Card>
+      ) : data.items.length === 0 ? (
         <Card bodyClassName="p-0" pad={false}>
           <EmptyState
             icon={Package}
@@ -244,7 +262,13 @@ export default function ProductsPage() {
         </Card>
       )}
 
+      {/* `key` remounts the form whenever the target product changes. The form
+          is rendered unconditionally so the modal can animate, which means it
+          survives from one open to the next; without this its state is the one
+          captured on first mount, and clicking Edit shows the blank create form
+          under an "Edit <product>" title. */}
       <ProductForm
+        key={editing ? `edit-${editing.id}` : 'create'}
         open={formOpen}
         onClose={() => {
           setFormOpen(false);

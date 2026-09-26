@@ -1,7 +1,14 @@
 // Inventory intelligence — turns stock + demand signals into plain business actions.
+//
+// In `mock` mode the actions are derived in the browser from the deterministic
+// store. In `api` mode they come from the server's recommendation endpoint, so
+// the wording and the quantities are the ones the inventory engine produced
+// rather than a second, browser-side restatement of them.
 
 import { getDB, latency } from './mock/db';
 import { get30DayForecast } from './forecastService';
+import { usingApi } from './api/mode';
+import * as api from './api/intelligence';
 
 export const REC_TYPES = ['critical', 'reorder', 'monitor', 'no_action'];
 
@@ -79,6 +86,7 @@ function buildRecommendation(db, p) {
 }
 
 export async function getRecommendations(user, { filter = 'all' } = {}) {
+  if (usingApi()) return api.getRecommendations(user, { filter });
   await latency(550);
   const db = getDB(user);
   const all = db.products.map((p) => buildRecommendation(db, p));

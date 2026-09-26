@@ -136,10 +136,12 @@ export default function SalesDataPage() {
     toast.info('File ready — validating now.');
     setPhase('validating');
     setStepIndex(2);
-    // brief simulated processing so the steps feel real
-    setTimeout(() => {
+    // In api mode validation is a server round trip, so the delay only exists
+    // to keep the step indicator from flashing; it is a no-op in mock mode
+    // where the store is in-memory.
+    setTimeout(async () => {
       try {
-        const result = validateSalesCsv(text, user);
+        const result = await validateSalesCsv(text, user);
         setValidation(result);
         setPhase('ready');
         setStepIndex(2);
@@ -562,6 +564,16 @@ function ChannelBadge({ channel }) {
     'Offline Store': 'bg-slate-100 text-slate-600 border-slate-200',
     Import: 'bg-emerald-50 text-emerald-700 border-emerald-200',
   };
+  // The canonical sales contract records no channel, so a row served by the API
+  // genuinely has none. Say so rather than rendering an empty badge or
+  // defaulting it to a channel the sale was never attributed to.
+  if (!channel) {
+    return (
+      <span className="text-xs text-slate-400" title="The sales contract does not record a channel.">
+        Not recorded
+      </span>
+    );
+  }
   return (
     <span className={cn('inline-block rounded-full border px-2 py-0.5 text-[10px] font-bold', tones[channel] || tones['Offline Store'])}>
       {channel}

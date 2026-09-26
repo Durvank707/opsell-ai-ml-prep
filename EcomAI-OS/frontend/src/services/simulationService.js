@@ -1,7 +1,14 @@
 // Inventory simulation (V2) — evaluates inventory policies against historical demand.
+//
+// In `mock` mode the policies are replayed in the browser against the
+// deterministic store. In `api` mode the same call is a real backtest on the
+// server, run through the shared simulation engine over this tenant's own sales
+// history and this tenant's own error spread.
 
 import { getDB, latency, randomError } from './mock/db';
 import { hashString, mulberry32 } from '../lib/utils';
+import { usingApi } from './api/mode';
+import * as api from './api/intelligence';
 
 export const POLICY_PRESETS = [
   { key: 'current', label: 'Current Policy', safetyMultiplier: 1, reorderMultiplier: 1, orderMultiplier: 1 },
@@ -164,6 +171,7 @@ function runPolicy(db, productIds, config, policy) {
 }
 
 export async function runSimulation(user, config) {
+  if (usingApi()) return api.runSimulation(user, config);
   await latency(2200);
 
   const db = getDB(user);

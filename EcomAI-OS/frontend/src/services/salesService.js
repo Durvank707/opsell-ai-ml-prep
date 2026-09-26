@@ -1,7 +1,15 @@
 // Sales data service — summary, records table, CSV upload + validation.
+//
+// The default `mock` mode validates and commits in the browser. With
+// `VITE_DATA_MODE=api` both steps go through the tenant API, which is the only
+// authority on what the canonical sales contract accepts. `validateSalesCsv` is
+// async in both modes for that reason: a server-side rule check cannot be
+// answered synchronously from the browser.
 
 import { getDB, latency, randomError } from './mock/db';
 import { parseCSV, downloadFile } from '../lib/utils';
+import { usingApi } from './api/mode';
+import * as api from './api/sales';
 
 const CHANNELS = ['Online Store', 'Amazon', 'Flipkart', 'Myntra', 'Offline Store'];
 
@@ -48,12 +56,14 @@ export const getSalesSummary = memo((db) => {
 });
 
 export async function getSalesData(user) {
+  if (usingApi()) return api.getSalesData(user);
   await latency(450);
   const db = getDB(user);
   return getSalesSummary(db);
 }
 
 export async function listSalesRecords(user, filters = {}) {
+  if (usingApi()) return api.listSalesRecords(user, filters);
   await latency(400);
   const db = getDB(user);
   const {
@@ -106,18 +116,24 @@ function pageRecords(records, page, pageSize) {
 
 // ------------------------------------------------------------------ upload
 
-export const SAMPLE_CSV_TEMPLATE = `date,product_id,units_sold,channel
-2026-09-01,P001,14,Online Store
-2026-09-02,P001,9,Amazon
-2026-09-01,P002,3,Flipkart
-2026-09-02,P002,5,Online Store`;
+// The columns the canonical sales contract actually stores. `date`,
+// `product_id` and `units_sold` are required; `price`, `category` and
+// `promotion` are optional but are what the eligibility gate checks before it
+// will use the trained model, so a file that supplies them gets a real forecast
+// rather than a baseline with derived features.
+export const SAMPLE_CSV_TEMPLATE = `date,product_id,units_sold,price,category,promotion
+2026-09-01,P001,14,1299,Electronics,false
+2026-09-02,P001,9,1299,Electronics,true
+2026-09-01,P002,3,899,Home,false
+2026-09-02,P002,5,899,Home,false`;
 
 /**
  * Validate a CSV string against the workspace catalog. Never silently accepts
  * invalid data: every erroneous row is reported so the user can inspect it
  * before importing. Throws on structurally broken files.
  */
-export function validateSalesCsv(csvText, user) {
+export async function validateSalesCsv(csvText, user) {
+  if (usingApi()) return api.validateSalesCsv(csvText, user);
   const db = getDB(user);
   if (!csvText || !csvText.trim()) throw randomError('The uploaded file is empty.');
 
@@ -200,8 +216,9 @@ export function validateSalesCsv(csvText, user) {
  * are surfaced to the user both in the returned result and as structured UI.
  */
 export async function uploadSalesCsv(user, csvText) {
+  if (usingApi()) return api.uploadSalesCsv(user, csvText);
   await latency(1200);
-  const result = validateSalesCsv(csvText, user);
+  const result = await validateSalesCsv(csvText, user);
   if (result.validRows === 0) {
     throw randomError(
       result.errors.some((e) => e.reason.includes('Unknown product'))
@@ -216,13 +233,14 @@ export async function uploadSalesCsv(user, csvText) {
     ok: true,
     message:
       result.errors.length > 0
-        ? `${result.errors.length} row${result.errors.length === 1 ? '' : 's'} were skipped during validation. ${result.validRows} valid row${result.validRows === 1 ? '' : 's'} were imported.`
+        ? `${result.errors.length} row${result.errors.length === 1 ? ' was' : 's were'} skipped during validation. ${result.validRows} valid row${result.validRows === 1 ? ' was' : 's were'} imported.`
         : `${result.validRows} row${result.validRows === 1 ? '' : 's'} imported successfully.`,
   };
 }
 
 /** Import the full generated store history (used as a demo shortcut). */
 export async function loadSampleSalesData(user) {
+  if (usingApi()) return api.loadSampleSalesData(user);
   await latency(1500);
   const db = getDB(user);
   if (db.products.length === 0) throw randomError('Add at least one product before importing sales data.');

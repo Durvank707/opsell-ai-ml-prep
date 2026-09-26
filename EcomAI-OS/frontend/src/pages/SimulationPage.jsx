@@ -6,6 +6,7 @@ import EmptyState from '../components/ui/EmptyState';
 import SimulationConfig from '../components/SimulationConfig';
 import SimulationResults from '../components/SimulationResults';
 import { listProducts } from '../services/inventoryService';
+import { getSalesData } from '../services/salesService';
 import { runSimulation } from '../services/simulationService';
 import { useAuth } from '../context/AuthContext';
 import { useData } from '../context/DataContext';
@@ -22,6 +23,26 @@ export default function SimulationPage() {
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState(null);
   const [lastConfig, setLastConfig] = useState(null);
+  const [dataRange, setDataRange] = useState(null);
+  const [rangeReady, setRangeReady] = useState(false);
+
+  // The demand span the simulation form defaults to. Read alongside the product
+  // list because a backtest replays recorded sales, so the period has to be one
+  // this tenant actually recorded rows in.
+  const loadRange = useCallback(async () => {
+    try {
+      const summary = await getSalesData(user);
+      if (summary.dateFrom || summary.dateTo) {
+        setDataRange({ from: summary.dateFrom, to: summary.dateTo });
+      }
+    } catch {
+      // The form falls back to a calendar window, so a missing range is not
+      // worth an error on a page whose subject is the simulation itself.
+      setDataRange(null);
+    } finally {
+      setRangeReady(true);
+    }
+  }, [user]);
 
   const loadProducts = useCallback(async () => {
     setLoadingProducts(true);
@@ -39,6 +60,10 @@ export default function SimulationPage() {
     loadProducts();
   }, [loadProducts]);
 
+  useEffect(() => {
+    loadRange();
+  }, [loadRange]);
+
   const handleRun = async (config) => {
     setRunning(true);
     setLastConfig(config);
@@ -53,7 +78,10 @@ export default function SimulationPage() {
     }
   };
 
-  if (loadingProducts && products.length === 0) {
+  // The form seeds its period from the loaded range, so the page waits for both
+  // reads rather than mounting the form against defaults it would have to
+  // discard a moment later.
+  if (loadingProducts || !rangeReady) {
     return (
       <div className="space-y-5">
         <PageHeader title="Simulation" subtitle="Test inventory policies against historical demand." />
@@ -91,6 +119,7 @@ export default function SimulationPage() {
           <div className="xl:sticky xl:top-20 xl:max-h-[calc(100vh-6rem)] xl:overflow-y-auto xl:pr-1">
             <SimulationConfig
               products={products}
+              dataRange={dataRange}
               onRun={handleRun}
               running={running}
               progressStep={running ? 'Evaluating demand, stockouts and costs across the selected period…' : ''}

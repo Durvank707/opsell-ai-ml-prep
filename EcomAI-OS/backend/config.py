@@ -35,6 +35,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # Canonical raw store — additive, byte-verified on disk (data/raw/sales.csv).
 RAW_SALES_CSV = REPO_ROOT / "data" / "raw" / "sales.csv"
 
+# Canonical inventory snapshot that accompanies it (data/raw/
+# inventory_snapshot.csv). Without it a seeded catalog starts at zero stock on
+# every product, which makes every product look critically short and tells the
+# tenant nothing about its own inventory health.
+RAW_INVENTORY_CSV = REPO_ROOT / "data" / "raw" / "inventory_snapshot.csv"
+
 # Search order: explicit ECOMAI_OS_ENV_FILE -> backend/.env -> repo root .env.
 def _candidate_env_files() -> list[str]:
     explicit = os.environ.get("ECOMAI_OS_ENV_FILE", "").strip()
