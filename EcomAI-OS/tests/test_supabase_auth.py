@@ -516,24 +516,85 @@ def test_verify_password_never_uses_the_service_role_key(monkeypatch):
 
 
 def test_verify_password_rejects_a_response_without_a_user(monkeypatch):
+    """A 200 with no account is a refusal, not a malformed request.
+
+    403 for the same reason as a wrong password: the caller is authenticated and
+    the answer is "no". Treating it as anything else would let the browser
+    decide the session had ended.
+    """
+
     _enable_supabase_auth(monkeypatch)
     _install(monkeypatch, _GoTrue({"/token": {"access_token": "x"}}))
 
     with pytest.raises(SupabaseAuthError) as caught:
         supabase_auth.verify_password(Settings(), "person@example.com", "wrong")
-    assert caught.value.status_code == 401
+    assert caught.value.status_code == 403
+    assert str(caught.value) == "The current password is incorrect."
 
 
 def test_wrong_password_and_unknown_account_are_indistinguishable(monkeypatch):
-    # Both come back as the same 401 from GoTrue, and _safe_detail maps both to
-    # the same sentence, so the error cannot be used to test whether an address
-    # is registered.
+    # GoTrue answers both of these with the same 400, and so does this layer: one
+    # 403 with one sentence, so the error cannot be used to test whether an
+    # address is registered. 403 rather than 401 because the caller is already
+    # authenticated -- the request is understood and refused, which is what 403
+    # means, and it keeps 401 reserved for "your session credential is not
+    # acceptable" so the browser can tell the two apart.
     _enable_supabase_auth(monkeypatch)
     _install(monkeypatch, _GoTrue({"/token": _http_error(400, {"msg": "Invalid"})}))
 
     with pytest.raises(SupabaseAuthError) as caught:
         supabase_auth.verify_password(Settings(), "ghost@example.com", "wrong")
-    assert str(caught.value) == "Supabase Auth rejected the request."
+    assert str(caught.value) == "The current password is incorrect."
+    assert caught.value.status_code == 403
+
+
+def test_verify_password_does_not_flatten_a_throttle(monkeypatch):
+    """A rate limit is not a credential verdict and must not read as one."""
+
+    _enable_supabase_auth(monkeypatch)
+    _install(monkeypatch, _GoTrue({"/token": _http_error(429, None)}))
+
+    with pytest.raises(SupabaseAuthError) as caught:
+        supabase_auth.verify_password(Settings(), "person@example.com", "right")
+    assert caught.value.status_code == 429
+
+
+def test_verify_password_reports_an_upstream_outage_as_such(monkeypatch):
+    """A 5xx is not a wrong password, and must not be reported as one."""
+
+    _enable_supabase_auth(monkeypatch)
+    _install(monkeypatch, _GoTrue({"/token": _http_error(503, None)}))
+
+    with pytest.raises(SupabaseAuthError) as caught:
+        supabase_auth.verify_password(Settings(), "person@example.com", "right")
+    assert caught.value.status_code == 503
+
+
+def test_a_refused_authenticated_caller_is_never_a_401(monkeypatch):
+    """401 on this API means the session is over; the browser relies on that.
+
+    A 401 makes the client discard its tokens and bounce the user to the login
+    page. So an endpoint that refuses an otherwise-valid session must use 403,
+    or a user who mistypes their current password is signed out instead of told
+    to retype it. This asserts that for both endpoints that check a credential
+    in the request body, and that the 401 the auth layer *does* return carries
+    the header the browser keys on.
+    """
+
+    _enable_supabase_auth(monkeypatch)
+    _install(monkeypatch, _GoTrue({"/token": _http_error(400, {})}))
+
+    assert client.post(
+        "/api/auth/change-password",
+        json={"currentPassword": "wrong", "newPassword": "newpass123"},
+        headers=_auth_headers(email="person@example.com"),
+    ).status_code == 403
+    assert _delete_account(password="wrong").status_code == 403
+
+    # And the genuine session failure is a 401 that does carry the header.
+    response = client.get("/api/v2/products", headers={"Authorization": "Bearer nope"})
+    assert response.status_code == 401
+    assert "bearer" in response.headers.get("www-authenticate", "").lower()
 
 
 def test_sign_out_other_sessions_forwards_the_caller_token(monkeypatch):
@@ -583,21 +644,85 @@ def test_account_routes_require_supabase_auth(monkeypatch):
         assert "Supabase Auth is not configured" in response.json()["detail"]
 
 
-def test_local_issuer_routes_still_refuse_under_supabase(monkeypatch):
-    # The local issuer and Supabase Auth are separate systems. Enabling Supabase
-    # must not quietly switch signup/login over to it.
+def test_session_routes_use_supabase_and_never_the_local_issuer(monkeypatch):
+    # The session routes are issuer-aware. Under Supabase they must talk to
+    # GoTrue, not to a local sqlite database that holds none of these accounts.
     _enable_supabase_auth(monkeypatch)
-    _install(monkeypatch, _GoTrue())
+    gotrue = _install(monkeypatch, _GoTrue())
 
-    assert client.post(
+    response = client.post(
         "/api/auth/login", json={"email": "a@b.co", "password": "x1234567"}
-    ).status_code == 503
-    assert client.post(
-        "/api/auth/signup", json={"email": "a@b.co", "password": "x1234567"}
-    ).status_code == 503
-    assert client.get("/api/auth/me", headers=_auth_headers()).status_code == 503
-    # /logout is deliberately issuer-agnostic: it records the intent to end a
-    # session and the client clears its own token. Unchanged from before.
+    )
+
+    # The empty stub answers 200 with no token, which is not a usable session.
+    assert response.status_code == 401
+    calls = gotrue.for_path("/token")
+    assert len(calls) == 1
+    assert calls[0].get_method() == "POST"
+    assert "grant_type=password" in calls[0].full_url
+
+
+def test_local_only_deployment_refuses_the_supabase_account_routes(monkeypatch):
+    # The other direction: with no Supabase project configured, the six account
+    # actions have no provider and must fail closed rather than appear to work.
+    monkeypatch.setenv("LOCAL_AUTH_ENABLED", "true")
+    monkeypatch.setenv("PASSWORD_RESET_REDIRECT_URL", REDIRECT)
+
+    cases = [
+        ("POST", "/api/auth/password-reset", {"email": "a@example.com"}),
+        ("POST", "/api/auth/reset-password", {"token": "t", "password": "abcd1234"}),
+        ("PATCH", "/api/auth/me", {"name": "New"}),
+        ("POST", "/api/auth/change-password",
+         {"currentPassword": "abcd1234", "newPassword": "efgh5678"}),
+        ("POST", "/api/auth/logout-all", {}),
+        ("DELETE", "/api/auth/me", {"password": "abcd1234"}),
+    ]
+    for method, path, payload in cases:
+        response = client.request(
+            method,
+            path,
+            json=payload,
+            headers=_auth_headers(email="a@example.com"),
+        )
+        assert response.status_code == 503, path
+        assert "Supabase Auth is not configured" in response.json()["detail"]
+
+
+def test_local_only_deployment_has_no_refresh_token_to_renew(monkeypatch):
+    """The local issuer mints stateless tokens, so /refresh must say so."""
+
+    monkeypatch.setenv("LOCAL_AUTH_ENABLED", "true")
+
+    response = client.post("/api/auth/refresh", json={"refreshToken": "whatever"})
+
+    assert response.status_code == 503
+    assert "does not issue refresh tokens" in response.json()["detail"]
+
+
+def test_session_routes_report_no_provider_rather_than_falling_back(monkeypatch):
+    """With neither issuer enabled, signing in must not fall through."""
+
+    # The autouse fixture already leaves LOCAL_AUTH_ENABLED=false and
+    # USE_SUPABASE=false, which is exactly this configuration.
+
+    for path, payload in (
+        ("/api/auth/login", {"email": "a@b.co", "password": "x1234567"}),
+        ("/api/auth/signup", {"email": "a@b.co", "password": "x1234567"}),
+        ("/api/auth/refresh", {"refreshToken": "whatever"}),
+    ):
+        response = client.post(path, json=payload)
+        assert response.status_code == 503, path
+        assert "No identity provider is configured" in response.json()["detail"]
+
+
+def test_logout_still_answers_200_when_no_provider_is_configured(monkeypatch):
+    # Deliberate and unchanged: a sign-out that failed would strand a token in
+    # the browser with no way to clear it.
+
+    response = client.post("/api/auth/logout", headers=_auth_headers())
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
 
 
 # --------------------------------------------------------- password-reset route
@@ -851,7 +976,12 @@ def test_change_password_refuses_a_wrong_current_password(monkeypatch):
         headers=_auth_headers(email="person@example.com"),
     )
 
-    assert response.status_code == 400
+    # 403, not 401 and not GoTrue's 400: the caller is authenticated and the
+    # request is understood, so it is refused rather than unauthenticated. A 401
+    # here would make the browser discard the session and bounce the user to the
+    # login page instead of telling them to retype their password.
+    assert response.status_code == 403
+    assert response.json()["detail"] == "The current password is incorrect."
     # Nothing was written: the new password is never set without verification.
     assert gotrue.for_path("/admin") == []
 
@@ -1011,6 +1141,36 @@ def test_delete_account_purges_every_owned_table_in_pages(monkeypatch):
     assert all("limit=500" in r.full_url for r in gotrue.for_path("/rest"))
 
 
+def test_delete_account_purge_asks_for_rows_the_way_postgrest_expects(monkeypatch):
+    """`return` is a Prefer header, never a query parameter.
+
+    Every other purge test stubs PostgREST, so a malformed request looks fine to
+    all of them -- and this one did, right up to a live run where the purge
+    returned PGRST100 for *every* tenant and every account deletion reported a
+    failure. Sent as a query parameter, PostgREST reads "return" as a filter name
+    and rejects the request outright:
+
+        PGRST100 unexpected "r" expecting "not" or operator (eq, gt, ...)
+
+    Without the representation the paging loop cannot count what it removed, so
+    this is not a cosmetic detail: the header is what makes the count true.
+    """
+
+    _enable_supabase_auth(monkeypatch)
+    gotrue = _install(
+        monkeypatch,
+        _GoTrue({"/token": {"user": _gotrue_user()}, "/admin": None, "/rest": []}),
+    )
+
+    assert _delete_account().status_code == 200
+
+    deletes = gotrue.for_path("/rest")
+    assert deletes, "the purge issued no requests at all"
+    for request in deletes:
+        assert "return=" not in request.full_url, request.full_url
+        assert request.headers.get("Prefer") == "return=representation"
+
+
 def test_delete_account_purge_is_scoped_to_the_tenant(monkeypatch):
     _enable_supabase_auth(monkeypatch)
     gotrue = _install(
@@ -1034,7 +1194,10 @@ def test_delete_account_refuses_without_the_password(monkeypatch):
 
     response = _delete_account(password="wrongpass")
 
-    assert response.status_code == 400
+    # 403 for the same reason change-password uses one, and the 401 the browser
+    # treats as a dead session is kept out of reach here.
+    assert response.status_code == 403
+    assert response.json()["detail"] == "The current password is incorrect."
     # Neither the account nor its rows may be touched without proof.
     assert gotrue.for_path("/admin") == []
     assert gotrue.for_path("/rest") == []

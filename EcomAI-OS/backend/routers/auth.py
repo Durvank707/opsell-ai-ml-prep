@@ -1,26 +1,33 @@
 """Authentication endpoints.
 
-Two issuers live behind one router, and the split is deliberate:
+Two issuers live behind one router, and they are mutually exclusive in
+configuration: ``LOCAL_AUTH_ENABLED=true`` for the local development issuer,
+``USE_SUPABASE=true`` for Supabase Auth. :func:`_issuer` picks between them, so
+there is never a tie to break and never a fallback from one to the other.
 
-* ``signup``/``login``/``me``/``logout`` are the optional **local** development
-  issuer. They are gated on ``LOCAL_AUTH_ENABLED=true`` and fail closed for
-  Supabase and production configuration in :class:`backend.config.Settings`.
+* ``signup``/``login``/``refresh``/``me``/``logout`` are the **session** routes.
+  They work with whichever issuer is configured and return the same envelope
+  either way, so switching identity providers is a configuration change.
 * The six **account** actions (password reset, profile, password change,
-  sign-out-everywhere, account deletion) are backed by **Supabase Auth**. They
-  exist because the frontend offered those actions and there was nowhere for
-  them to go: the local issuer has no reset-token, revocation, or deletion
+  sign-out-everywhere, account deletion) are backed by **Supabase Auth** only.
+  They exist because the frontend offered those actions and there was nowhere
+  for them to go: the local issuer has no reset-token, revocation, or deletion
   story, and inventing one would be a second, weaker identity system.
 
-The account routes are gated on Supabase Auth being configured, not on the local
-issuer, so they work under ``USE_SUPABASE=true`` where the local routes 503.
+The account routes are gated on Supabase Auth being configured rather than on
+the local issuer, so they are unavailable -- with an honest 503 -- under a
+local-only deployment.
 
 The service-role key stays in :mod:`backend.supabase_auth` and is never
 serialized into a response. The browser only ever presents the credential it
-already holds: its own access token, or a recovery token from a reset link.
+already holds: its own access token, its own refresh token, or a recovery token
+from a reset link. Signing up and signing in use the publishable key only, so no
+privileged credential is involved in establishing a session.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -40,6 +47,7 @@ from backend.local_auth import (
 from backend.supabase_auth import SupabaseAuthError
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+_logger = logging.getLogger(__name__)
 
 MIN_PASSWORD = 8
 MAX_PASSWORD = 256
@@ -66,6 +74,17 @@ _PURGE_PROBE_COLUMN = {
 }
 _PURGE_PAGE = 500
 _PURGE_MAX_PAGES = 2_000  # a million rows; a guard, not an expected limit
+
+
+def _is_already_gone(status_code: Optional[int]) -> bool:
+    """Whether an upstream refusal means "there was nothing to revoke".
+
+    A 4xx from GoTrue on sign-out means it could not find the session. That is
+    the desired end state -- the credential is not usable -- so it is not an
+    error. Only a 5xx or a transport error leaves the outcome unknown.
+    """
+
+    return status_code is not None and 400 <= status_code < 500
 
 
 def _purge_tenant_rows(user_id: str) -> int:
@@ -96,9 +115,14 @@ def _purge_tenant_rows(user_id: str) -> int:
                 rows = _request(
                     "DELETE",
                     table=table,
+                    # `return` is a Prefer header, not a query parameter. As a
+                    # query parameter PostgREST reads it as a filter named
+                    # "return" and rejects the whole request with PGRST100, which
+                    # would turn every purge into a reported failure. The
+                    # representation is what makes the paging count possible.
+                    prefer="return=representation",
                     query={
                         "user_id": f"eq.{user_id}",
-                        "return": "representation",
                         "select": _PURGE_PROBE_COLUMN[table],
                         "order": f"{_PURGE_PROBE_COLUMN[table]}.asc",
                         "limit": str(_PURGE_PAGE),
@@ -157,6 +181,54 @@ class PasswordChange(BaseModel):
 
 class AccountDeletion(BaseModel):
     password: str = Field(min_length=1, max_length=MAX_PASSWORD)
+
+
+class SessionRefresh(BaseModel):
+    # Issued alongside the access token at sign-in. Long-lived, so it is a
+    # credential: it is never logged, never echoed, and never accepted from a
+    # query string.
+    refreshToken: str = Field(min_length=1, max_length=4096)
+
+
+class SessionLogout(BaseModel):
+    # Optional so that a caller with no refresh token -- the local issuer, or an
+    # older client -- can still sign out. It is the credential that actually
+    # gets revoked, so it is forwarded to GoTrue and never used for anything else.
+    refreshToken: Optional[str] = Field(default=None, max_length=4096)
+
+
+def _issuer(settings: Settings) -> str:
+    """Decide which identity provider owns the session routes.
+
+    ``LOCAL_AUTH_ENABLED`` and ``USE_SUPABASE`` are mutually exclusive in
+    configuration, so this never has to break a tie: exactly one issuer is
+    available, and reporting "not configured" when neither is keeps the routes
+    failing closed rather than falling through to a provider that holds no
+    accounts.
+    """
+
+    if supabase_auth.supabase_auth_configured(settings):
+        return "supabase"
+    if settings.local_auth_enabled:
+        return "local"
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=(
+            "No identity provider is configured. Enable the local issuer with "
+            "LOCAL_AUTH_ENABLED=true, or Supabase Auth with USE_SUPABASE=true."
+        ),
+    )
+
+
+def _session_or_503():
+    try:
+        settings = Settings()
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication is not configured on the server.",
+        ) from exc
+    return settings, _issuer(settings)
 
 
 def _settings_or_503() -> Settings:
@@ -268,12 +340,42 @@ def _require_current_password(
     _call_goTrue(supabase_auth.verify_password, settings, address, password)
 
 
-# ---------------------------------------------------------------- local issuer
+# ------------------------------------------------------------------- sessions
+
+# The four routes below work with whichever issuer is configured. Both return
+# the same envelope -- ``{user, access_token, refresh_token, token_type}`` -- so
+# the frontend has one shape to handle and switching identity providers is a
+# configuration change rather than a code change.
 
 
 @router.post("/signup", status_code=status.HTTP_201_CREATED)
 async def signup(payload: SignupRequest):
-    settings = _settings_or_503()
+    settings, issuer = _session_or_503()
+    if issuer == "supabase":
+        try:
+            email = supabase_auth.normalize_email(payload.email)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        metadata = {}
+        if payload.fullName:
+            metadata["name"] = payload.fullName
+        if payload.businessName:
+            metadata["business_name"] = payload.businessName
+        session = _call_goTrue(
+            supabase_auth.sign_up, settings, email, payload.password, metadata
+        )
+        if not session["access_token"]:
+            # "Confirm email" is on. The account exists but there is no session
+            # to hand over, and the user has to act before they can sign in.
+            return {
+                "user": session["user"],
+                "access_token": "",
+                "refresh_token": "",
+                "token_type": session["token_type"],
+                "confirmation_required": True,
+            }
+        return {**session, "confirmation_required": False}
+
     try:
         store = get_store(settings)
         user = store.create_user(
@@ -287,12 +389,29 @@ async def signup(payload: SignupRequest):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except LocalAuthError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {"user": user, "access_token": token, "token_type": "bearer"}
+    # The local issuer mints stateless HS256 tokens with no refresh, so
+    # ``refresh_token`` is empty and the client re-authenticates on expiry.
+    return {
+        "user": user,
+        "access_token": token,
+        "refresh_token": "",
+        "token_type": "bearer",
+        "confirmation_required": False,
+    }
 
 
 @router.post("/login")
 async def login(payload: LoginRequest):
-    settings = _settings_or_503()
+    settings, issuer = _session_or_503()
+    if issuer == "supabase":
+        try:
+            email = supabase_auth.normalize_email(payload.email)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _call_goTrue(
+            supabase_auth.sign_in, settings, email, payload.password
+        )
+
     try:
         store = get_store(settings)
         user = store.authenticate(email=payload.email, password=payload.password)
@@ -301,22 +420,101 @@ async def login(payload: LoginRequest):
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except LocalAuthError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {"user": user, "access_token": token, "token_type": "bearer"}
+    return {
+        "user": user,
+        "access_token": token,
+        "refresh_token": "",
+        "token_type": "bearer",
+    }
+
+
+@router.post("/refresh")
+async def refresh(payload: SessionRefresh):
+    """Exchange a refresh token for a new access token.
+
+    Supabase access tokens last about an hour. Without this a signed-in user is
+    dropped at the end of it, and the only way back is a password they may not
+    still have. The local issuer has no refresh token, so it answers 503 rather
+    than pretending to renew one.
+    """
+
+    settings, issuer = _session_or_503()
+    if issuer != "supabase":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The local identity provider does not issue refresh tokens.",
+        )
+    return _call_goTrue(
+        supabase_auth.refresh_session, settings, payload.refreshToken
+    )
 
 
 @router.get("/me")
 async def me(principal: AuthPrincipal = Depends(require_auth)):
-    settings = _settings_or_503()
-    user = get_store(settings).get_user(principal.user_id or "")
+    settings, issuer = _session_or_503()
+    user_id = str(principal.user_id or "")
+    if issuer == "supabase":
+        # Addressed by the signed subject only, so a caller cannot read another
+        # account by naming one.
+        return {"user": _call_goTrue(supabase_auth.get_user, settings, user_id)}
+
+    user = get_store(settings).get_user(user_id)
     if user is None:
         raise HTTPException(status_code=401, detail="The local account no longer exists.")
     return {"user": user}
 
 
 @router.post("/logout")
-async def logout(principal: AuthPrincipal = Depends(require_auth)):
-    # Access tokens are short-lived and stateless. The client clears its token;
-    # this endpoint makes that intent explicit and leaves an auth audit hook.
+async def logout(
+    principal: AuthPrincipal = Depends(require_auth),
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer_credentials),
+    payload: Optional[SessionLogout] = None,
+):
+    # Deliberately issuer-agnostic, and deliberately still 200 when no provider
+    # is configured: a sign-out that failed would leave a token in the browser
+    # with no way to clear it, and clearing it locally is the part that
+    # actually matters.
+    #
+    # A failed *revocation* is not swallowed silently, though. Telling the
+    # caller 200 while its refresh token is still live would be a
+    # security-relevant lie, so the upstream reason is logged for an operator
+    # even though the caller's own sign-out has genuinely succeeded.
+    try:
+        settings, issuer = _session_or_503()
+    except HTTPException:
+        return {"ok": True, "user_id": principal.user_id}
+
+    if issuer == "supabase":
+        try:
+            supabase_auth.sign_out(
+                settings,
+                access_token=credentials.credentials if credentials is not None else None,
+                refresh_token=(payload.refreshToken if payload else None),
+            )
+        except SupabaseAuthError as exc:
+            # GoTrue answers 4xx when the session it was asked to revoke is
+            # already gone. That is the outcome this route wanted, not a
+            # failure, and it is the normal answer after a password change --
+            # which revokes the session itself. Reporting it at warning level
+            # made every password change look like a security incident.
+            if _is_already_gone(exc.status_code):
+                _logger.info(
+                    "Sign-out found no live session to revoke (%s). Nothing to "
+                    "revoke; the caller is signed out. Reason: %s",
+                    exc.status_code,
+                    exc,
+                )
+            else:
+                # A 5xx or a transport failure means the outcome is genuinely
+                # unknown, so this stays loud: the caller was told it was signed
+                # out and that may not be true.
+                _logger.warning(
+                    "Supabase Auth could not confirm a sign-out revocation (%s). "
+                    "The caller is signed out locally, but that refresh token may "
+                    "still be usable. Sign-out failures: %s",
+                    exc.status_code,
+                    exc,
+                )
     return {"ok": True, "user_id": principal.user_id}
 
 

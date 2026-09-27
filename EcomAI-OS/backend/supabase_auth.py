@@ -336,23 +336,39 @@ def verify_password(settings: Settings, email: str, password: str) -> Dict[str, 
     A password change and an account deletion both need proof that the caller
     holds the current password. Rather than adding a second copy of GoTrue's
     hashing to compare against, this asks GoTrue to do what it already does
-    and treats its answer as authoritative. Failure is reported as a
-    ``SupabaseAuthError`` with status 401 and is deliberately
-    indistinguishable between an unknown address and a wrong password.
+    and treats its answer as authoritative.
+
+    Failure is a **403**, not a 401, and that distinction is load-bearing. The
+    caller is already authenticated; the request is understood and refused,
+    which is exactly what 403 means. It also keeps 401 unambiguous: on this API
+    a 401 means "the session credential is not acceptable" and is always
+    accompanied by ``WWW-Authenticate: Bearer``, which is what lets the browser
+    tell a dead session from a wrong password. Reporting a mistyped current
+    password as 401 signed the user out instead of telling them to retype it.
+
+    The upstream status is collapsed the same way :func:`sign_in` collapses it,
+    so a wrong password and an unknown account are one indistinguishable answer.
+    A 429 is passed through: a throttle is not a credential verdict.
     """
 
-    raw = _auth_request(
-        "POST",
-        "/token",
-        settings=settings,
-        query={"grant_type": "password"},
-        body={"email": email, "password": password},
-    )
+    try:
+        raw = _auth_request(
+            "POST",
+            "/token",
+            settings=settings,
+            query={"grant_type": "password"},
+            body={"email": email, "password": password},
+        )
+    except SupabaseAuthError as exc:
+        if _credentials_rejected(exc.status_code):
+            raise SupabaseAuthError(
+                "The current password is incorrect.", status_code=403
+            ) from exc
+        raise
     user = raw.get("user") if isinstance(raw, Mapping) else None
     if not isinstance(user, Mapping):
         raise SupabaseAuthError(
-            "Supabase Auth did not return an account for those credentials.",
-            status_code=401,
+            "The current password is incorrect.", status_code=403
         )
     return _user_payload(user)
 
@@ -433,3 +449,171 @@ def sign_out_other_sessions(settings: Settings, access_token: str) -> None:
         query={"scope": "others"},
         token=access_token,
     )
+
+
+def sign_out(
+    settings: Settings,
+    *,
+    access_token: Optional[str] = None,
+    refresh_token: Optional[str] = None,
+) -> None:
+    """Revoke the caller's own session, refresh token included.
+
+    An access token is stateless and cannot be withdrawn, but the refresh token
+    behind it can, and that is what would otherwise let a browser that signed
+    out keep minting new access tokens for the length of the refresh window.
+
+    When the browser holds a refresh token it is sent in the body, because that
+    names the exact session to destroy rather than whichever one the bearer
+    happens to map to -- the difference matters as soon as a device has more than
+    one live session. The access token still has to be sent as the bearer:
+    GoTrue answers a body-only request with ``401 no_authorization`` ("This
+    endpoint requires a valid Bearer token") and revokes nothing, which would
+    leave the caller believing a session was destroyed that is still live.
+
+    That makes the access token a requirement, so a caller whose access token
+    has expired cannot revoke this way. The browser is responsible for renewing
+    before signing out; the failure is not hidden if it does not.
+
+    With neither token there is nothing to revoke, and saying so is better than
+    issuing a request that is guaranteed to be rejected.
+    """
+
+    if not access_token and not refresh_token:
+        return
+    body = {"refresh_token": refresh_token} if refresh_token else None
+    _auth_request(
+        "POST",
+        "/logout",
+        settings=settings,
+        token=access_token,
+        body=body,
+    )
+
+
+# ------------------------------------------------------------------- sessions
+
+
+_CREDENTIALS_REJECTED = "Email or password is incorrect."
+
+
+def _session_payload(raw: Any) -> Dict[str, Any]:
+    """Project a GoTrue token response onto the shape the frontend consumes.
+
+    An empty ``access_token`` means GoTrue acted on the account but issued no
+    session, which is exactly what a project with "Confirm email" enabled does
+    on signup. That is reported as-is rather than dressed up as a sign-in, so
+    the caller has to handle the unconfirmed case instead of storing an empty
+    credential and discovering the problem on the next protected request.
+    """
+
+    record = raw if isinstance(raw, Mapping) else {}
+    expires_in = record.get("expires_in")
+    if isinstance(expires_in, bool) or not isinstance(expires_in, (int, float)):
+        expires_in = None
+    return {
+        "user": _user_payload(record.get("user")),
+        "access_token": str(record.get("access_token") or "").strip(),
+        "refresh_token": str(record.get("refresh_token") or "").strip(),
+        "token_type": str(record.get("token_type") or "bearer").strip() or "bearer",
+        "expires_in": int(expires_in) if expires_in is not None else None,
+    }
+
+
+def _credentials_rejected(status: Optional[int]) -> bool:
+    """Whether an upstream status means "these credentials are not valid"."""
+
+    return status is not None and 400 <= status < 500 and status != 429
+
+
+def sign_in(settings: Settings, email: str, password: str) -> Dict[str, Any]:
+    """Exchange an address and password for a session.
+
+    Every credential failure is reported as one 401, whatever GoTrue actually
+    said. Upstream separates an unknown address from a wrong password only in
+    wording, and a project with "Confirm email" enabled answers an unconfirmed
+    account differently from an unknown one -- any of which would let a caller
+    enumerate which addresses have accounts. A 429 is passed through as a 429,
+    because a throttle is neither a credential verdict nor a secret, and
+    flattening it would hide a real limit from the user.
+
+    "Check your inbox" guidance is deliberately not produced here. It belongs to
+    signup, where the address cannot already belong to somebody else.
+    """
+
+    try:
+        raw = _auth_request(
+            "POST",
+            "/token",
+            settings=settings,
+            query={"grant_type": "password"},
+            body={"email": email, "password": password},
+        )
+    except SupabaseAuthError as exc:
+        if _credentials_rejected(exc.status_code):
+            raise SupabaseAuthError(_CREDENTIALS_REJECTED, status_code=401) from None
+        raise
+    session = _session_payload(raw)
+    if not session["access_token"]:
+        # A 200 with no token is not a usable session. Reporting it as one would
+        # leave the caller holding an empty credential.
+        raise SupabaseAuthError(
+            "Supabase Auth did not issue a session for those credentials.",
+            status_code=401,
+        )
+    return session
+
+
+def sign_up(
+    settings: Settings,
+    email: str,
+    password: str,
+    metadata: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    """Create an account, and return a session when GoTrue issues one."""
+
+    body: Dict[str, Any] = {"email": email, "password": password}
+    if metadata:
+        # ``data`` becomes GoTrue's user_metadata. Only ever supplied by the
+        # server from a validated request model, never echoed from the caller.
+        body["data"] = {str(k): str(v) for k, v in metadata.items()}
+    raw = _auth_request("POST", "/signup", settings=settings, body=body)
+    session = _session_payload(raw)
+    if not session["user"]["id"]:
+        raise SupabaseAuthError(
+            "Supabase Auth did not return an account for that signup.",
+            status_code=502,
+        )
+    return session
+
+
+def refresh_session(settings: Settings, refresh_token: str) -> Dict[str, Any]:
+    """Trade a refresh token for a fresh access token.
+
+    A refresh token is a long-lived credential, so every failure here is
+    reported as one 401 whatever upstream called it: a token GoTrue does not
+    recognise must not be distinguishable from one it has revoked.
+    """
+
+    try:
+        raw = _auth_request(
+            "POST",
+            "/token",
+            settings=settings,
+            query={"grant_type": "refresh_token"},
+            body={"refresh_token": refresh_token},
+        )
+    except SupabaseAuthError as exc:
+        if _credentials_rejected(exc.status_code):
+            raise SupabaseAuthError(
+                "This session is no longer valid. Please sign in again.",
+                status_code=401,
+            ) from None
+        raise
+    session = _session_payload(raw)
+    if not session["access_token"]:
+        raise SupabaseAuthError(
+            "Supabase Auth did not issue a session for that refresh token.",
+            status_code=401,
+        )
+    return session
