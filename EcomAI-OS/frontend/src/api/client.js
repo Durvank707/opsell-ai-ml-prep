@@ -40,6 +40,19 @@ function errorMessage(payload, fallback) {
 }
 
 /**
+ * Whether a failed response means the session itself is over.
+ *
+ * The server sends `WWW-Authenticate: Bearer` with every 401 that means "your
+ * token is not acceptable", and nothing else. Checking for it is what keeps a
+ * wrong current password on `POST /auth/change-password` from being read as a
+ * dead session: that endpoint refuses with 403 precisely so a user who mistyped
+ * gets told to retype it instead of being bounced to the login page.
+ */
+function sessionHasEnded(response) {
+  return response.headers.has('WWW-Authenticate');
+}
+
+/**
  * Fetch a backend endpoint with optional bearer authentication.
  *
  * `auth: 'required'` is used for V2. `auth: 'none'` is useful for a future
@@ -75,7 +88,7 @@ export async function request(path, {
   const url = /^https?:\/\//i.test(path) ? path : `${base}${path}`;
   const response = await fetch(url, { ...init, body, headers: finalHeaders });
   const payload = await readResponse(response);
-  if (response.status === 401 && token && auth !== 'none') {
+  if (response.status === 401 && token && auth !== 'none' && sessionHasEnded(response)) {
     notifyAuthExpired();
   }
   if (!response.ok) {

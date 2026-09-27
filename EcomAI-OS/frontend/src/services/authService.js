@@ -10,7 +10,9 @@ import { hashString } from '../lib/utils';
 import {
   clearAccessToken,
   getAccessToken,
+  getRefreshToken,
   setAccessToken,
+  setRefreshToken,
 } from '../api/tokenStore';
 
 const USERS_KEY = 'ecomai.users.v1';
@@ -89,10 +91,92 @@ async function backendRequest(path, { method = 'GET', payload, auth = false } = 
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    if (response.status === 401) clearAccessToken();
+    // Only a 401 that says the *bearer* was rejected ends the session. A 401
+    // from a credential checked in the request body -- a wrong current password
+    // -- is a message to show the user, not a reason to wipe their tokens. The
+    // server keeps the two apart by status: 401 for the token, 403 for the
+    // credential.
+    if (response.status === 401 && response.headers.has('WWW-Authenticate')) {
+      clearAccessToken();
+    }
     throw new Error(body.detail || body.message || 'Authentication request failed.');
   }
   return body;
+}
+
+function tokenLooksExpired() {
+  const claims = decodeJwtPayload(getAccessToken());
+  if (!claims || claims.exp == null) return false;
+  // Renew slightly early, so a token cannot expire between this check and the
+  // server reading it.
+  return Number(claims.exp) * 1000 - 30_000 <= Date.now();
+}
+
+// The in-flight renewal, shared by concurrent callers. See renewOnce.
+let renewal = null;
+
+/**
+ * Trade the stored refresh token for a fresh access token.
+ *
+ * This is a public operation, so the refresh token is posted rather than the
+ * expired access token, and no privileged credential is involved.
+ */
+async function renewSession() {
+  const refreshToken = getRefreshToken();
+  if (!refreshToken) return null;
+  const base = String(import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/$/, '');
+  const response = await fetch(`${base}/auth/refresh`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ refreshToken }),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || !body?.access_token) {
+    // A refresh token GoTrue will not accept is a signed-out session, not a
+    // transient error. Clearing it stops every later request from retrying.
+    clearAccessToken();
+    throw new Error(
+      body?.detail || 'Your session has ended. Please sign in again.',
+    );
+  }
+  setAccessToken(body.access_token);
+  // Supabase rotates the refresh token on every renewal, so the replacement
+  // has to be stored: the old one is dead the moment this succeeds.
+  if (body.refresh_token) setRefreshToken(body.refresh_token);
+  return body.access_token;
+}
+
+// Concurrent callers must share one renewal. Supabase invalidates a refresh
+// token when it is used, so a second concurrent request would present a token
+// the first had just consumed and sign the user out mid-session.
+function renewOnce() {
+  if (!renewal) {
+    renewal = renewSession().finally(() => {
+      renewal = null;
+    });
+  }
+  return renewal;
+}
+
+/**
+ * Issue an authenticated backend request, renewing the access token first if
+ * the stored one has expired.
+ *
+ * The `exp` claim is a hint, not an authority: the backend verifies every
+ * token regardless, so a wrong guess here costs one wasted request and never a
+ * wrong authorization. The local issuer mints no refresh token, in which case
+ * there is nothing to renew and the request simply goes out as it is.
+ */
+async function authenticatedRequest(path, options = {}) {
+  if (tokenLooksExpired()) {
+    try {
+      await renewOnce();
+    } catch {
+      // Fall through so the request itself reports the failure, once and in
+      // the same shape as any other authentication error.
+    }
+  }
+  return backendRequest(path, { ...options, auth: true });
 }
 
 function requireProvider(method) {
@@ -141,15 +225,29 @@ function getAllUsers() {
 export { AUTH_MODE };
 export const DEMO_CREDENTIALS = { email: 'demo@ecomai.app', password: 'demo1234' };
 
+/**
+ * Persist a session envelope from the backend.
+ *
+ * The refresh token is optional: the local issuer mints stateless HS256 tokens
+ * and returns an empty one, which is stored as "no refresh token" rather than
+ * as a truthy empty string that a later renewal would try to use.
+ */
+function storeSession(result) {
+  const token = result?.access_token || result?.token || '';
+  if (!token) return '';
+  setAccessToken(token);
+  setRefreshToken(result?.refresh_token || '');
+  return token;
+}
+
 export async function login({ email, password }) {
   if (BACKEND_AUTH) {
     const result = await backendRequest('/login', {
       method: 'POST',
       payload: { email, password },
     });
-    const token = result.access_token || result.token;
+    const token = storeSession(result);
     if (!token) throw new Error('The backend returned no access token.');
-    setAccessToken(token);
     return { user: result.user, token };
   }
   if (REMOTE_AUTH) {
@@ -188,10 +286,16 @@ export async function signup({ fullName, businessName, email, password }) {
       method: 'POST',
       payload: { fullName, businessName, email, password },
     });
-    const token = result.access_token || result.token;
+    // With "Confirm email" enabled the backend creates the account and issues
+    // no session. That is reported as-is: storing an empty credential and
+    // treating the signup as a sign-in would fail on the first protected
+    // request instead of telling the user to check their inbox.
+    if (result.confirmation_required && !result.access_token) {
+      return { user: result.user, token: '', confirmationRequired: true };
+    }
+    const token = storeSession(result);
     if (!token) throw new Error('The backend returned no access token.');
-    setAccessToken(token);
-    return { user: result.user, token };
+    return { user: result.user, token, confirmationRequired: false };
   }
   if (REMOTE_AUTH) {
     const hook = provider()?.signup;
@@ -236,7 +340,9 @@ export async function getSession() {
   if (BACKEND_AUTH) {
     if (!getAccessToken()) return null;
     try {
-      const result = await backendRequest('/me', { auth: true });
+      // Renews an expired access token first, so reloading the app an hour
+      // after signing in does not sign the user out.
+      const result = await authenticatedRequest('/me');
       return { user: result.user, token: getAccessToken() };
     } catch {
       clearAccessToken();
@@ -268,7 +374,30 @@ export async function getSession() {
 export async function logout() {
   if (BACKEND_AUTH) {
     try {
-      if (getAccessToken()) await backendRequest('/logout', { method: 'POST', auth: true });
+      if (getAccessToken()) {
+        // The refresh token is sent because it names the exact session to
+        // destroy rather than whichever one the bearer happens to map to. The
+        // access token is still required to authorize the revocation, so a
+        // session whose access token has expired is renewed first -- otherwise
+        // the server would report a successful sign-out while the refresh
+        // token stayed live for the rest of its window. Renewing only when the
+        // token is actually expired avoids rotating the refresh token on every
+        // sign-out.
+        if (tokenLooksExpired()) {
+          try {
+            await renewOnce();
+          } catch {
+            // Already signed out upstream. Sign out locally; there is nothing
+            // left to revoke and the tokens are cleared either way.
+          }
+        }
+        const refreshToken = getRefreshToken();
+        await backendRequest('/logout', {
+          method: 'POST',
+          auth: true,
+          payload: refreshToken ? { refreshToken } : {},
+        });
+      }
     } finally {
       clearAccessToken();
     }
@@ -361,14 +490,13 @@ export async function resetPassword({ token, password }) {
 
 export async function updateProfile(user, patch) {
   if (useBackendAccountApi()) {
-    const body = await backendRequest('/me', {
+    const body = await authenticatedRequest('/me', {
       method: 'PATCH',
       payload: {
         name: patch.name ?? undefined,
         businessName: patch.businessName ?? undefined,
         email: patch.email ?? undefined,
       },
-      auth: true,
     });
     return body.user;
   }
@@ -392,10 +520,9 @@ export async function updateProfile(user, patch) {
 
 export async function changePassword(user, { currentPassword, newPassword }) {
   if (useBackendAccountApi()) {
-    await backendRequest('/change-password', {
+    await authenticatedRequest('/change-password', {
       method: 'POST',
       payload: { currentPassword, newPassword },
-      auth: true,
     });
     return { ok: true };
   }
@@ -419,7 +546,7 @@ export async function logoutAllSessions() {
     // Revokes the caller's other refresh tokens server-side. This is a real
     // state change, so it is not allowed to report success without a round
     // trip the way the old no-op did.
-    await backendRequest('/logout-all', { method: 'POST', auth: true });
+    await authenticatedRequest('/logout-all', { method: 'POST' });
     return { ok: true };
   }
   if (REMOTE_AUTH) {
@@ -438,10 +565,9 @@ export async function logoutAllSessions() {
 
 export async function deleteAccount(user, password) {
   if (useBackendAccountApi()) {
-    const body = await backendRequest('/me', {
+    const body = await authenticatedRequest('/me', {
       method: 'DELETE',
       payload: { password },
-      auth: true,
     });
     clearAccessToken();
     return { ok: true, deletedRows: body.deleted_rows ?? 0 };

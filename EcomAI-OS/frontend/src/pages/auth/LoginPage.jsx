@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
-import { Eye, EyeOff, LogIn, Sparkles } from 'lucide-react';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { Eye, EyeOff, CheckCircle2, LogIn, Sparkles } from 'lucide-react';
 import AuthLayout from './AuthLayout';
 import Button from '../../components/ui/Button';
 import { Field, Input } from '../../components/ui/form';
@@ -12,6 +12,13 @@ export default function LoginPage() {
   const { login } = useAuth();
   const toast = useToast();
   const navigate = useNavigate();
+  const location = useLocation();
+
+  // A redirect can carry the reason it happened, which a toast cannot: the
+  // toast provider does not survive the navigation that a sign-out causes.
+  // Changing your password signs you out, and landing on a bare login form
+  // would look like the app forgot who you are.
+  const notice = location.state?.notice || '';
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -62,6 +69,13 @@ export default function LoginPage() {
 
         <h2 className="text-2xl font-extrabold tracking-tight text-slate-900">Welcome back</h2>
         <p className="mt-1 text-sm text-slate-500">Sign in to your inventory workspace.</p>
+
+        {notice && (
+          <div className="mt-5 flex items-start gap-2.5 rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-2.5 text-sm text-emerald-800">
+            <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+            <span>{notice}</span>
+          </div>
+        )}
 
         <form onSubmit={handleSubmit} className="mt-7 space-y-4" noValidate>
           {error && (

@@ -36,9 +36,13 @@ export function AuthProvider({ children }) {
   }, []);
 
   const signup = useCallback(async (payload) => {
-    const { user: u } = await auth.signup(payload);
-    setUser(u);
-    return u;
+    const { user: u, confirmationRequired } = await auth.signup(payload);
+    // With "Confirm email" enabled the account exists but there is no session
+    // to represent. Setting the user would render an authenticated shell whose
+    // every request then 401s, so the page is told to wait for the email
+    // instead.
+    if (!confirmationRequired) setUser(u);
+    return { user: u, confirmationRequired: !!confirmationRequired };
   }, []);
 
   const logout = useCallback(async () => {

@@ -121,7 +121,17 @@ export default function SettingsPage() {
     try {
       await changePassword(user, { currentPassword: pw.currentPassword, newPassword: pw.newPassword });
       setPw({ currentPassword: '', newPassword: '', confirmPassword: '' });
-      toast.success('Password changed successfully.');
+      // Changing the password ends the current session. The identity provider
+      // revokes the refresh token behind it, so the access token in this tab
+      // still works until it expires -- and then every request would fail with
+      // "your session has ended" for no visible reason. Sign out now, while the
+      // cause is still on screen, and say why on the page the user lands on
+      // rather than in a toast, which does not survive the redirect.
+      await logout();
+      navigate('/login', {
+        replace: true,
+        state: { notice: 'Your password was changed. Please sign in with your new password.' },
+      });
     } catch (e) {
       toast.error(e.message || 'Unable to change your password.');
     } finally {

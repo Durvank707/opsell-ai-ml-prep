@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Eye, EyeOff, UserPlus } from 'lucide-react';
+import { Eye, EyeOff, MailCheck, UserPlus } from 'lucide-react';
 import AuthLayout from './AuthLayout';
 import Button from '../../components/ui/Button';
 import { Field, Input } from '../../components/ui/form';
@@ -22,6 +22,10 @@ export default function SignupPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  // Set when the identity provider created the account but issued no session,
+  // which is what "Confirm email" does. The address is kept so the message can
+  // name it, and so the field cannot be edited into a different one.
+  const [awaitingConfirmation, setAwaitingConfirmation] = useState('');
 
   const set = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.value }));
 
@@ -44,12 +48,16 @@ export default function SignupPage() {
     setError('');
     setLoading(true);
     try {
-      const user = await signup({
+      const { user, confirmationRequired } = await signup({
         fullName: form.fullName.trim(),
         businessName: form.businessName.trim(),
         email: form.email.trim(),
         password: form.password,
       });
+      if (confirmationRequired) {
+        setAwaitingConfirmation(form.email.trim());
+        return;
+      }
       toast.success(`Welcome to EcomAI-OS, ${user.name.split(' ')[0]}!`);
       navigate('/app');
     } catch (err) {
@@ -72,6 +80,29 @@ export default function SignupPage() {
           Set up your inventory intelligence workspace in minutes.
         </p>
 
+        {awaitingConfirmation ? (
+          <div className="mt-7">
+            <div className="flex items-start gap-3 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3.5">
+              <MailCheck className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600" />
+              <div>
+                <p className="text-sm font-semibold text-emerald-900">
+                  Confirm your email address
+                </p>
+                <p className="mt-1 text-sm text-emerald-800">
+                  Your account is created. We sent a confirmation link to{' '}
+                  <span className="font-medium">{awaitingConfirmation}</span>. Open it to
+                  finish setting up your workspace.
+                </p>
+              </div>
+            </div>
+            <p className="mt-5 text-sm text-slate-500">
+              Already confirmed?{' '}
+              <Link to="/login" className="font-semibold text-brand-600 hover:text-brand-700">
+                Sign in
+              </Link>
+            </p>
+          </div>
+        ) : (
         <form onSubmit={handleSubmit} className="mt-7 space-y-4" noValidate>
           {error && (
             <div className="rounded-lg border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-sm text-rose-700">
@@ -127,6 +158,7 @@ export default function SignupPage() {
             Create Account
           </Button>
         </form>
+        )}
 
         <p className="mt-7 text-center text-sm text-slate-500">
           Already have an account?{' '}
