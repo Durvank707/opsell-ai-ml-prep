@@ -5,10 +5,15 @@ identity.  This module verifies a signed bearer token, derives the tenant from
 a verified claim (``sub`` by default), and exposes a small FastAPI dependency
 for route handlers.
 
-The verifier is dependency-free.  It supports the local HS256 mode as well as
-RS256 using a server-configured PEM public key or a tightly bounded JWKS URL.
-The token's ``alg`` header is never allowed to choose the algorithm; it must
-match the server configuration.  No token/key material is logged or returned.
+The HS256 and RS256 paths are dependency-free: HS256 signs locally, and RS256
+is verified with a server-configured PEM public key or a tightly bounded JWKS
+URL.  ES256 -- the algorithm Supabase signs with by default -- is verified with
+``cryptography``, which is imported lazily so that a deployment which does not
+use ES256 neither needs it installed nor fails to start without it; a missing
+``cryptography`` is reported as a configuration error only when an ES256 token
+is actually presented.  The token's ``alg`` header is never allowed to choose
+the algorithm; it must match the server configuration.  No token/key material
+is logged or returned.
 """
 
 from __future__ import annotations
@@ -37,13 +42,18 @@ from backend.config import Settings
 
 MAX_TOKEN_LENGTH = 16_384
 MIN_JWT_SECRET_BYTES = 32
-SUPPORTED_JWT_ALGORITHMS = {"HS256", "RS256"}
+SUPPORTED_JWT_ALGORITHMS = {"HS256", "RS256", "ES256"}
 JWT_ALGORITHM = "HS256"  # backwards-compatible public constant
 _BEARER = HTTPBearer(auto_error=False)
 _B64_SEGMENT = re.compile(r"^[A-Za-z0-9_-]+$")
 _CLAIM_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _RSA_DIGEST_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
 _RSA_MIN_KEY_BITS = 2048
+# JOSE ES256 is defined only for NIST P-256, and its signature is the raw
+# concatenation r||s of two 32-byte integers rather than a DER structure.
+_EC_CURVE = "P-256"
+_EC_COORDINATE_BYTES = 32
+_ES256_SIGNATURE_BYTES = 2 * _EC_COORDINATE_BYTES
 
 
 class _NoRedirectHandler(HTTPRedirectHandler):
@@ -54,7 +64,8 @@ class _NoRedirectHandler(HTTPRedirectHandler):
 
 
 _JWKS_OPENER = build_opener(_NoRedirectHandler)
-_JWKS_CACHE: Dict[str, tuple[float, List[Dict[str, Any]]]] = {}
+# Keyed by (url, algorithm): see _load_jwks.
+_JWKS_CACHE: Dict[tuple[str, str], tuple[float, List[Dict[str, Any]]]] = {}
 _JWKS_CACHE_LOCK = threading.Lock()
 
 
@@ -64,6 +75,44 @@ class AuthenticationError(ValueError):
 
 class AuthConfigurationError(RuntimeError):
     """The server has not been configured with a usable JWT verifier."""
+
+
+_ECDSA_MODULES = None
+
+
+def _ecdsa():
+    """Return the ``cryptography`` pieces ES256 needs, or refuse to continue.
+
+    Imported lazily on purpose. ES256 is the only path that needs this package,
+    so requiring it at import time would make an HS256/RS256 deployment fail to
+    boot for no reason, and would make the dependency mandatory for local
+    development. Failing here instead means a server configured for ES256
+    without the package installed rejects every token rather than accepting an
+    unverified one.
+    """
+
+    global _ECDSA_MODULES
+    modules = _ECDSA_MODULES
+    if modules is None:
+        try:
+            from cryptography.exceptions import InvalidSignature
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import ec
+            from cryptography.hazmat.primitives.asymmetric.utils import (
+                encode_dss_signature,
+            )
+        except ImportError as exc:
+            raise AuthConfigurationError(
+                "JWT_ALGORITHM=ES256 requires the 'cryptography' package."
+            ) from exc
+        modules = _ECDSA_MODULES = (
+            ec,
+            hashes,
+            serialization,
+            encode_dss_signature,
+            InvalidSignature,
+        )
+    return modules
 
 
 @dataclass(frozen=True)
@@ -219,12 +268,73 @@ def _rsa_key_from_jwk(jwk: Mapping[str, Any]) -> tuple[int, int]:
     return modulus, exponent
 
 
-def _load_jwks(url: str, settings: Settings) -> List[Dict[str, Any]]:
-    """Fetch and cache a small, validated JWKS document without redirects."""
+def _ec_key_from_jwk(jwk: Mapping[str, Any]):
+    """Build a P-256 public key from a JWKS ``EC`` entry, or raise ValueError."""
+
+    if jwk.get("kty") != "EC":
+        raise ValueError("JWKS key is not EC")
+    if jwk.get("crv") != _EC_CURVE:
+        # ES256 is only defined over P-256, so no other curve can be accepted
+        # here even if a provider offers one.
+        raise ValueError("JWKS EC key is not on the P-256 curve")
+    x_value = jwk.get("x")
+    y_value = jwk.get("y")
+    if not isinstance(x_value, str) or not isinstance(y_value, str):
+        raise ValueError("JWKS EC key is incomplete")
+    try:
+        x_bytes = _decode_segment(x_value)
+        y_bytes = _decode_segment(y_value)
+    except AuthenticationError as exc:
+        raise ValueError("JWKS EC key encoding is invalid") from exc
+    # RFC 7518 requires each coordinate to be exactly the curve's octet length,
+    # left-padded. Accepting a short or over-long coordinate would let a
+    # non-canonical key in through.
+    if len(x_bytes) != _EC_COORDINATE_BYTES or len(y_bytes) != _EC_COORDINATE_BYTES:
+        raise ValueError("JWKS EC key coordinates are not the P-256 length")
+
+    ec, _hashes, _serialization, _encode_dss, _invalid = _ecdsa()
+    public_numbers = ec.EllipticCurvePublicNumbers(
+        int.from_bytes(x_bytes, "big"),
+        int.from_bytes(y_bytes, "big"),
+        ec.SECP256R1(),
+    )
+    try:
+        return public_numbers.public_key()
+    except ValueError as exc:
+        # A point that is not on the curve. cryptography raises ValueError.
+        raise ValueError("JWKS EC key is not a valid curve point") from exc
+
+
+def _ec_key_from_pem(pem: str):
+    """Load a PEM-encoded EC public key, or raise ValueError."""
+
+    ec, _hashes, serialization, _encode_dss, _invalid = _ecdsa()
+    try:
+        key = serialization.load_pem_public_key(pem.encode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - any parse failure is a bad key
+        raise ValueError("PEM public key is not a valid EC key") from exc
+    if not isinstance(key, ec.EllipticCurvePublicKey):
+        raise ValueError("PEM public key is not an EC key")
+    if not isinstance(key.curve, ec.SECP256R1):
+        raise ValueError("PEM EC key is not on the P-256 curve")
+    return key
+
+
+def _load_jwks(url: str, settings: Settings, algorithm: str) -> List[Dict[str, Any]]:
+    """Fetch and cache a small, validated JWKS document without redirects.
+
+    Only keys usable by ``algorithm`` are kept, so a rotated provider key of a
+    different type can never be selected for a signature check.
+    """
 
     now = time.monotonic()
+    # Keyed by algorithm as well as URL: the filtered list is only valid for the
+    # algorithm it was filtered for, and only one algorithm is ever configured at
+    # a time, so this costs nothing and removes the chance of handing back a
+    # list of the wrong key type.
+    cache_key = (url, algorithm)
     with _JWKS_CACHE_LOCK:
-        cached = _JWKS_CACHE.get(url)
+        cached = _JWKS_CACHE.get(cache_key)
         if cached is not None and cached[0] > now:
             return cached[1]
 
@@ -266,16 +376,23 @@ def _load_jwks(url: str, settings: Settings) -> List[Dict[str, Any]]:
         for key in keys:
             if not isinstance(key, dict):
                 raise ValueError("JWKS key is not an object")
-            if key.get("kty") == "RSA" and (
-                not key.get("alg") or key.get("alg") == "RS256"
-            ):
-                # Validate now so a malformed key cannot be selected later.
-                _rsa_key_from_jwk(key)
-                normalized.append(dict(key))
+            if algorithm == "RS256":
+                if key.get("kty") == "RSA" and (
+                    not key.get("alg") or key.get("alg") == "RS256"
+                ):
+                    # Validate now so a malformed key cannot be selected later.
+                    _rsa_key_from_jwk(key)
+                    normalized.append(dict(key))
+            else:
+                if key.get("kty") == "EC" and (
+                    not key.get("alg") or key.get("alg") == "ES256"
+                ):
+                    _ec_key_from_jwk(key)
+                    normalized.append(dict(key))
         if not normalized:
-            raise ValueError("JWKS has no usable RS256 key")
+            raise ValueError(f"JWKS has no usable {algorithm} key")
         with _JWKS_CACHE_LOCK:
-            _JWKS_CACHE[url] = (
+            _JWKS_CACHE[cache_key] = (
                 now + max(float(settings.jwt_jwks_cache_seconds), 0.0),
                 normalized,
             )
@@ -299,10 +416,15 @@ def _verify_rs256(
             if settings.jwt_key_id and key_id != settings.jwt_key_id:
                 raise AuthenticationError("JWT signing key is not accepted.")
         else:
-            keys = _load_jwks(settings.jwt_jwks_url, settings)
+            keys = _load_jwks(settings.jwt_jwks_url, settings, "RS256")
             requested_kid = header.get("kid")
             if requested_kid is not None and not isinstance(requested_kid, str):
                 raise AuthenticationError("JWT kid is invalid.")
+            if settings.jwt_key_id and requested_kid != settings.jwt_key_id:
+                # An operator pin must bind whichever key source is in use. It
+                # used to apply only to a static PEM, which meant pinning was
+                # silently unavailable to anyone verifying against a JWKS.
+                raise AuthenticationError("JWT signing key is not accepted.")
             candidates = [
                 key for key in keys
                 if requested_kid is None or key.get("kid") == requested_kid
@@ -332,6 +454,67 @@ def _verify_rs256(
     expected = b"\x00\x01" + (b"\xff" * padding_length) + b"\x00" + digest_info
     if not hmac.compare_digest(expected, block):
         raise AuthenticationError("JWT signature is invalid.")
+
+
+def _verify_es256(
+    signature: bytes,
+    signing_input: bytes,
+    header: Mapping[str, Any],
+    settings: Settings,
+) -> None:
+    """Verify a JOSE ES256 signature (ECDSA P-256 over SHA-256)."""
+
+    try:
+        if settings.jwt_public_key:
+            public_key = _ec_key_from_pem(settings.jwt_public_key)
+            key_id = str(header.get("kid", ""))
+            if settings.jwt_key_id and key_id != settings.jwt_key_id:
+                raise AuthenticationError("JWT signing key is not accepted.")
+        else:
+            keys = _load_jwks(settings.jwt_jwks_url, settings, "ES256")
+            requested_kid = header.get("kid")
+            if requested_kid is not None and not isinstance(requested_kid, str):
+                raise AuthenticationError("JWT kid is invalid.")
+            if settings.jwt_key_id and requested_kid != settings.jwt_key_id:
+                raise AuthenticationError("JWT signing key is not accepted.")
+            candidates = [
+                key for key in keys
+                if requested_kid is None or key.get("kid") == requested_kid
+            ]
+            if not candidates:
+                raise AuthenticationError("JWT signing key is not available.")
+            if len(candidates) > 1 and requested_kid is None:
+                raise AuthenticationError("JWT signing key is ambiguous.")
+            public_key = _ec_key_from_jwk(candidates[0])
+    except (AuthenticationError, AuthConfigurationError):
+        raise
+    except ValueError as exc:
+        raise AuthConfigurationError("JWT verification key is invalid.") from exc
+
+    # JOSE carries r||s at a fixed width; cryptography verifies DER. Checking
+    # the length first also rejects a DER-encoded signature outright rather
+    # than letting it be split into two nonsensical integers.
+    if len(signature) != _ES256_SIGNATURE_BYTES:
+        raise AuthenticationError("JWT signature is invalid.")
+    half = _EC_COORDINATE_BYTES
+    r_value = int.from_bytes(signature[:half], "big")
+    s_value = int.from_bytes(signature[half:], "big")
+
+    ec, hashes, _serialization, encode_dss_signature, invalid_signature = _ecdsa()
+    # A zero r or s is not a point on the curve at all. Checking keeps a
+    # malformed signature from being handed to the verifier as a valid shape.
+    if r_value == 0 or s_value == 0:
+        raise AuthenticationError("JWT signature is invalid.")
+    try:
+        der = encode_dss_signature(r_value, s_value)
+    except ValueError as exc:
+        raise AuthenticationError("JWT signature is invalid.") from exc
+    try:
+        public_key.verify(der, signing_input, ec.ECDSA(hashes.SHA256()))
+    except invalid_signature as exc:
+        raise AuthenticationError("JWT signature is invalid.") from exc
+    except ValueError as exc:
+        raise AuthenticationError("JWT signature is invalid.") from exc
 
 
 def _numeric_claim(claims: Mapping[str, Any], name: str) -> Optional[float]:
@@ -430,6 +613,14 @@ def verify_jwt(token: str, settings: Optional[Settings] = None) -> AuthPrincipal
         secret = settings.jwt_secret
         if not secret or len(secret.encode("utf-8")) < MIN_JWT_SECRET_BYTES:
             raise AuthConfigurationError("JWT verification is not configured.")
+    else:
+        # Refuse an absent key source before doing any per-token work, and
+        # resolve the ES256 dependency now so a misconfigured deployment is
+        # reported as configuration rather than as a bad token.
+        if not settings.jwt_public_key and not settings.jwt_jwks_url:
+            raise AuthConfigurationError("JWT verification is not configured.")
+        if algorithm == "ES256":
+            _ecdsa()
 
     normalized = str(token or "").strip()
     if not normalized or len(normalized) > MAX_TOKEN_LENGTH:
@@ -461,8 +652,10 @@ def verify_jwt(token: str, settings: Optional[Settings] = None) -> AuthPrincipal
         ).digest()
         if not hmac.compare_digest(expected, supplied_signature):
             raise AuthenticationError("JWT signature is invalid.")
-    else:
+    elif algorithm == "RS256":
         _verify_rs256(supplied_signature, signing_input, header, settings)
+    else:
+        _verify_es256(supplied_signature, signing_input, header, settings)
 
     _validate_standard_claims(payload, settings)
     subject = _safe_identity(payload.get("sub"), "sub")
@@ -526,6 +719,13 @@ def require_auth(
             detail="Authentication is not configured on the server.",
         ) from exc
     except AuthenticationError as exc:
+        # Every 401 on this API comes from here and is always paired with
+        # `WWW-Authenticate: Bearer`. That is not decoration: the browser treats
+        # a 401 *carrying* that header as "the session is over" and anything
+        # else as a normal error to show the user. An endpoint that wants to
+        # refuse an authenticated caller -- a wrong current password, say --
+        # must therefore use 403, not 401, or it signs the user out instead of
+        # telling them what they did wrong.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication token.",

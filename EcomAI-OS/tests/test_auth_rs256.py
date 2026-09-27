@@ -463,7 +463,7 @@ def test_jwks_fetch_refuses_redirects(monkeypatch):
         JWT_JWKS_URL="https://issuer.example/.well-known/jwks.json",
     )
     with pytest.raises(AuthConfigurationError):
-        _load_jwks(settings.jwt_jwks_url, settings)
+        _load_jwks(settings.jwt_jwks_url, settings, "RS256")
     # The opener is invoked once: the redirect is never chased to a second URL.
     assert opener.calls == 1
     _ = _RedirectResponse  # documents the expected response shape

@@ -269,12 +269,14 @@ class Settings:
         self.auth_mode = raw_auth_mode
 
         # HS256 remains the dependency-free local/default verifier.  RS256 is
-        # also supported for production providers that sign with an asymmetric
-        # key.  The token header still cannot select the algorithm: it is
-        # compared with this server-owned setting in backend.auth.
+        # for providers that sign with an RSA key, and ES256 for providers that
+        # sign with P-256 -- Supabase's own default.  The token header still
+        # cannot select the algorithm: it is compared with this server-owned
+        # setting in backend.auth.  Exactly one is accepted at a time on
+        # purpose; accepting two at once would widen the verification surface.
         self.jwt_algorithm = os.environ.get("JWT_ALGORITHM", "HS256").strip().upper()
-        if self.jwt_algorithm not in {"HS256", "RS256"}:
-            raise RuntimeError("JWT_ALGORITHM must be HS256 or RS256.")
+        if self.jwt_algorithm not in {"HS256", "RS256", "ES256"}:
+            raise RuntimeError("JWT_ALGORITHM must be HS256, RS256 or ES256.")
         self.jwt_secret = (
             os.environ.get("JWT_SECRET")
             or os.environ.get("SUPABASE_JWT_SECRET")
@@ -339,8 +341,8 @@ class Settings:
                 )
                 if not has_static_key and not has_jwks:
                     auth_problems.append(
-                        "JWT_ALGORITHM=RS256 requires a real JWT_PUBLIC_KEY or "
-                        "JWT_JWKS_URL configured on the server."
+                        f"JWT_ALGORITHM={self.jwt_algorithm} requires a real "
+                        "JWT_PUBLIC_KEY or JWT_JWKS_URL configured on the server."
                     )
                 if has_jwks:
                     try:

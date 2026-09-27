@@ -13,3 +13,10 @@ fastapi>=0.100.0
 uvicorn>=0.23.0
 pydantic>=2.0.0
 httpx>=0.28.0
+
+# JWT verification for ES256 (ECDSA P-256), which is what Supabase Auth signs
+# with. Imported lazily by backend/auth.py, so an HS256 or RS256 deployment
+# neither needs it installed nor fails to start without it; a server configured
+# for ES256 without it rejects every token rather than accepting an unverified
+# one.
+cryptography>=42.0.0
