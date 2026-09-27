@@ -72,17 +72,36 @@ local-development escape hatch and is rejected in production or when Supabase
 is enabled. Tokens with whitespace-padded subjects, missing expiry, duplicate
 JSON claims, unsupported headers, or a different `alg` are rejected.
 
-Managed providers may use asymmetric verification instead:
+Managed providers may use asymmetric verification instead. Exactly one
+algorithm is accepted at a time, on purpose: accepting two would widen the
+verification surface.
 
 ```dotenv
+# RS256 (RSA)
 JWT_ALGORITHM=RS256
 JWT_PUBLIC_KEY=<server-side PEM public key>
 # or: JWT_JWKS_URL=https://provider.example/.well-known/jwks.json
+
+# ES256 (ECDSA P-256) -- Supabase Auth's default
+JWT_ALGORITHM=ES256
+JWT_JWKS_URL=https://<project-ref>.supabase.co/auth/v1/.well-known/jwks.json
 ```
 
 The token header cannot select an algorithm or key source. The public key and
 JWKS URL are server configuration; never place either a private key or a
 Supabase service-role key in the browser.
+
+`JWT_KEY_ID` optionally pins the signing key, and binds whichever key source is
+in use — a static PEM or a JWKS. It is worth setting for a provider that rotates
+keys: a token signed with any other key is then refused rather than accepted.
+
+ES256 is the only algorithm that needs the `cryptography` package
+(`requirements.txt`). It is imported lazily, so an `HS256` or `RS256` deployment
+neither needs it installed nor fails to start without it, and a server configured
+for `ES256` without it rejects every token rather than accepting an unverified
+one. The JOSE signature is the raw `r‖s` pair, not the DER form, and only
+P-256 is accepted; a coordinate of the wrong length or a point that is not on
+the curve is rejected when the key is loaded, not when a signature fails.
 
 For an entirely offline end-to-end login, an operator may explicitly set
 `LOCAL_AUTH_ENABLED=true`, `AUTH_MODE=jwt`, and a 32-byte `JWT_SECRET` in a
@@ -93,10 +112,28 @@ email verification, refresh rotation, or a production identity provider.
 
 #### Account management (Supabase Auth)
 
-`signup`/`login`/`me`/`logout` are the local issuer and stay disabled when
-Supabase is enabled. The six **account** actions are separate and are backed by
-Supabase Auth, because the local issuer has no reset-token, revocation, or
-deletion story to route them to:
+Sign-in, sign-up, and the four other session routes are issuer-aware: they work
+against whichever provider holds the account, and return the same envelope either
+way, so switching identity providers is a configuration change.
+
+| Endpoint | Purpose | Credential |
+| --- | --- | --- |
+| `POST /api/auth/signup` | create an account | none |
+| `POST /api/auth/login` | start a session | email + password |
+| `POST /api/auth/refresh` | renew an access token | refresh token |
+| `GET /api/auth/me` | read the signed-in account | session bearer |
+| `POST /api/auth/logout` | revoke this session | session bearer / refresh token |
+
+`LOCAL_AUTH_ENABLED` and `USE_SUPABASE` are mutually exclusive, so there is never
+a tie to break and never a fallback from one issuer to the other: with neither
+enabled these routes return `503` rather than falling through.
+
+Under Supabase, all of these are public operations except `/me` and the account
+actions, and they carry only the **publishable** key. Establishing a session
+never involves a privileged credential.
+
+The six **account** actions are separate and are Supabase-only, because the local
+issuer has no reset-token, revocation, or deletion story to route them to:
 
 | Endpoint | Purpose | Credential |
 | --- | --- | --- |
@@ -108,8 +145,7 @@ deletion story to route them to:
 | `DELETE /api/auth/me` | delete the account and its rows | session bearer + current password |
 
 These are gated on Supabase Auth being configured, not on the local issuer, so
-they work under `USE_SUPABASE=true` where the local routes return `503`. They
-fail closed with `503` when `USE_SUPABASE` is off or a credential is missing.
+they are unavailable — with an honest `503` — under a local-only deployment.
 
 Four properties are deliberate:
 
@@ -133,6 +169,71 @@ Four properties are deliberate:
   (PostgREST caps one response, so an un-paginated delete can leave rows behind
   while reporting success). If the purge fails after the account is gone, the
   response says exactly that rather than reporting a clean deletion.
+
+#### Sessions and account enumeration
+
+A Supabase access token lasts about an hour, so `POST /api/auth/refresh` trades
+the stored refresh token for a new one and the frontend renews automatically
+before sending a request with an expired token. Supabase **rotates** the refresh
+token on every renewal, so the replacement has to be stored and concurrent
+renewals have to share one in-flight request — otherwise a second caller would
+present a token the first had just consumed and sign the user out mid-session.
+The local issuer mints stateless tokens, so `/refresh` answers `503` there rather
+than pretending to renew something.
+
+`POST /api/auth/logout` revokes with **both** credentials when the browser sends
+them: the access token as the bearer, the refresh token in the body. The bearer
+authorizes the call and the refresh token names the exact session to destroy
+rather than whichever one the bearer happens to map to. Both are needed —
+GoTrue answers a body-only `/logout` with `401 no_authorization` and revokes
+nothing, which would leave the caller believing a session was destroyed that is
+still live.
+
+Because the bearer is required, a session whose access token has already expired
+cannot revoke itself. The frontend renews first in that case, so a sign-out
+cannot strand a live refresh token. If that renewal fails there is nothing left
+to revoke — a refresh token the provider will not accept is already dead — so
+the browser clears its tokens and signs out locally without issuing a request
+guaranteed to be rejected.
+
+Five enumeration and honesty properties are deliberate:
+
+* **`login` cannot be used to discover which addresses have accounts.** Every
+  credential failure is one `401` with the same message, whatever GoTrue
+  actually said — including the different answer a project with "Confirm email"
+  gives for an unconfirmed account. "Check your inbox" guidance is deliberately
+  *not* produced there; it belongs to `signup`, where the address cannot already
+  belong to somebody else.
+* **A `429` stays a `429`.** A throttle is neither a credential verdict nor a
+  secret, and reporting it as a wrong password would send the user to reset it
+  for no reason.
+* **`signup` reports a confirmation requirement instead of faking a sign-in.**
+  With "Confirm email" on, GoTrue creates the account and issues no session. The
+  response says `confirmation_required: true` with an empty `access_token`, and
+  the signup page says to check the inbox — rather than storing an empty
+  credential that fails on the first protected request.
+* **On this API, `401` means one thing only: the session credential is not
+  acceptable.** Every `401` comes from the auth dependency and carries
+  `WWW-Authenticate: Bearer`, and the browser keys its "sign the user out" logic
+  on exactly that. An endpoint refusing an otherwise-authenticated caller
+  therefore uses `403` — a wrong current password on `change-password` or
+  `DELETE /me` is understood-and-refused, not unauthenticated. Returning `401`
+  there was a real bug: the client discarded its tokens and threw the user back
+  to the login page instead of telling them to retype their password.
+* **Changing a password signs you out immediately.** The password is set through
+  the Supabase admin API, which revokes the refresh session behind the caller's
+  own access token. Left alone, the tab keeps working on a stateless access token
+  for up to an hour and then fails every request with "your session has ended"
+  for no visible reason. The Settings page signs out at the moment of the change
+  and says why.
+
+`POST /api/auth/logout` is the one place a failure is not surfaced to the caller.
+It still answers `200` when nothing is configured, and still answers `200` when
+GoTrue declines the revocation, because the caller's own sign-out genuinely
+succeeded and a failed sign-out would strand a token in the browser with no way
+to clear it. The revocation failure is **not** swallowed silently: it is logged
+as a warning naming the reason, because the refresh token is still live and an
+operator has to be able to see that.
 
 #### Password reset: what to configure in Supabase
 
@@ -288,23 +389,27 @@ rotate it in the Supabase dashboard.
 #### Row-level security and the identity mismatch
 
 The migrations enable RLS with policies of the form
-`user_id = auth.uid()::text`. **These do not currently match how the
-application identifies a tenant, and the policies are therefore inert.**
+`user_id = auth.uid()::text`. **Whether these match how the application
+identifies a tenant now depends entirely on which issuer is configured**, and
+under the local issuer they are inert.
 
-* The app's tenant identity is the JWT `sub` claim. With the current local
-  issuer that is an email-shaped string such as `demo@ecomai.app`.
-* `auth.uid()` returns a UUID from a Supabase Auth session. An email is never
-  equal to a UUID, so these policies match no row for this application.
+* The app's tenant identity is the JWT `sub` claim.
+* Under the **local** issuer `sub` is an email-shaped string such as
+  `demo@ecomai.app`. `auth.uid()` returns a UUID from a Supabase Auth session, and
+  an email is never equal to a UUID, so these policies match no row.
+* Under **Supabase Auth** the two are the same value: GoTrue sets `sub` to the
+  auth user's UUID, so `user_id = auth.uid()::text` does match. This is verified
+  against a live project, not inferred — see below.
 * The backend authenticates to PostgREST with the **service-role key, which
   bypasses RLS entirely**. Isolation today comes from application-level scoping,
-  not from the database.
+  not from the database, whichever issuer is in use.
 
 Verified with the publishable key, all three tables return `0` rows.
 
 So there is currently **one** isolation boundary, not two. That is not a
 shortcut that was taken to make the app work — it is a consequence of the
-identity mismatch above, and it should be resolved before the service handles
-untrusted traffic. Two coherent options:
+service-role connection above, and it should be resolved before the service
+handles untrusted traffic. Two coherent options:
 
 1. **Adopt Supabase Auth as the identity provider.** Sign users in through
    Supabase Auth so `sub` *is* `auth.uid()`, and the existing policies start
@@ -315,28 +420,37 @@ untrusted traffic. Two coherent options:
    the only boundary. Acceptable only while the API is the sole client and the
    service-role key never leaves the server.
 
-Option 1 is the target state. Until it is chosen, do not expose the
-publishable/anon key to a browser expecting the policies to protect data.
+Option 1 is the target state, and the two things that stood in its way are now
+in place:
 
-Account management already points at option 1: the six account endpoints are
-Supabase Auth endpoints, and the password-reset flow assumes a user who signs in
-through Supabase. Two things still stand between the current state and a
-working option 1, both verified against a live project rather than inferred:
+1. **ES256 verification.** Supabase signs access tokens with ES256 — the
+   project's JWKS serves a single `kty=EC, crv=P-256` key — and
+   `SUPPORTED_JWT_ALGORITHMS` in `backend/auth.py` was `{"HS256", "RS256"}`, so
+   every real Supabase session token was rejected with "JWT algorithm is not
+   accepted" before any tenant check ran. The verifier now handles ES256, and a
+   genuine Supabase token verifies against the real JWKS.
+2. **Supabase sign-in.** `signup`/`login` were local-issuer only and returned
+   `503` under `USE_SUPABASE=true`, so after resetting a password there was no
+   way to obtain a Supabase-issued session through this API. The session routes
+   are now issuer-aware.
 
-1. **There is no Supabase sign-in.** `signup`/`login` are local-issuer only and
-   return `503` under `USE_SUPABASE=true`, so after resetting a password there
-   is no way to obtain a Supabase-issued session through this API.
-2. **The backend cannot verify a Supabase-issued token.** Supabase signs access
-   tokens with **ES256** (the project's JWKS serves a single
-   `kty=EC, crv=P-256` key), and `SUPPORTED_JWT_ALGORITHMS` in
-   `backend/auth.py` is `{"HS256", "RS256"}`. A real Supabase session token is
-   rejected with `401 Invalid authentication token` — "JWT algorithm is not
-   accepted" — before any tenant check runs.
+To run this way, the two environment changes are:
 
-   Either the project's signing key is configured to use HS256 or RS256 so the
-   existing verifier applies, or `backend/auth.py` gains ES256 support. The
-   first is a dashboard change and needs no new crypto code; the second needs an
-   ECDSA verifier, and `cryptography` is not currently a dependency.
+```dotenv
+JWT_ALGORITHM=ES256
+JWT_JWKS_URL=https://<project-ref>.supabase.co/auth/v1/.well-known/jwks.json
+```
+
+Two things to be clear about, because neither is finished by the above:
+
+* **RLS still does not protect anything while the service-role key is what the
+  backend uses for PostgREST.** Matching identities are a prerequisite, not the
+  change. To make the database a real second layer, the data routes have to
+  present the caller's own token (or `anon`) to PostgREST instead of the
+  service-role key. That is the remaining work in option 1.
+* **Email confirmation.** Supabase projects have "Confirm email" on by default.
+  `signup` reports that requirement honestly and the page asks the user to check
+  their inbox; nothing auto-confirms an address.
 
 ### 2. Frontend Setup & Run (React)
 
@@ -349,10 +463,24 @@ npm run dev
 - Web Application: `http://localhost:5173`
 
 Out of the box the UI serves its own mock data. To run it against this backend and
-Supabase instead, set `VITE_DATA_MODE=api` (and `VITE_AUTH_MODE=external`) in
-`frontend/.env.local` — see `frontend/.env.example` and
-`frontend/README.md` § *Data modes*. In that mode a failed request is reported on the
-page; the app never falls back to generated data behind your back.
+Supabase instead, put this in `frontend/.env.local`:
+```dotenv
+VITE_DATA_MODE=api
+VITE_AUTH_MODE=backend
+```
+`VITE_AUTH_MODE=backend` routes sign-in, sign-up, and password changes through this
+API's `/api/auth/*` endpoints, which hold the Supabase credentials server-side —
+no Supabase key ever reaches the browser. `external` is the alternative for a host
+application that injects its own access token; see `frontend/.env.example` and
+`frontend/README.md` § *Data modes*. In `api` mode a failed request is reported on
+the page; the app never falls back to generated data behind your back.
+
+The dev server proxies `/api` to `http://localhost:8000`. To point it elsewhere
+without editing `vite.config.js`, set `VITE_API_PROXY_TARGET` before `npm run dev`:
+```powershell
+$env:VITE_API_PROXY_TARGET="http://localhost:8011"
+npm run dev
+```
 
 ---
 
