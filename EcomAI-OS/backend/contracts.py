@@ -120,6 +120,42 @@ def _sales_category_contract() -> FieldContract:  # noqa: D401
     )
 
 
+#: Canonical label recorded when a sales row states no selling channel.
+#:
+#: This is a *stated* value, not a NULL and not a guess: the UI renders it as
+#: "Not recorded" so an unattributed sale is visible as such rather than
+#: silently folded into a real channel.  It is part of the sales business key,
+#: so every row has a defined, deterministic key component.
+SALES_CHANNEL_UNRECORDED = "unrecorded"
+
+
+def _sales_channel_contract() -> FieldContract:  # noqa: D401
+    return FieldContract(
+        canonical_name="channel",
+        aliases=("channel", "sales_channel", "channel_name", "selling_channel"),
+        data_type="string",
+        required=False,
+        missing_behaviour="fallback_unknown",
+        mapping_rule=(
+            "Free-text selling channel, e.g. 'Online Store' or 'Amazon'. The "
+            "vocabulary is deliberately open: a merchant's real channel names "
+            "are not knowable in advance, so an unrecognized label is stored "
+            "as given rather than refused."
+        ),
+        transformation=(
+            "trimmed; an absent or blank value is recorded as the explicit "
+            f"label {SALES_CHANNEL_UNRECORDED!r}, never left NULL and never "
+            "guessed"
+        ),
+        ml_requirement="IGNORED",
+        description=(
+            "Where the sale happened. Part of the sales business key, so the "
+            "same product may be recorded once per channel on a given day. "
+            "Demand is still forecast on the product's combined daily units."
+        ),
+    )
+
+
 def _sales_promotion_contract() -> FieldContract:  # noqa: D401
     return FieldContract(
         canonical_name="promotion",
@@ -200,13 +236,14 @@ class ValidationProblemCategories:
 SALES_RECORD = RecordContract(
     record_type="sales",
     description="One row of canonicalized daily sales history.",
-    business_key=("product_id", "date"),
+    business_key=("product_id", "date", "channel"),
     fields=(
         _product_id_contract(),
         _sales_date_contract(),
         _sales_units_contract(),
         _sales_price_contract(),
         _sales_category_contract(),
+        _sales_channel_contract(),
         _sales_promotion_contract(),
     ),
 )
@@ -399,6 +436,32 @@ ALL_RECORDS: Dict[str, RecordContract] = {
     c.record_type: c
     for c in (SALES_RECORD, PRODUCT_RECORD, FORECAST_RECORD, RECOMMENDATION_RECORD, SIMULATION_RECORD)
 }
+
+
+def sales_channel_label(value: Any) -> str:
+    """The canonical stored label for a sales row's selling channel.
+
+    ``channel`` is part of the sales business key, so a row that states no
+    channel still needs a deterministic key component.  This is the one place
+    that decision is made; the persistence layer and the tenant workspace both
+    call it, so a row's key component can never depend on which one handled it.
+
+    Blank, ``None`` and non-string values all resolve to
+    :data:`SALES_CHANNEL_UNRECORDED` -- an explicit "we were not told" label,
+    never an invented channel.  Casing is otherwise preserved, because
+    "Amazon" and "amazon" are the same channel to a reader but two different
+    spellings to a group-by.
+    """
+
+    if value is None:
+        return SALES_CHANNEL_UNRECORDED
+    if not isinstance(value, str):
+        # A number or boolean here is a source-data mistake.  It is surfaced as
+        # "unrecorded" rather than coerced, and the row's own validation
+        # warning still reports the bad column.
+        return SALES_CHANNEL_UNRECORDED
+    trimmed = value.strip()
+    return trimmed or SALES_CHANNEL_UNRECORDED
 
 
 def contract_for(record_type: str) -> RecordContract:

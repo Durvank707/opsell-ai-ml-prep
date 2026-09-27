@@ -36,10 +36,12 @@ from uuid import uuid4
 
 from backend.contracts import (
     ALL_RECORDS,
+    SALES_CHANNEL_UNRECORDED,
     SALES_RECORD,
     RecordContract,
     contract_for,
     parse_date_iso,
+    sales_channel_label,
 )
 from backend.eligibility import (
     EligibilityDecision,
@@ -244,6 +246,99 @@ def _product_row_from_hydrated(row: Dict[str, Any]) -> "ProductRow":
     )
 
 
+#: Fields the daily combiner owns rather than copying from the first record.
+#:
+#: ``channel`` is listed because it is a facet of the record, not a dimension of
+#: the demand series: a day has no single channel, and carrying one forward
+#: would suggest to a reader that it influenced the number.
+_COMBINED_FIELDS = frozenset(
+    {"units_sold", "price", "promotion", "category", "channel"}
+)
+
+
+def _daily_combined(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse per-channel sales records into one row per calendar day.
+
+    A sales record is keyed by ``(product_id, date, channel)``, so a product
+    sold on two channels on the same day is legitimately two records. Demand,
+    however, is a property of the product on that day, and the forecaster, the
+    eligibility gate and the backtest all need a series with one row per date.
+    Handing them two rows for one date would double-count the day and corrupt
+    the lag and rolling features the trained model is built on.
+
+    Combination rules, chosen so that a day with a single record -- the common
+    case, and the only case before channels existed -- is returned unchanged:
+
+    * ``units_sold``  summed; a day's demand is the total sold that day.
+    * ``price``       the mean of the day's stated numeric prices. Omitted
+                      entirely when no record for the day stated one, so the
+                      caller still sees "not recorded" rather than a zero.
+    * ``promotion``   true when any record for the day ran a promotion. A
+                      promotion on one channel is a promotion the product had.
+                      Omitted entirely when no record for the day stated one --
+                      supplying a bare ``False`` here would be exactly the kind
+                      of quiet derivation ``_enrich_history`` exists to report
+                      to the caller.
+    * ``category``    the first stated value; every record for one product
+                      resolves to the same category in practice.
+    * every other key is taken from the first record seen for that date.
+
+    ``channel`` is not carried through. It is a facet of the record, not a
+    dimension of demand, and the model has no channel feature -- keeping it
+    would suggest to a reader that it influenced the number.
+    """
+
+    by_day: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        day = str(row.get("date"))
+        bucket = by_day.get(day)
+        if bucket is None:
+            bucket = {
+                key: value
+                for key, value in row.items()
+                if key not in _COMBINED_FIELDS
+            }
+            bucket["date"] = day
+            bucket["units_sold"] = 0
+            bucket["_prices"] = []
+            # None means "no record for this day stated a promotion", which is
+            # carried through as an absent key rather than as False. Once a
+            # record does state one it becomes the day's value, and any later
+            # true promotes the day: a promotion on one channel is a promotion
+            # the product had.
+            bucket["_promotion"] = None
+            by_day[day] = bucket
+        bucket["units_sold"] += int(row.get("units_sold", 0) or 0)
+        price = row.get("price")
+        if isinstance(price, (int, float)) and not isinstance(price, bool):
+            bucket["_prices"].append(float(price))
+        if "promotion" in row:
+            if bucket["_promotion"] is None:
+                bucket["_promotion"] = bool(row.get("promotion"))
+            elif row.get("promotion"):
+                bucket["_promotion"] = True
+        if bucket.get("category") is None and row.get("category") is not None:
+            bucket["category"] = row["category"]
+
+    combined: List[Dict[str, Any]] = []
+    for day in sorted(by_day):
+        bucket = by_day[day]
+        # Only the internal accumulators are dropped here; the real fields were
+        # each assigned explicitly above and must survive.
+        row = {
+            key: value
+            for key, value in bucket.items()
+            if not key.startswith("_")
+        }
+        prices = bucket["_prices"]
+        if prices:
+            row["price"] = sum(prices) / len(prices)
+        if bucket["_promotion"] is not None:
+            row["promotion"] = bucket["_promotion"]
+        combined.append(row)
+    return combined
+
+
 @dataclass
 class TenantWorkspace:
     """One user's isolated workspace. All state lives under ``user_id``."""
@@ -252,7 +347,7 @@ class TenantWorkspace:
     email: str = ""
     display_name: str = ""
     products: Dict[str, ProductRow] = field(default_factory=dict)
-    sales_records: Dict[Tuple[str, str], Dict[str, Any]] = field(default_factory=dict)  # (product_id, date) → canonical row
+    sales_records: Dict[Tuple[str, str, str], Dict[str, Any]] = field(default_factory=dict)  # (product_id, date, channel) → canonical row
     audit: List[AuditEntry] = field(default_factory=list)
     created_at: str = ""
     remote_hydrated: bool = False
@@ -467,7 +562,22 @@ class TenantWorkspace:
         ):
             raise ValueError("A hydrated Supabase sales row failed validation.")
         stored = self._stored_sales_values(report.rows[0].values)
-        self.sales_records[(stored["product_id"], stored["date"])] = stored
+        self.sales_records[self._sales_key(stored)] = stored
+
+    @staticmethod
+    def _sales_key(stored: Dict[str, Any]) -> Tuple[str, str, str]:
+        """The canonical sales business key for one stored row.
+
+        Mirrors ``SALES_RECORD.business_key``.  ``channel`` is resolved by
+        :func:`sales_channel_label` in ``_stored_sales_values`` so a hydrated
+        remote row and a freshly ingested one key identically.
+        """
+
+        return (
+            str(stored["product_id"]),
+            str(stored["date"]),
+            str(stored["channel"]),
+        )
 
     @staticmethod
     def _stored_sales_values(values: Dict[str, Any]) -> Dict[str, Any]:
@@ -482,6 +592,10 @@ class TenantWorkspace:
             "product_id": pid,
             "date": stored_date,
             "units_sold": int(values["units_sold"]),
+            # Always present, because it is a key component. Resolved through the
+            # one shared normaliser so a row that stated no channel is keyed and
+            # displayed consistently by every reader.
+            "channel": sales_channel_label(values.get("channel")),
         }
         for optional in ("price", "category", "promotion"):
             if optional in values:
@@ -748,12 +862,11 @@ class TenantWorkspace:
 
         if not prepared:
             return 0
-        keys = [
-            (str(stored["product_id"]), str(stored["date"]))
-            for stored, _warnings in prepared
-        ]
+        keys = [self._sales_key(stored) for stored, _warnings in prepared]
         if len(set(keys)) != len(keys):
-            raise ValueError("A sales batch contains duplicate product/date keys.")
+            raise ValueError(
+                "A sales batch contains duplicate product/date/channel keys."
+            )
 
         # When enabled, persist only after every row is valid and owned.  A
         # failed remote write happens before local mutation, so the local
@@ -775,11 +888,12 @@ class TenantWorkspace:
         pending_audit: List[AuditEntry] = []
         for stored, validation_warnings in prepared:
             pid = str(stored["product_id"])
-            key = (pid, str(stored["date"]))
+            key = self._sales_key(stored)
             existing = self.sales_records.get(key)
             self.sales_records[key] = stored
             audit_detail = {
                 "date": stored["date"],
+                "channel": stored["channel"],
                 "units_sold": stored["units_sold"],
                 "was_update": existing is not None,
             }
@@ -822,15 +936,37 @@ class TenantWorkspace:
         return self._commit_sales_rows(prepared)
 
     def sales_history_for(self, product_id: str) -> List[Dict[str, Any]]:
-        """Sorted daily sales rows for one product (user-scoped)."""
+        """Sorted sales records for one product (user-scoped), one per channel.
+
+        This is the *record* view: a product recorded on two channels on the
+        same day yields two rows. Use :meth:`daily_history_for` for anything
+        that needs a demand series.
+        """
         self._check_product(product_id)
         rows = [
-            {**r, "date": d}
-            for (pid, d), r in self.sales_records.items()
+            dict(r)
+            for (pid, _d, _channel), r in self.sales_records.items()
             if pid == product_id
         ]
-        rows.sort(key=lambda r: r["date"])
+        rows.sort(key=lambda r: (r["date"], r["channel"]))
         return rows
+
+    def daily_history_for(self, product_id: str) -> List[Dict[str, Any]]:
+        """One row per calendar day for one product, oldest first.
+
+        This is the *demand series* view that the forecaster, the eligibility
+        gate and the backtest consume; :meth:`sales_history_for` is the
+        per-channel record view. See :func:`_daily_combined` for the
+        combination rules and why they matter.
+        """
+        self._check_product(product_id)
+        return _daily_combined(
+            [
+                row
+                for (pid, _d, _channel), row in self.sales_records.items()
+                if pid == product_id
+            ]
+        )
 
     def forecast_for(
         self,
@@ -861,11 +997,15 @@ class TenantWorkspace:
         self._check_product(product_id)
         history_warnings: List[Dict[str, Any]] = []
         if history is None:
-            history = self.sales_history_for(product_id)
+            history = self.daily_history_for(product_id)
         else:
             history, history_warnings = self._validated_request_history(
                 product_id, history
             )
+        # Caller-supplied history may repeat a date across channels, exactly as
+        # the stored records can, so both paths are combined to one row per day
+        # before the eligibility gate and the model see it.
+        history = _daily_combined(history)
         history, derived_warnings = self._enrich_history(product_id, history)
         if derived_warnings:
             history_warnings = [*history_warnings, *derived_warnings]
@@ -1106,7 +1246,11 @@ class TenantWorkspace:
 
         self._check_product(product_id)
         p = self.products[product_id]
-        history = self.sales_history_for(product_id)
+        # Daily demand, not per-channel records: ``daily_avg`` and the history
+        # length below both feed safety stock and the eligibility grade, and
+        # averaging a split day's channel rows would understate real demand by
+        # the number of channels while double-counting the days of history.
+        history = self.daily_history_for(product_id)
         daily_avg = round(
             sum(r["units_sold"] for r in history) / max(len(history), 1), 2
         )
@@ -1192,26 +1336,39 @@ class TenantWorkspace:
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
         search: Optional[str] = None,
+        channel: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> Dict[str, Any]:
-        """Paginated, user-scoped sales records for the records table."""
+        """Paginated, user-scoped sales records for the records table.
+
+        ``channel`` is matched exactly against the stored label, so selecting
+        :data:`SALES_CHANNEL_UNRECORDED` shows the sales nobody attributed and
+        selecting a real channel shows only that one. Rows are ordered newest
+        first, then by product and channel so a multi-channel day reads as a
+        stable group rather than shuffling between requests.
+        """
 
         if product_id is not None:
             self._check_product(product_id)
         needle = (search or "").strip().casefold()
-        selected: List[Tuple[str, str, Dict[str, Any]]] = []
-        for (pid, day), row in self.sales_records.items():
+        wanted_channel = (
+            sales_channel_label(channel) if channel is not None else None
+        )
+        selected: List[Tuple[str, str, str, Dict[str, Any]]] = []
+        for (pid, day, row_channel), row in self.sales_records.items():
             if product_id is not None and pid != product_id:
+                continue
+            if wanted_channel is not None and row_channel != wanted_channel:
                 continue
             if date_from and day < date_from:
                 continue
             if date_to and day > date_to:
                 continue
-            if needle and needle not in f"{pid} {day} {row.get('category', '')}".casefold():
+            if needle and needle not in f"{pid} {day} {row_channel} {row.get('category', '')}".casefold():
                 continue
-            selected.append((pid, day, row))
-        selected.sort(key=lambda item: (item[1], item[0]), reverse=True)
+            selected.append((pid, day, row_channel, row))
+        selected.sort(key=lambda item: (item[1], item[0], item[2]), reverse=True)
 
         total = len(selected)
         page = selected[max(0, offset):max(0, offset) + max(1, limit)]
@@ -1226,9 +1383,21 @@ class TenantWorkspace:
                     if pid in self.products else pid,
                     **row,
                 }
-                for pid, day, row in page
+                for pid, _day, _channel, row in page
             ],
         }
+
+    def sales_channels(self) -> List[str]:
+        """Every selling channel this tenant has actually recorded.
+
+        Derived from stored records rather than a fixed list, so the filter
+        offers the labels in the data instead of a menu the tenant's history
+        cannot satisfy.
+        """
+
+        return sorted(
+            {channel for (_pid, _day, channel) in self.sales_records}
+        )
 
     def sales_summary(self) -> Dict[str, Any]:
         """Portfolio sales totals for the signed-in tenant."""
@@ -1236,23 +1405,38 @@ class TenantWorkspace:
         total_rows = len(self.sales_records)
         units = 0
         revenue = 0.0
+        per_channel: Dict[str, Dict[str, Any]] = {}
         for row in self.sales_records.values():
             sold = int(row.get("units_sold", 0) or 0)
             units += sold
             price = row.get("price")
             if isinstance(price, (int, float)):
                 revenue += sold * float(price)
-        dates = sorted({day for (_pid, day) in self.sales_records})
+            bucket = per_channel.setdefault(
+                str(row["channel"]),
+                {"channel": str(row["channel"]), "count": 0, "units": 0},
+            )
+            bucket["count"] += 1
+            bucket["units"] += sold
+        dates = sorted({day for (_pid, day, _channel) in self.sales_records})
+        # Most records first, then alphabetical, so the ordering is stable
+        # across requests and does not depend on dict insertion order.
+        channels = sorted(
+            per_channel.values(),
+            key=lambda entry: (-int(entry["count"]), str(entry["channel"])),
+        )
         return {
             "total_records": total_rows,
             "total_units": units,
             "total_revenue": round(revenue, 2),
             "products_covered": len({
-                pid for (pid, _day) in self.sales_records
+                pid for (pid, _day, _channel) in self.sales_records
                 if pid in self.products
             }),
             "date_from": dates[0] if dates else None,
             "date_to": dates[-1] if dates else None,
+            "channels": channels,
+            "unrecorded": SALES_CHANNEL_UNRECORDED,
         }
 
     # -- demand forecasting -------------------------------------------------
@@ -1277,7 +1461,10 @@ class TenantWorkspace:
         horizon = max(1, min(requested, 180))
         result = self.forecast_for(product_id, horizon=horizon, audit=audit)
         raw_points = result.get("forecast") or []
-        history = self.sales_history_for(product_id)
+        # The residual spread is measured on the same daily series the forecast
+        # was built from, so the band reflects a product's real day-to-day
+        # volatility rather than the smaller per-channel figures.
+        history = self.daily_history_for(product_id)
         sigma = _forecast_error_std([r.get("units_sold", 0) for r in history])
 
         points: List[Dict[str, Any]] = []
@@ -1430,7 +1617,7 @@ class TenantWorkspace:
         """Actual daily units summed across the whole catalog, oldest first."""
         window = max(int(days), 1)
         totals: Dict[str, int] = {}
-        for (_pid, day), row in self.sales_records.items():
+        for (_pid, day, _channel), row in self.sales_records.items():
             totals[day] = totals.get(day, 0) + int(row.get("units_sold", 0) or 0)
         recent = sorted(totals.items())[-window:]
         return [{"date": day, "units": units} for day, units in recent]
@@ -1439,7 +1626,7 @@ class TenantWorkspace:
         """The last day with recorded sales, which forecasts project forward from."""
 
         history = self.sales_records
-        return max((day for (_pid, day) in history), default=None) or _step_days(
+        return max((day for (_pid, day, _channel) in history), default=None) or _step_days(
             datetime.now(timezone.utc).date().isoformat(), 0
         )
 
@@ -1555,7 +1742,10 @@ class TenantWorkspace:
 
         state = self._inventory_state(product_id)
         product = self.products[product_id]
-        history = self.sales_history_for(product_id)
+        # This walks the timeline day by day against the anchor, so it indexes
+        # history by day. Per-channel records would put two entries on one date
+        # and shift every offset the window shows.
+        history = self.daily_history_for(product_id)
         days = max(1, min(int(days), 180))
         forecast = self.demand_forecast(product_id, audit=False)
 
@@ -1742,7 +1932,9 @@ class TenantWorkspace:
 
         self._check_product(product_id)
         product = self.products[product_id]
-        history = self.sales_history_for(product_id)
+        # The backtest simulates one product's inventory day by day, so it needs
+        # the combined daily demand series, not the per-channel records.
+        history = self.daily_history_for(product_id)
         if not history:
             raise ValueError(
                 f"'{product_id}' has no sales history, so there is nothing to "
@@ -2482,12 +2674,18 @@ def seed_canonical_demo(ws: "TenantWorkspace", *, limit: int = _DEMO_SEED_LIMIT)
     """Seed ``ws`` ONLY from the canonical raw sales store (``REPO_ROOT /
     ``data/raw/sales.csv``, byte-verified columns: date, product_id,
     product_name, category, price, discount, promotion, day_of_week, month,
-    is_weekend, units_sold).
+    is_weekend, units_sold, and optionally channel).
 
     This is the ONLY module that ever walks the canonical store to seed a demo
     tenant. It reuses ``TenantWorkspace.add_products`` / ``upsert_sales_rows``
     exclusively (never another tenant's rows), returns the number of sales rows
     written, and is a no-op for an empty store. Nothing here invents rows.
+
+    ``channel`` is read when the store carries it and is NOT required: the raw
+    directory is git-ignored, so a store generated elsewhere may predate the
+    column. A row without one is passed through untouched and the sales contract
+    records it as :data:`SALES_CHANNEL_UNRECORDED` -- the seed does not guess a
+    channel on the tenant's behalf.
 
     The catalog is overlaid with ``data/raw/inventory_snapshot.csv`` (see
     :func:`apply_inventory_snapshot`) so seeded products carry the stock, lead
@@ -2560,20 +2758,23 @@ def seed_canonical_demo(ws: "TenantWorkspace", *, limit: int = _DEMO_SEED_LIMIT)
                     "unit_price": r["price"],
                 })
                 taken[pid] = taken.get(pid, 0) + 1
-                sales_rows.append(
-                    {
-                        "date": r["date"],
-                        "product_id": pid,
-                        # Keep the raw CSV cells intact until the canonical sales
-                        # validator runs.  Converting here with int()/float()
-                        # would silently truncate a malformed seed row before the
-                        # strict ingestion boundary sees it.
-                        "units_sold": r["units_sold"],
-                        "price": r["price"],
-                        "promotion": r["promotion"],
-                        "category": r["category"],
-                    }
-                )
+                seed_row = {
+                    "date": r["date"],
+                    "product_id": pid,
+                    # Keep the raw CSV cells intact until the canonical sales
+                    # validator runs.  Converting here with int()/float()
+                    # would silently truncate a malformed seed row before the
+                    # strict ingestion boundary sees it.
+                    "units_sold": r["units_sold"],
+                    "price": r["price"],
+                    "promotion": r["promotion"],
+                    "category": r["category"],
+                }
+                # Only sent when the store actually has the column; a blank cell
+                # is left to the contract rather than treated as present.
+                if str(r.get("channel") or "").strip():
+                    seed_row["channel"] = r["channel"]
+                sales_rows.append(seed_row)
                 if len(sales_rows) >= limit:
                     break
         if not sales_rows:

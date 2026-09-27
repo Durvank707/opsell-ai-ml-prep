@@ -20,6 +20,17 @@ import { formatDate } from '../../lib/utils';
 
 const HEALTH_STATES = ['critical', 'low', 'overstocked', 'healthy'];
 
+/**
+ * The label the backend records when a sales row states no channel.
+ *
+ * Mirrors `SALES_CHANNEL_UNRECORDED` in `backend/contracts.py`. It is a stated
+ * value, not a null, because `channel` is part of the sales business key: an
+ * unstated channel still needs a deterministic key component. Adapters
+ * translate it to `null` (or "Not recorded") so no component has to know the
+ * sentinel's spelling.
+ */
+const UNRECORDED_CHANNEL = 'unrecorded';
+
 function num(value, fallback = null) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -279,6 +290,7 @@ export function toRecommendation(raw) {
 /** Portfolio sales totals. */
 export function toSalesSummary(raw) {
   const row = raw || {};
+  const unrecorded = str(row.unrecorded) || UNRECORDED_CHANNEL;
   return {
     totalRecords: num(row.total_records, 0),
     totalUnits: num(row.total_units, 0),
@@ -287,18 +299,30 @@ export function toSalesSummary(raw) {
     productsCovered: num(row.products_covered, 0),
     dateFrom: row.date_from ? str(row.date_from) : null,
     dateTo: row.date_to ? str(row.date_to) : null,
-    // The canonical sales contract records no channel, so there is no
-    // by-channel split to report. An empty list keeps the page's existing
-    // empty state instead of inventing one.
-    channels: [],
+    // A real split, straight from the tenant's own rows. The sentinel the
+    // server uses for "nobody stated a channel" is translated to a label a
+    // reader can act on, and is kept as its own slice rather than being
+    // dropped -- unattributed sales are a real gap worth seeing.
+    channels: (row.channels || []).map((entry) => ({
+      name: str(entry.channel) === unrecorded ? 'Not recorded' : str(entry.channel),
+      count: num(entry.count, 0),
+      units: num(entry.units, 0),
+    })),
+    availableChannels: (row.available_channels || []).map((channel) => (
+      str(channel) === unrecorded ? 'Not recorded' : str(channel)
+    )),
+    unrecordedLabel: 'Not recorded',
   };
 }
 
 /** One row of the sales records table. */
 export function toSalesRecord(row) {
   const record = row || {};
+  const channel = str(record.channel) || UNRECORDED_CHANNEL;
   return {
-    id: `${str(record.product_id)}-${str(record.date)}`,
+    // channel is part of the record's business key, so a product sold on two
+    // channels on one day is two rows and the id has to say so.
+    id: `${str(record.product_id)}-${str(record.date)}-${channel}`,
     date: str(record.date),
     productId: str(record.product_id),
     productName: str(record.product_name) || str(record.product_id),
@@ -307,7 +331,8 @@ export function toSalesRecord(row) {
     revenue: num(record.price, null) === null
       ? null
       : Math.round(num(record.units_sold, 0) * num(record.price, 0) * 100) / 100,
-    channel: null,
+    channel: channel === UNRECORDED_CHANNEL ? null : channel,
+    unrecordedChannel: channel === UNRECORDED_CHANNEL,
     promotion: record.promotion ?? null,
   };
 }

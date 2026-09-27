@@ -165,9 +165,10 @@ the database policies do and do not currently guarantee.
 The service-role key can only reach PostgREST; it cannot run DDL. Create the
 tables once, in the Supabase **SQL Editor**, by running
 `supabase/migrations/0007_full_schema.sql` (or `0000`–`0006` in order), then
-`supabase/migrations/0008_product_price_and_display_fields.sql`. Every statement
-is idempotent, so re-running is safe. `scripts/probe_supabase.py` then confirms
-connectivity and which tables exist without printing any key material.
+`0008_product_price_and_display_fields.sql` and
+`0009_sales_channel.sql`. Every statement is idempotent, so re-running is safe.
+`scripts/probe_supabase.py` then confirms connectivity and which tables exist
+without printing any key material.
 
 `0008` is required, not optional. It adds the three nullable columns the product
 record and the product form need beyond the original schema — `unit_price`,
@@ -175,6 +176,24 @@ record and the product form need beyond the original schema — `unit_price`,
 and supplier are dropped on the way to the database, and every forecast built
 from that history sees a price of `0`. The columns are nullable and additive
 precisely so the migration cannot lose existing rows.
+
+`0009` is also required. It adds the sales `channel` column and widens the sales
+upsert key from `(user_id, product_id, date)` to
+`(user_id, product_id, date, channel)`, so one product can be recorded once per
+channel on a given day. Existing rows are labelled `unrecorded` — the UI shows
+that as "Not recorded" — and nothing is attributed to a channel that did not
+claim it. The column is `NOT NULL` with a default rather than nullable on
+purpose: `NULL`s are distinct in a unique index, so a nullable channel would
+make every unchanneled row its own key and a re-upload would silently duplicate
+history instead of updating it.
+
+#### Re-uploading an old CSV after `0009`
+
+Because the key now includes `channel`, a re-upload of a file that states no
+channel will not match a row previously attributed to a real channel, and will be
+inserted as a separate `unrecorded` record. That is the intended consequence of
+keying on the channel, not a bug — but it is worth knowing before backfilling
+history. The same product/date/channel combination still updates in place.
 
 #### Never put credentials in `.env.example`
 

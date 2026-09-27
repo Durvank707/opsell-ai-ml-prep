@@ -192,7 +192,7 @@ def test_full_ingest_then_read_back():
 
     ws = v2._WORKSPACES["ingest-user"]
     assert len(ws.sales_records) == 3
-    assert ws.sales_records[("P1", "2025-05-02")]["units_sold"] == 2
+    assert ws.sales_records[("P1", "2025-05-02", "unrecorded")]["units_sold"] == 2
 
 
 def test_reingesting_the_same_rows_updates_rather_than_duplicates():
@@ -207,7 +207,7 @@ def test_reingesting_the_same_rows_updates_rather_than_duplicates():
     })
     ws = v2._WORKSPACES["ingest-user"]
     assert len(ws.sales_records) == 3
-    assert ws.sales_records[("P1", "2025-05-01")]["units_sold"] == 99
+    assert ws.sales_records[("P1", "2025-05-01", "unrecorded")]["units_sold"] == 99
 
 
 def test_ingest_creates_an_audit_trail():

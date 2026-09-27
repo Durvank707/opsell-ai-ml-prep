@@ -90,15 +90,30 @@ skeletons and error handling behave identically against both backends.
 
 Uploads are validated row-by-row against the product catalog before import:
 
-| Column       | Notes                                      |
-| ------------ | ------------------------------------------ |
-| `date`       | `YYYY-MM-DD`                               |
-| `product_id` | product ID (`P001`) or SKU — must exist    |
-| `units_sold` | whole number ≥ 0                           |
-| `channel`    | optional (defaults to `Import`)            |
+| Column       | Notes                                                              |
+| ------------ | ------------------------------------------------------------------ |
+| `date`       | `YYYY-MM-DD`                                                       |
+| `product_id` | product ID (`P001`) or SKU — must exist                            |
+| `units_sold` | whole number ≥ 0                                                   |
+| `price`      | optional unit price; supplies an ML feature the gate otherwise lacks |
+| `category`   | optional; must match the product's catalog category                |
+| `promotion`  | optional `true`/`false`                                            |
+| `channel`    | optional, **free text** — your own channel names are stored as given |
+
+`channel` is part of the sales business key, so one product can appear once per
+channel on a given date (`P001, 2026-09-01, Online Store` and
+`P001, 2026-09-01, Amazon` are two distinct records). Demand is still forecast on
+that product's *combined* daily units, so splitting a day across channels does not
+double-count it. Rows that state no channel are stored as the explicit
+`unrecorded` label and shown as **Not recorded** — they are never attributed to a
+channel nobody claimed, and the Sales by Channel panel keeps them as their own slice
+so the gap stays visible.
 
 Invalid rows are reported inline (bad dates, unknown products, non-whole units) and
 never imported silently. A sample template can be downloaded from the Sales Data page.
+
+Import is all-or-nothing: if any row has a blocking problem, nothing is written and
+the offending rows are listed with their field and value.
 
 ## Project structure
 

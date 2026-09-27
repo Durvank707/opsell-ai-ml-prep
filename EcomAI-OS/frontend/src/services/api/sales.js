@@ -38,10 +38,10 @@ export async function getSalesData(user) {
 /**
  * The page the records table shows.
  *
- * The canonical sales contract has no channel, so the channel facet is not
- * something this query can honour: it is accepted for signature compatibility
- * and a non-"all" value is refused rather than quietly ignored, which would
- * return unfiltered rows under a filter that claims to be applied.
+ * `channel` filters on the stored selling-channel label. The UI shows
+ * "Not recorded" for the sentinel, so the page passes the sentinel back
+ * verbatim and the translation happens once, in the adapter, rather than
+ * here and in `ChannelBadge` separately.
  */
 export async function listSalesRecords(user, filters = {}) {
   const {
@@ -54,17 +54,12 @@ export async function listSalesRecords(user, filters = {}) {
     pageSize = 25,
   } = filters;
 
-  if (channel && channel !== 'all') {
-    throw new Error(
-      'Sales records are not stored per channel, so this view cannot be filtered by channel.',
-    );
-  }
-
   const raw = await http.fetchSales(user, {
     productId,
     dateFrom,
     dateTo,
     search,
+    channel: channel === 'all' ? null : channel,
     limit: pageSize,
     offset: (page - 1) * pageSize,
   });

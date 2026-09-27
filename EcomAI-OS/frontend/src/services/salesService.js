@@ -44,6 +44,9 @@ export const getSalesSummary = memo((db) => {
       }
     }
   }
+  const channels = Object.entries(channelCounts)
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
   return {
     totalRecords,
     totalRevenue,
@@ -51,7 +54,11 @@ export const getSalesSummary = memo((db) => {
     dateFrom: db.salesMeta.dateFrom,
     dateTo: db.salesMeta.dateTo,
     productsCovered: db.products.length,
-    channels: Object.entries(channelCounts).map(([name, count]) => ({ name, count })),
+    channels,
+    // The labels this store actually holds, so the channel filter offers real
+    // selections. Same key the api adapter emits, so the page needs one path.
+    availableChannels: channels.map((entry) => entry.name).filter((name) => name),
+    unrecordedLabel: 'Not recorded',
   };
 });
 
@@ -121,11 +128,18 @@ function pageRecords(records, page, pageSize) {
 // `promotion` are optional but are what the eligibility gate checks before it
 // will use the trained model, so a file that supplies them gets a real forecast
 // rather than a baseline with derived features.
-export const SAMPLE_CSV_TEMPLATE = `date,product_id,units_sold,price,category,promotion
-2026-09-01,P001,14,1299,Electronics,false
-2026-09-02,P001,9,1299,Electronics,true
-2026-09-01,P002,3,899,Home,false
-2026-09-02,P002,5,899,Home,false`;
+//
+// `channel` is optional too and free-text -- your own channel names are stored
+// as given, so "Online Store", "Amazon" and "Wholesale" are all equally valid.
+// It is part of the sales business key, so the same product may appear once per
+// channel on one date; rows without it are recorded as "Not recorded" rather
+// than being guessed at.
+export const SAMPLE_CSV_TEMPLATE = `date,product_id,units_sold,price,category,promotion,channel
+2026-09-01,P001,14,1299,Electronics,false,Online Store
+2026-09-02,P001,9,1299,Electronics,true,Online Store
+2026-09-01,P001,4,1299,Electronics,false,Amazon
+2026-09-01,P002,3,899,Home,false,Offline Store
+2026-09-02,P002,5,899,Home,false,Offline Store`;
 
 /**
  * Validate a CSV string against the workspace catalog. Never silently accepts

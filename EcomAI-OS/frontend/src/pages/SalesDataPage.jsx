@@ -43,6 +43,13 @@ const STEPS = [
   { key: 'import', label: 'Import' },
 ];
 
+// The backend's label for sales nobody attributed to a channel, and the
+// display string for it. `channel` is part of the sales business key, so an
+// unstated channel is a stated value rather than a null; the adapter maps it to
+// this display label and the filter maps it back to the sentinel.
+const UNRECORDED_CHANNEL = 'unrecorded';
+const NOT_RECORDED_LABEL = 'Not recorded';
+
 export default function SalesDataPage() {
   const { user } = useAuth();
   const { refresh } = useData();
@@ -117,6 +124,21 @@ export default function SalesDataPage() {
   useEffect(() => {
     setPage(1);
   }, [search, productId, channel, dateFrom, dateTo, pageSize]);
+
+  // The filter menu is built from the channels this tenant has actually
+  // recorded, not from a fixed list. A hardcoded menu would offer selections
+  // the server cannot satisfy, so the user could pick "Myntra" and be shown an
+  // empty table with no explanation. "Not recorded" maps to the server's
+  // sentinel so unattributed sales stay reachable.
+  const channelOptions = useMemo(() => {
+    const labels = summary?.availableChannels?.length
+      ? summary.availableChannels
+      : (summary?.channels || []).map((entry) => entry.name);
+    return labels.filter(Boolean).map((label) => ({
+      label,
+      value: label === NOT_RECORDED_LABEL ? UNRECORDED_CHANNEL : label,
+    }));
+  }, [summary]);
 
   // ------------------------------------------------------------ upload flow
 
@@ -389,7 +411,10 @@ export default function SalesDataPage() {
         </Card>
 
         {/* Channel breakdown */}
-        <Card title="Sales by Channel" subtitle="Share of recorded orders">
+        <Card
+          title="Sales by Channel"
+          subtitle="Where your recorded sales were attributed"
+        >
           {summaryLoading || !summary ? (
             <LoadingSkeleton rows={4} />
           ) : summary.channels.length === 0 ? (
@@ -401,10 +426,24 @@ export default function SalesDataPage() {
                 {summary.channels.map((c) => (
                   <div key={c.name} className="flex items-center justify-between text-xs">
                     <span className="text-slate-500">{c.name}</span>
-                    <span className="tnum font-bold text-slate-700">{formatNumber(c.count)}</span>
+                    <span className="tnum font-bold text-slate-700">
+                      {formatNumber(c.count)}
+                      {c.units != null && (
+                        <span className="ml-1.5 font-normal text-slate-400">
+                          {formatNumber(c.units)} units
+                        </span>
+                      )}
+                    </span>
                   </div>
                 ))}
               </div>
+              {summary.channels.some((c) => c.name === NOT_RECORDED_LABEL) && (
+                <p className="mt-3 text-xs text-slate-400">
+                  Sales shown as &ldquo;{NOT_RECORDED_LABEL.toLowerCase()}&rdquo; were
+                  imported without a channel. Add a <code>channel</code> column to your
+                  CSV and re-import to attribute them.
+                </p>
+              )}
             </>
           )}
         </Card>
@@ -421,12 +460,9 @@ export default function SalesDataPage() {
           <SearchInput value={search} onChange={setSearch} placeholder="Search products" className="w-full sm:w-56" />
           <Select value={channel} onChange={(e) => setChannel(e.target.value)} className="w-40">
             <option value="all">All Channels</option>
-            <option>Online Store</option>
-            <option>Amazon</option>
-            <option>Flipkart</option>
-            <option>Myntra</option>
-            <option>Offline Store</option>
-            <option>Import</option>
+            {channelOptions.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
           </Select>
           <div className="flex items-center gap-2">
             <Field className="!mb-0">
@@ -564,18 +600,28 @@ function ChannelBadge({ channel }) {
     'Offline Store': 'bg-slate-100 text-slate-600 border-slate-200',
     Import: 'bg-emerald-50 text-emerald-700 border-emerald-200',
   };
-  // The canonical sales contract records no channel, so a row served by the API
-  // genuinely has none. Say so rather than rendering an empty badge or
-  // defaulting it to a channel the sale was never attributed to.
+  // The channel vocabulary is open -- a merchant's own channel names are stored
+  // as given -- so an unrecognized label gets a neutral badge rather than being
+  // forced into one of the tones above. The fallback tone is deliberately
+  // neutral grey, not a real channel's colour, so a new label cannot be
+  // mistaken for "Offline Store".
   if (!channel) {
     return (
-      <span className="text-xs text-slate-400" title="The sales contract does not record a channel.">
-        Not recorded
+      <span
+        className="text-xs text-slate-400"
+        title="This sale was imported without stating a selling channel."
+      >
+        {NOT_RECORDED_LABEL}
       </span>
     );
   }
   return (
-    <span className={cn('inline-block rounded-full border px-2 py-0.5 text-[10px] font-bold', tones[channel] || tones['Offline Store'])}>
+    <span
+      className={cn(
+        'inline-block rounded-full border px-2 py-0.5 text-[10px] font-bold',
+        tones[channel] || 'bg-slate-100 text-slate-600 border-slate-200',
+      )}
+    >
       {channel}
     </span>
   );

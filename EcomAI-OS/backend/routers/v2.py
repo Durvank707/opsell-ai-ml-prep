@@ -60,6 +60,38 @@ router = APIRouter(
 _WORKSPACES: Dict[str, TenantWorkspace] = {}
 
 
+#: Warnings returned per validation response.
+#:
+#: A minimal sales file states only product_id/date/units_sold, so the four
+#: optional contract fields each flag every row: a 1,000-row file legitimately
+#: produces ~4,000 warnings. Shipping all of them costs hundreds of kilobytes to
+#: say the same thing 200 times, and no caller acts on them individually. Errors
+#: are NEVER truncated — ingest is all-or-nothing, so a caller must be able to
+#: see every blocking problem — and the true totals are always reported so a
+#: truncated count can never read as a complete one.
+_WARNING_RESPONSE_LIMIT = 200
+
+
+def _validation_payload(result: Any) -> Dict[str, Any]:
+    """The shared validation-report body, with warnings capped and counted."""
+
+    blocking = [p for p in result.problems if p.severity == SEV_ERROR]
+    warnings = [p for p in result.problems if p.severity != SEV_ERROR]
+    kept = warnings[:_WARNING_RESPONSE_LIMIT]
+    return {
+        "total_rows": result.total_rows,
+        "accepted_rows": result.accepted_rows,
+        "rejected_rows": result.rejected_rows,
+        # Errors first, so a client that reads only the first problem is never
+        # handed a warning while the batch is still refused.
+        "problems": [p.to_dict() for p in (*blocking, *kept)],
+        "schema_problems": [p.to_dict() for p in result.schema_problems],
+        "error_count": len(blocking),
+        "warning_count": len(warnings),
+        "warnings_omitted": len(warnings) - len(kept),
+    }
+
+
 def workspace_for(user_id: str, email: Optional[str] = None) -> TenantWorkspace:
     """Return the user-scoped workspace, creating an empty one on first sight.
 
@@ -325,13 +357,7 @@ async def validate_rows_v2(
             max_rows=row_limit,
         )
         response.status_code = 413
-        return {
-            "total_rows": result.total_rows,
-            "accepted_rows": result.accepted_rows,
-            "rejected_rows": result.rejected_rows,
-            "problems": [p.to_dict() for p in result.problems],
-            "schema_problems": [p.to_dict() for p in result.schema_problems],
-        }
+        return _validation_payload(result)
 
     # Async path for large files (202) --------------------------------------
     if len(request.rows) > _INLINE_LIMIT:
@@ -366,13 +392,7 @@ async def validate_rows_v2(
         known_categories=known_categories,
         max_rows=request.max_rows,
     )
-    return {
-        "total_rows": result.total_rows,
-        "accepted_rows": result.accepted_rows,
-        "rejected_rows": result.rejected_rows,
-        "problems": [p.to_dict() for p in result.problems],
-        "schema_problems": [p.to_dict() for p in result.schema_problems],
-    }
+    return _validation_payload(result)
 
 
 _INLINE_LIMIT = 500
@@ -475,6 +495,8 @@ async def ingest_rows_v2(
                 "rejected_rows": result.rejected_rows,
                 "problems": [p.to_dict() for p in result.problems],
                 "schema_problems": [p.to_dict() for p in result.schema_problems],
+                "error_count": result.error_count,
+                "warning_count": result.warn_count,
             },
         )
 
@@ -761,10 +783,15 @@ async def list_sales_v2(
     date_from: Optional[str] = Query(default=None),
     date_to: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
+    channel: Optional[str] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ):
-    """Paginated, tenant-scoped sales records for the records table."""
+    """Paginated, tenant-scoped sales records for the records table.
+
+    ``channel`` matches the stored label exactly; pass the ``unrecorded``
+    sentinel from ``/sales/summary`` to select sales nobody attributed.
+    """
     ws = _principal_workspace(principal, user_id)
     try:
         return ws.list_sales(
@@ -772,6 +799,7 @@ async def list_sales_v2(
             date_from=date_from,
             date_to=date_to,
             search=search,
+            channel=channel,
             limit=limit,
             offset=offset,
         )
@@ -784,9 +812,11 @@ async def sales_summary_v2(
     principal: AuthPrincipal = Depends(require_auth),
     user_id: str = Query(..., min_length=1),
 ):
-    """Portfolio sales totals for the signed-in tenant."""
+    """Portfolio sales totals and the per-channel split for the signed-in tenant."""
     ws = _principal_workspace(principal, user_id)
-    return ws.sales_summary()
+    summary = ws.sales_summary()
+    summary["available_channels"] = ws.sales_channels()
+    return summary
 
 
 class V2DemoSeedRequest(BaseModel):
@@ -1113,13 +1143,7 @@ async def _async_validate(
         columns=columns,
         known_categories=known_categories,
     )
-    return {
-        "total_rows": result.total_rows,
-        "accepted_rows": result.accepted_rows,
-        "rejected_rows": result.rejected_rows,
-        "problems": [p.to_dict() for p in result.problems],
-        "schema_problems": [p.to_dict() for p in result.schema_problems],
-    }
+    return _validation_payload(result)
 
 
 # Re-export the canonical taxonomy so routers never import contracts twice.

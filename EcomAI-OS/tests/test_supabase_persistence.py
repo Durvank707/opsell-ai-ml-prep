@@ -78,11 +78,16 @@ def test_upsert_is_canonical_and_user_scoped(monkeypatch):
         "units_sold": 4,
         "price": 10.5,
         "category": "Electronics",
+        # A row that stated no channel is sent as the explicit 'unrecorded'
+        # label, never omitted, because channel is part of the upsert key.
+        "channel": "unrecorded",
         "promotion": False,
     }]
     request = requests[0][0]
     assert request.method == "POST"
-    assert "on_conflict=user_id%2Cproduct_id%2Cdate" in request.full_url
+    assert (
+        "on_conflict=user_id%2Cproduct_id%2Cdate%2Cchannel" in request.full_url
+    )
     assert request.headers["Authorization"] == "Bearer service-role-test-key"
     assert json.loads(request.data.decode("utf-8"))[0]["user_id"] == "tenant-a"
 
@@ -187,12 +192,12 @@ def test_tenant_write_and_hydration_use_the_remote_boundary(monkeypatch):
         "promotion": False,
     })
 
-    assert workspace.sales_records[("P1", "2025-01-01")]["units_sold"] == 4
+    assert workspace.sales_records[("P1", "2025-01-01", "unrecorded")]["units_sold"] == 4
     assert requests[-1].method == "POST"
 
     hydrated = TenantWorkspace("tenant-a")
     assert hydrated.hydrate_sales() == 1
-    assert hydrated.sales_records[("P1", "2025-01-01")]["units_sold"] == 4
+    assert hydrated.sales_records[("P1", "2025-01-01", "unrecorded")]["units_sold"] == 4
     assert any(entry.action == "sales_hydrated" for entry in hydrated.audit)
 
 

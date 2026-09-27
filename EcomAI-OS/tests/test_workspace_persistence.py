@@ -240,7 +240,7 @@ def test_full_hydration_restores_products_sales_and_audit(monkeypatch):
     assert counts["sales"] == 1
     assert counts["audit"] == 1
     assert workspace.products["P1"].product_name == "Widget"
-    assert workspace.sales_records[("P1", "2025-01-01")]["units_sold"] == 5
+    assert workspace.sales_records[("P1", "2025-01-01", "unrecorded")]["units_sold"] == 5
     # The hydration events themselves are recorded and persisted.
     actions = [item[0]["action"] for item in recorder.bodies_for("audit_entries")]
     assert "products_hydrated" in actions
@@ -438,4 +438,4 @@ def test_sales_persistence_is_unchanged(monkeypatch):
     assert len(sales) == 1
     assert sales[0][0]["user_id"] == "tenant-a"
     assert sales[0][0]["units_sold"] == 7
-    assert workspace.sales_records[("P1", "2025-01-01")]["units_sold"] == 7
+    assert workspace.sales_records[("P1", "2025-01-01", "unrecorded")]["units_sold"] == 7

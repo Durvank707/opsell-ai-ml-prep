@@ -280,7 +280,7 @@ def _canonical_sales_payloads(
 ) -> List[Dict[str, Any]]:
     """Validate rows and convert them to the remote sales wire shape."""
 
-    from backend.contracts import SALES_RECORD
+    from backend.contracts import SALES_RECORD, sales_channel_label
     from backend.validation import SEV_ERROR, validate_rows
 
     payloads: List[Dict[str, Any]] = []
@@ -321,6 +321,14 @@ def _canonical_sales_payloads(
         payload: Dict[str, Any] = {"user_id": user_id}
         for field in SALES_RECORD.fields:
             name = field.canonical_name
+            if name == "channel":
+                # ``channel`` is part of the upsert key, so it is always sent
+                # explicitly rather than left to the column default. Otherwise
+                # two batches that both omitted the column would still collide
+                # correctly, but a batch that supplied it and one that did not
+                # would disagree about the key for the same logical row.
+                payload[name] = sales_channel_label(values.get(name))
+                continue
             if name not in values:
                 continue
             value = values[name]
@@ -333,11 +341,15 @@ def _canonical_sales_payloads(
             elif name == "promotion":
                 value = bool(value)
             payload[name] = value
-        business_key = (payload["product_id"], payload["date"])
+        business_key = (
+            payload["product_id"],
+            payload["date"],
+            payload["channel"],
+        )
         if business_key in seen_business_keys:
             raise SupabasePersistenceError(
-                f"Sales rows contain duplicate product/date key {business_key}; "
-                "the batch was refused."
+                f"Sales rows contain duplicate product/date/channel key "
+                f"{business_key}; the batch was refused."
             )
         seen_business_keys.add(business_key)
         payloads.append(payload)
@@ -350,7 +362,7 @@ def upsert_sales(
     """Upsert canonical sales for exactly one user.
 
     The ``on_conflict`` clause corresponds to the unique index in
-    ``0002_sales_upsert.sql``.  A successful HTTP response returns the payloads
+    ``0009_sales_channel.sql``.  A successful HTTP response returns the payloads
     that were sent; failures raise :class:`SupabasePersistenceError` and never
     return a fabricated success value.
     """
@@ -372,7 +384,7 @@ def upsert_sales(
     _request(
         "POST",
         table="sales",
-        query={"on_conflict": "user_id,product_id,date"},
+        query={"on_conflict": "user_id,product_id,date,channel"},
         body=payloads,
         prefer="resolution=merge-duplicates,return=minimal",
     )
@@ -423,7 +435,9 @@ def fetch_sales(
     max_rows = _max_upload_rows()
     page_size = _fetch_page_size()
     base_query: Dict[str, Any] = {
-        "select": "user_id,product_id,date,units_sold,price,category,promotion",
+        "select": (
+            "user_id,product_id,date,units_sold,price,category,channel,promotion"
+        ),
         "user_id": f"eq.{normalized_user}",
         "order": "date.asc,product_id.asc",
     }

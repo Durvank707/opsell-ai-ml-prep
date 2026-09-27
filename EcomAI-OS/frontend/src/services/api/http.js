@@ -72,12 +72,18 @@ export function fetchTimeline(user, productId, days = 45) {
 
 // ---------------------------------------------------------------- sales
 
-export function fetchSales(user, { productId, dateFrom, dateTo, search, limit, offset } = {}) {
+export function fetchSales(
+  user,
+  { productId, dateFrom, dateTo, search, channel, limit, offset } = {},
+) {
   const extra = {};
   if (productId && productId !== 'all') extra.product_id = productId;
   if (dateFrom) extra.date_from = dateFrom;
   if (dateTo) extra.date_to = dateTo;
   if (search) extra.search = search;
+  // Null/absent means "no filter". The server matches the stored label exactly,
+  // so the caller passes the canonical label and never a display string.
+  if (channel) extra.channel = channel;
   if (limit != null) extra.limit = String(limit);
   if (offset != null) extra.offset = String(offset);
   return requestV2(`/sales${query(user, extra)}`);
