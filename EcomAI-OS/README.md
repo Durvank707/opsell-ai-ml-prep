@@ -36,11 +36,123 @@ Built with **FastAPI**, **React (Vite + Tailwind CSS + Recharts + Lucide)**, **X
 
 ---
 
+## Fresh Clone Setup
+
+A fresh clone of this repository is **not runnable as-is**, by design. The
+trained model and the seed datasets are build outputs, not source, so they are
+git-ignored:
+
+| Ignored path | Rule | Built by |
+| --- | --- | --- |
+| `data/raw/sales.csv` | `.gitignore`: `data/raw/*.csv` | `scripts/generate_data.py` |
+| `data/raw/inventory_snapshot.csv` | `.gitignore`: `data/raw/*.csv` | `scripts/generate_inventory.py` |
+| `data/processed/forecast_error_std.csv` | `.gitignore`: `data/processed/*.csv` | `train.py` |
+| `models/xgboost_forecaster.joblib` | `.gitignore`: `models/*.joblib` | `train.py` |
+
+`EcomAIService.load_resources` (`backend/services.py`) requires the sales store,
+the inventory snapshot and the trained forecaster and raises `FileNotFoundError`
+if any is missing, so **the backend will not start and `/api/health` will fail**
+until you build them. There is deliberately no dummy or mock model behind that
+check: a fabricated artifact would make a broken setup look like a working one.
+
+### Commands
+
+Run all of the following from the repository root (the directory containing
+`requirements.txt`):
+
+```powershell
+# 1. Create the environment and install dependencies
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# 2. Create the local environment file (never committed; fill in your own secrets)
+copy .env.example .env
+
+# 3. Build the data and model artifacts listed above
+.\.venv\Scripts\python.exe scripts\bootstrap.py
+
+# 4. Start the backend
+.\.venv\Scripts\uvicorn.exe backend.main:app --reload --port 8000
+```
+
+Then, in a second terminal:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Step 3 prints a summary of what it built and where. It is idempotent: existing
+artifacts are reported as `[skip]`, so it is safe to re-run. Use
+`--force` to rebuild everything from scratch, or `--status` to check what is
+present without changing anything.
+
+Verify step 3 worked:
+
+```powershell
+Invoke-RestMethod http://localhost:8000/api/health   # -> {"status":"healthy"}
+```
+
+### What step 3 actually does
+
+`scripts/bootstrap.py` runs three steps **in dependency order**, and fails loudly
+rather than substituting anything if one of them cannot run:
+
+1. `scripts/generate_data.py` writes the deterministic seed sales dataset
+   (5 products x 731 days, `np.random.seed(42)`). Run it from the repository
+   root: it writes to the relative path `data/raw/sales.csv`.
+2. `scripts/generate_inventory.py` derives `inventory_snapshot.csv` (stock,
+   lead time, unit cost) from the sales data written in step 1.
+3. `train.py` trains the XGBoost forecaster and writes
+   `models/xgboost_forecaster.joblib` plus the per-product forecast-error
+   spread `data/processed/forecast_error_std.csv` used for safety stock.
+
+`train.py` is the non-interactive entry point for the pipeline developed in
+`notebooks/02_forecasting_models.ipynb`. It is not a second implementation: it
+calls the same `src/` functions as that notebook, with the same feature list,
+split dates (`train_end=2025-07-01`, `validation_end=2025-10-01`) and
+hyperparameters as the notebook's final cells, so a model trained by either path
+is the same model. It exists because a notebook cannot be relied on to produce
+an artifact from a clean checkout, and because it runs from any working
+directory. The notebook remains the source of truth for the model comparison,
+the hyperparameter search and the baseline backtests.
+
+Two details worth knowing:
+
+- The trained model is XGBoost, fitted on 3055 rows with a held-out test window
+  of 2025-10-01 onward. Rebuilding is deterministic: repeated runs produce an
+  identical artifact. Exact `forecast_error_std.csv` *values* do drift slightly
+  across XGBoost major versions (the tracked notebook output was produced on
+  2.x), which is expected and does not affect correctness.
+- `data/raw/sales.csv` is read with a `channel` column when present and without
+  one otherwise. The generated dataset has no `channel` column, which is
+  supported: `seed_canonical_demo` (`backend/tenant.py`) treats a channel-less
+  store as valid and records those rows as `SALES_CHANNEL_UNRECORDED` rather
+  than guessing a channel.
+
+### Running the tests from a fresh clone
+
+The suite is hermetic and needs no `.env` and no real credentials, but it does
+need the step 3 artifacts, because the tests exercise the real model and seed a
+tenant from the real sales store. So run step 3 first:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/
+```
+
+---
+
 ## Quick Start Guide
 
 ### Prerequisites
 - Python 3.12+
 - Node.js 18+ & npm
+
+If you have just cloned the repository, complete the
+[Fresh Clone Setup](#fresh-clone-setup) section above first — the backend cannot
+start without the artifacts it builds.
 
 ### 1. Backend Setup & Run (FastAPI)
 
@@ -495,6 +607,11 @@ The suite is hermetic: `tests/conftest.py` pins an explicit environment and
 points `ECOMAI_OS_ENV_FILE` at a non-existent path, so a developer's real
 `.env` or Supabase credentials can never change a test result.
 
+It still needs the git-ignored data and model artifacts, because the API tests
+exercise the real trained model and seed a tenant from the real sales store. On
+a fresh clone, run `scripts/bootstrap.py` first — see
+[Fresh Clone Setup](#fresh-clone-setup).
+
 ---
 
 ## Project Structure
@@ -516,7 +633,7 @@ EcomAI-OS/
 │   ├── package.json
 │   └── vite.config.js
 ├── models/
-│   └── xgboost_forecaster.joblib  # Trained model
+│   └── xgboost_forecaster.joblib  # Trained model (git-ignored, built by train.py)
 ├── data/
 │   ├── raw/                  # sales.csv, inventory_snapshot.csv
 │   └── processed/            # forecast_error_std.csv
@@ -526,5 +643,11 @@ EcomAI-OS/
 │   ├── features/
 │   ├── inventory/
 │   └── models/
+├── scripts/
+│   ├── bootstrap.py          # Fresh-clone setup: seed data, then train
+│   ├── generate_data.py      # Seed sales dataset
+│   └── generate_inventory.py # Seed inventory snapshot
+├── notebooks/                # Exploratory analysis; 02 trains the forecaster
+├── train.py                  # Non-interactive forecaster training entry point
 └── tests/                    # Pytest test suite
 ```
