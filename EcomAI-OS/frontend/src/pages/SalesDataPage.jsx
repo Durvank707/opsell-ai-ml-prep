@@ -116,10 +116,14 @@ export default function SalesDataPage() {
     }
   }, [user, search, productId, channel, dateFrom, dateTo, page, pageSize]);
 
+  // `loadKey` is bumped by both import paths, so it is what tells this effect
+  // that rows were written. Without it here the summary refreshes after an
+  // import but the table keeps the rows it loaded beforehand, and the page
+  // reports a fresh import while showing "No sales records found".
   useEffect(() => {
     const t = setTimeout(loadRecords, 120);
     return () => clearTimeout(t);
-  }, [loadRecords]);
+  }, [loadRecords, loadKey]);
 
   useEffect(() => {
     setPage(1);
@@ -426,11 +430,15 @@ export default function SalesDataPage() {
                 {summary.channels.map((c) => (
                   <div key={c.name} className="flex items-center justify-between text-xs">
                     <span className="text-slate-500">{c.name}</span>
+                    {/* The bar above is scaled by record count, so the count is
+                        the number that has to lead -- and it has to say so.
+                        Printed bare next to the unit total it reads as one
+                        larger figure ("40" + "196" looks like 40,196 units). */}
                     <span className="tnum font-bold text-slate-700">
-                      {formatNumber(c.count)}
+                      {formatNumber(c.count)} record{c.count === 1 ? '' : 's'}
                       {c.units != null && (
                         <span className="ml-1.5 font-normal text-slate-400">
-                          {formatNumber(c.units)} units
+                          &middot; {formatNumber(c.units)} units
                         </span>
                       )}
                     </span>
