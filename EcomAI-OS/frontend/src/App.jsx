@@ -45,6 +45,22 @@ function HomeRedirect() {
   return <Navigate to={user ? '/app' : '/login'} replace />;
 }
 
+/**
+ * The reset page is reachable whatever the session state is.
+ *
+ * A recovery link *is* the credential, and it is routinely opened in a browser
+ * that already holds a session — the user asked for the reset from their phone,
+ * or is signed in on the same machine. Gating this route on "signed out" made
+ * `GuestRoute` bounce those users to `/app`, discarding the `#access_token`
+ * fragment before `ResetPasswordPage` could read it: the link appeared to do
+ * nothing and the password could not be changed at all. The page renders its
+ * own `AuthLayout` and authenticates with the recovery token, so it has no use
+ * for a session and must not be redirected on the basis of one.
+ */
+function RecoverableRoute() {
+  return <Outlet />;
+}
+
 /** Scroll to top on navigation (respecting hash anchors). */
 function ScrollManager() {
   const { pathname, hash } = useLocation();
@@ -80,6 +96,9 @@ export default function App() {
                   <Route path="/login" element={<LoginPage />} />
                   <Route path="/signup" element={<SignupPage />} />
                   <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+                </Route>
+
+                <Route element={<RecoverableRoute />}>
                   <Route path="/reset-password" element={<ResetPasswordPage />} />
                 </Route>
 
