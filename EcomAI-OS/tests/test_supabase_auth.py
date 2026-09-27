@@ -365,6 +365,99 @@ def test_recovery_token_is_forwarded_as_the_bearer(monkeypatch):
     assert sent[0].headers["Apikey"] == PUBLISHABLE
 
 
+def test_recovery_session_is_revoked_once_the_password_is_set(monkeypatch):
+    """A recovery link must stop working the moment it has been spent.
+
+    GoTrue does not make a recovery session single-use: the same token can set
+    the password repeatedly for its whole lifetime, and the last call wins. So
+    the reset revokes the session it just used, with the very token the caller
+    presented -- no privileged credential, just the caller's own.
+    """
+
+    _enable_supabase_auth(monkeypatch)
+    gotrue = _install(monkeypatch, _GoTrue())
+
+    supabase_auth.apply_recovery_token(Settings(), "recovery-token-abc", "newpass123")
+
+    revoked = gotrue.for_path("/logout")
+    assert len(revoked) == 1, "the recovery session was never revoked"
+    assert revoked[0].headers["Authorization"] == "Bearer recovery-token-abc"
+    # Revocation must never reach for the service-role key: the recovery token
+    # authorises revoking itself, and the admin key is not needed here.
+    assert revoked[0].headers["Apikey"] == PUBLISHABLE
+
+
+def test_recovery_token_cannot_be_replayed_after_a_reset(monkeypatch):
+    """Replaying a spent reset link must fail closed.
+
+    A link that leaks -- forwarded mail, browser history, a proxy log -- would
+    otherwise stay a working account-takeover credential for the rest of its
+    hour-long life, long after the user reset their password and believed the
+    link was spent. Modelled directly on GoTrue's real behaviour, observed live:
+    one recovery session accepted three consecutive password writes.
+    """
+
+    _enable_supabase_auth(monkeypatch)
+    revoked: set = set()
+    current = {"password": "Original#2026a"}
+
+    def _user(request):
+        token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+        if token in revoked:
+            # Exactly GoTrue's answer for a session that no longer exists.
+            raise _http_error(
+                403,
+                {
+                    "error_code": "session_not_found",
+                    "msg": "Session from session_id claim in JWT does not exist",
+                },
+            )
+        current["password"] = json.loads(request.data.decode())["password"]
+        return {}
+
+    def _logout(request):
+        revoked.add(request.headers.get("Authorization", "").removeprefix("Bearer "))
+        return {}
+
+    _install(monkeypatch, _GoTrue({"/logout": _logout, "/user": _user}))
+
+    supabase_auth.apply_recovery_token(Settings(), "recovery-token-abc", "Chosen#2026b")
+    assert current["password"] == "Chosen#2026b"
+
+    with pytest.raises(SupabaseAuthError) as caught:
+        supabase_auth.apply_recovery_token(
+            Settings(), "recovery-token-abc", "Attacker#2026c"
+        )
+    assert caught.value.status_code == 403
+    assert current["password"] == "Chosen#2026b", "a replay must not change the password"
+
+
+def test_failed_revocation_does_not_fail_a_successful_reset(monkeypatch):
+    """Losing the revocation must not tell the user their reset did not happen.
+
+    The password has already been accepted by the time revocation is attempted,
+    so failing the request would report a reset that did occur as a failure. A
+    still-replayable link is the lesser problem next to a user who never learns
+    their new password works.
+    """
+
+    _enable_supabase_auth(monkeypatch)
+    wrote = []
+    _install(
+        monkeypatch,
+        _GoTrue(
+            {
+                "/logout": _http_error(500, {"msg": "smtp offline"}),
+                "/user": lambda request: wrote.append(request) or {},
+            }
+        ),
+    )
+
+    supabase_auth.apply_recovery_token(Settings(), "recovery-token-abc", "newpass123")
+
+    assert len(wrote) == 1, "the password must still have been set"
+
+
 def test_recovery_token_failure_reports_the_upstream_status(monkeypatch):
     _enable_supabase_auth(monkeypatch)
     _install(

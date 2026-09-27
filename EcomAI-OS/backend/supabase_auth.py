@@ -374,10 +374,30 @@ def verify_password(settings: Settings, email: str, password: str) -> Dict[str, 
 
 
 def apply_recovery_token(settings: Settings, token: str, new_password: str) -> None:
-    """Set a new password using a recovery token from a reset link.
+    """Set a new password using a recovery token from a reset link, once.
 
     The recovery token is itself the credential, so it travels as the bearer
     rather than through ``require_auth``: the caller holds no session yet.
+
+    GoTrue does not treat a recovery session as single-use. A token stays able
+    to set a password for its whole lifetime (an hour by default), and each
+    call overwrites the last, so a link that leaks -- forwarded mail, shared
+    history, a proxy log -- remains a working account-takeover credential long
+    after the real user has reset their password and believes the link is
+    spent. Verified against GoTrue: three consecutive ``PUT /user`` calls on
+    one recovery session all return 200, and the last password wins.
+
+    So the session is revoked as soon as the password is set, using the very
+    token the caller presented. A replay then fails closed with GoTrue's
+    ``403 session_not_found``. This is the same ``POST /logout`` revocation
+    ``sign_out`` already performs, and it needs no privileged credential: the
+    recovery token authorises revoking itself.
+
+    Revocation happens only after the password is accepted, and a failure to
+    revoke is logged rather than raised. The password has already changed by
+    then, so failing the request would tell the user their reset did not happen
+    when it did -- and a still-valid link is the lesser problem next to a user
+    who never learns their new password works.
     """
 
     _auth_request(
@@ -387,6 +407,15 @@ def apply_recovery_token(settings: Settings, token: str, new_password: str) -> N
         body={"password": new_password},
         token=token,
     )
+    try:
+        _auth_request("POST", "/logout", settings=settings, token=token)
+    except SupabaseAuthError as exc:
+        # The password is already set. Report the weak outcome for an operator
+        # and let the caller believe the reset worked.
+        _logger.warning(
+            "Password was reset but the recovery session could not be revoked, "
+            "so that reset link stays replayable until it expires: %s", exc
+        )
 
 
 def request_password_recovery(
