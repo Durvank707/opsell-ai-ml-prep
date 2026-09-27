@@ -135,8 +135,11 @@ export default function SettingsPage() {
       await logoutAllSessions();
       await logout();
       toast.info('You have been signed out of all sessions.');
-    } catch {
-      toast.error('Unable to sign out all sessions.');
+    } catch (e) {
+      // Surface why: the server may have refused because Supabase Auth is not
+      // configured, and "Unable to sign out all sessions" alone would send
+      // someone looking for the wrong problem.
+      toast.error(e.message || 'Unable to sign out all sessions.');
     } finally {
       setSaving('');
     }
@@ -146,6 +149,10 @@ export default function SettingsPage() {
     setSaving('delete');
     try {
       await deleteAccount(user, deletePassword);
+      // The account is gone, so a server sign-out round trip could only fail.
+      // Clear the local session so the shell does not keep rendering as
+      // signed in against an identity that no longer exists.
+      await logout().catch(() => {});
       toast.info('Your account has been deleted.');
       navigate('/login');
     } catch (e) {

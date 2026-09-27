@@ -229,6 +229,26 @@ class Settings:
             "SUPABASE_SERVICE_ROLE_KEY", ""
         ).strip()
 
+        # Where Supabase Auth should send a password-recovery link. This has to
+        # match a Redirect URL allow-list entry in the Supabase dashboard, and
+        # it is the URL the recovery token is handed back on, so it is a
+        # security boundary rather than a cosmetic default: a value that is not
+        # allow-listed is rejected by GoTrue, and one that is allow-listed
+        # wrongly would hand a recovery token to the wrong origin. It is
+        # therefore required to be an absolute http(s) URL and is validated
+        # here rather than at the point of use.
+        self.password_reset_redirect_url = os.environ.get(
+            "PASSWORD_RESET_REDIRECT_URL", ""
+        ).strip()
+        if self.password_reset_redirect_url:
+            if not re.fullmatch(
+                r"https?://[^\s/?#]+(?:[^\s?#]*)", self.password_reset_redirect_url
+            ):
+                raise RuntimeError(
+                    "PASSWORD_RESET_REDIRECT_URL must be an absolute http(s) "
+                    "URL, for example https://app.example.com/reset-password."
+                )
+
         # -- Application behavior ------------------------------------------
         # When USE_SUPABASE is off we run the fully-local, in-process,
         # per-user isolated store (the same store the tests exercise). The

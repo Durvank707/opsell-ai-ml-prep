@@ -5,14 +5,20 @@ import AuthLayout from './AuthLayout';
 import Button from '../../components/ui/Button';
 import { Field, Input } from '../../components/ui/form';
 import { useToast } from '../../context/ToastContext';
-import { requestPasswordReset } from '../../services/authService';
+import { AUTH_MODE, requestPasswordReset } from '../../services/authService';
+
+// In the mock there is no mail server, so the demo hands back a reset token and
+// shows the link inline. That is a mock affordance only: against a real
+// Supabase Auth project the link is emailed and the backend never returns a
+// token, so this panel must not be able to appear outside the demo.
+const MOCK_AUTH = AUTH_MODE === 'mock';
 
 export default function ForgotPasswordPage() {
   const toast = useToast();
   const [email, setEmail] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [sent, setSent] = useState(null); // {email, resetToken}
+  const [sent, setSent] = useState(null); // {email, demoToken}
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -24,11 +30,16 @@ export default function ForgotPasswordPage() {
     setLoading(true);
     try {
       const res = await requestPasswordReset(email.trim());
-      // Security-conscious: always show the same message.
-      setSent({ email: email.trim(), debugToken: res.sent ? res.resetToken : null });
-      toast.success('If an account exists, a reset link has been sent.');
-    } catch {
-      toast.error('Unable to process your request. Please try again.');
+      // The backend answers identically for a registered address and an
+      // unknown one, so this screen cannot be used to discover which
+      // addresses hold an account.
+      setSent({ email: email.trim(), demoToken: MOCK_AUTH ? res?.resetToken : null });
+    } catch (err) {
+      // A real failure has to be visible: "we emailed you" when nothing was
+      // sent would leave someone waiting for a message that never arrives.
+      const message = err?.message || 'Unable to send the reset link. Please try again.';
+      setError(message);
+      toast.error(message);
     } finally {
       setLoading(false);
     }
@@ -79,13 +90,13 @@ export default function ForgotPasswordPage() {
               If an account exists for <span className="font-semibold text-slate-700">{sent.email}</span>, a password
               reset link has been sent to it.
             </p>
-            {sent.debugToken && (
+            {sent.demoToken && (
               <div className="mt-4 rounded-xl border border-dashed border-brand-300 bg-brand-50/60 p-4 text-left">
                 <p className="text-xs font-semibold text-brand-700">
-                  Demo note: since email delivery is mocked, use this reset link:
+                  Demo note: email delivery is mocked here, so use this reset link:
                 </p>
                 <Link
-                  to={`/reset-password?token=${sent.debugToken}`}
+                  to={`/reset-password?token=${sent.demoToken}`}
                   className="mt-1.5 block break-all text-xs font-semibold text-brand-600 underline hover:text-brand-700"
                 >
                   Continue to reset password →

@@ -50,7 +50,13 @@ function ScrollManager() {
   const { pathname, hash } = useLocation();
   useEffect(() => {
     if (hash) {
-      const el = document.querySelector(hash);
+      // A hash is not necessarily a selector. A Supabase password-recovery link
+      // lands here as `#access_token=...&type=recovery`, and passing that to
+      // querySelector throws a SyntaxError, which unmounts the whole tree and
+      // leaves a blank page. Only a plain `#id` anchor is worth looking up, and
+      // an unresolvable one is simply not a scroll target.
+      const anchor = /^#[A-Za-z][\w-]*$/.test(hash) ? hash : null;
+      const el = anchor ? document.querySelector(anchor) : null;
       if (el) el.scrollIntoView({ behavior: 'smooth' });
     } else {
       window.scrollTo(0, 0);

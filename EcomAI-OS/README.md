@@ -91,6 +91,88 @@ non-production, non-Supabase environment. The optional `/api/auth/signup`,
 and issue short-lived HS256 tokens. This local issuer is not a replacement for
 email verification, refresh rotation, or a production identity provider.
 
+#### Account management (Supabase Auth)
+
+`signup`/`login`/`me`/`logout` are the local issuer and stay disabled when
+Supabase is enabled. The six **account** actions are separate and are backed by
+Supabase Auth, because the local issuer has no reset-token, revocation, or
+deletion story to route them to:
+
+| Endpoint | Purpose | Credential |
+| --- | --- | --- |
+| `POST /api/auth/password-reset` | email a recovery link | none |
+| `POST /api/auth/reset-password` | set the new password | recovery token |
+| `PATCH /api/auth/me` | update name / business name / email | session bearer |
+| `POST /api/auth/change-password` | change password | session bearer + current password |
+| `POST /api/auth/logout-all` | revoke other refresh tokens | session bearer |
+| `DELETE /api/auth/me` | delete the account and its rows | session bearer + current password |
+
+These are gated on Supabase Auth being configured, not on the local issuer, so
+they work under `USE_SUPABASE=true` where the local routes return `503`. They
+fail closed with `503` when `USE_SUPABASE` is off or a credential is missing.
+
+Four properties are deliberate:
+
+* **No token is ever returned to the browser for a reset request.** The recovery
+  token is emailed by Supabase Auth and comes back in the redirect URL's
+  fragment; the frontend reads it there and hands it straight to
+  `POST /api/auth/reset-password`, which forwards it to `PUT /auth/v1/user` with
+  the *publishable* key. The service-role key is only used for `/admin/*` paths
+  and never leaves `backend/supabase_auth.py`.
+* **`password-reset` cannot be used to enumerate accounts.** The response is
+  byte-identical for a registered address and an unknown one. A 4xx from GoTrue
+  (unknown address, or a rate limit) is swallowed for the caller but logged as a
+  warning, because a rejected `redirect_to` looks the same from outside and an
+  operator needs to see it. A 5xx is **not** swallowed: that means the mail may
+  not have gone out, and reporting success would leave someone waiting for a
+  message that never arrives.
+* **The account routes address GoTrue by the signed `sub` only.** A caller
+  cannot manage another account by naming it, and the address used to verify a
+  current password is read from the verified token, not the request body.
+* **`DELETE /api/auth/me` purges the tenant's own rows** in paged batches
+  (PostgREST caps one response, so an un-paginated delete can leave rows behind
+  while reporting success). If the purge fails after the account is gone, the
+  response says exactly that rather than reporting a clean deletion.
+
+#### Password reset: what to configure in Supabase
+
+`PASSWORD_RESET_REDIRECT_URL` is the page the emailed link lands on. It must be
+an absolute `http(s)` URL and must be allow-listed, or GoTrue rejects the request
+and no mail is sent:
+
+```dotenv
+PASSWORD_RESET_REDIRECT_URL=http://localhost:5173/reset-password
+```
+
+In the Supabase dashboard, under **Authentication → URL Configuration**:
+
+* **Site URL** — the app's origin (used when a link omits an explicit target).
+* **Redirect URLs** — add `http://localhost:5173/reset-password` and the
+  production equivalent. A `redirect_to` that is not allow-listed is *not*
+  honored; GoTrue falls back to the Site URL, so the link would land somewhere
+  useless rather than failing loudly.
+
+Email delivery uses Supabase Auth's own mailer. Its **built-in SMTP is rate
+limited to a couple of messages per hour and only to project members**, which is
+enough to confirm the flow works and not enough to use. For real traffic,
+configure **Authentication → Email → SMTP Settings** (or the newer
+**Email → SMTP** section) with a transactional provider such as Resend,
+Postmark, or SendGrid:
+
+| Dashboard field | Value |
+| --- | --- |
+| SMTP host | your provider's host, e.g. `smtp.resend.com` |
+| SMTP port | `587` (or `465` for implicit TLS) |
+| SMTP username | the provider's username or API key |
+| SMTP password | the provider's SMTP key |
+| Enable TLS | on (required by every provider listed above) |
+
+Those values live in the **Supabase dashboard**, not in this repository's
+`.env`. This backend needs **no new environment variables** for password reset —
+it reuses `SUPABASE_URL` plus the existing publishable and service-role keys,
+both of which stay server-side. Do not add the SMTP password to `.env.example`
+or to any tracked file.
+
 #### V1, jobs, and persistence
 
 `/api/health` is a public liveness check. The legacy V1 business routes are a
@@ -206,11 +288,11 @@ rotate it in the Supabase dashboard.
 #### Row-level security and the identity mismatch
 
 The migrations enable RLS with policies of the form
-`user_id = auth.uid()::text`. **This does not currently match how the
+`user_id = auth.uid()::text`. **These do not currently match how the
 application identifies a tenant, and the policies are therefore inert.**
 
-* The app's tenant identity is the JWT `sub` claim — an email-shaped string such
-  as `demo@ecomai.app`.
+* The app's tenant identity is the JWT `sub` claim. With the current local
+  issuer that is an email-shaped string such as `demo@ecomai.app`.
 * `auth.uid()` returns a UUID from a Supabase Auth session. An email is never
   equal to a UUID, so these policies match no row for this application.
 * The backend authenticates to PostgREST with the **service-role key, which
@@ -235,6 +317,26 @@ untrusted traffic. Two coherent options:
 
 Option 1 is the target state. Until it is chosen, do not expose the
 publishable/anon key to a browser expecting the policies to protect data.
+
+Account management already points at option 1: the six account endpoints are
+Supabase Auth endpoints, and the password-reset flow assumes a user who signs in
+through Supabase. Two things still stand between the current state and a
+working option 1, both verified against a live project rather than inferred:
+
+1. **There is no Supabase sign-in.** `signup`/`login` are local-issuer only and
+   return `503` under `USE_SUPABASE=true`, so after resetting a password there
+   is no way to obtain a Supabase-issued session through this API.
+2. **The backend cannot verify a Supabase-issued token.** Supabase signs access
+   tokens with **ES256** (the project's JWKS serves a single
+   `kty=EC, crv=P-256` key), and `SUPPORTED_JWT_ALGORITHMS` in
+   `backend/auth.py` is `{"HS256", "RS256"}`. A real Supabase session token is
+   rejected with `401 Invalid authentication token` — "JWT algorithm is not
+   accepted" — before any tenant check runs.
+
+   Either the project's signing key is configured to use HS256 or RS256 so the
+   existing verifier applies, or `backend/auth.py` gains ES256 support. The
+   first is a dashboard change and needs no new crypto code; the second needs an
+   ECDSA verifier, and `cryptography` is not currently a dependency.
 
 ### 2. Frontend Setup & Run (React)
 

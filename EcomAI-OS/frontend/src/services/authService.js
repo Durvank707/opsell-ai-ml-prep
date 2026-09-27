@@ -286,15 +286,35 @@ export async function logout() {
   localStorage.removeItem(SESSION_KEY);
 }
 
+// The six account actions below are served by the FastAPI backend's
+// Supabase Auth routes whenever the browser is holding a backend session. That
+// covers `VITE_AUTH_MODE=backend` and also `external` when the host app has not
+// installed a `window.__ECOMAI_OS_AUTH__` adapter -- in which case the
+// provider owns sign-in but this service still owns account management, and
+// routing it to the backend is the difference between the Settings page working
+// and every action on it throwing.
+//
+// A real deployment never receives a reset token from the backend. The reset
+// link is emailed by Supabase Auth and the recovery token comes back to the
+// browser in the redirect URL's fragment; it is handed straight to
+// `PUT /auth/v1/user` through this service and is never persisted.
+
+function useBackendAccountApi() {
+  if (BACKEND_AUTH) return true;
+  if (REMOTE_AUTH) return typeof provider()?.requestPasswordReset !== 'function'
+    && typeof provider()?.resetPassword !== 'function';
+  return false;
+}
+
 export async function requestPasswordReset(email) {
-  if (BACKEND_AUTH) {
-    throw new Error('Password reset is not enabled for the local backend issuer.');
+  if (useBackendAccountApi()) {
+    // Uniform response for a known and an unknown address alike: the backend
+    // never discloses whether an account exists.
+    await backendRequest('/password-reset', { method: 'POST', payload: { email } });
+    return { ok: true, sent: true };
   }
   if (REMOTE_AUTH) {
     const hook = provider()?.requestPasswordReset || provider()?.resetPassword;
-    if (typeof hook !== 'function') {
-      throw new Error('Password reset is managed by the external identity provider.');
-    }
     return hook({ email });
   }
   await latency(700);
@@ -315,12 +335,15 @@ export async function requestPasswordReset(email) {
 }
 
 export async function resetPassword({ token, password }) {
-  if (BACKEND_AUTH) {
-    throw new Error('Password reset is not enabled for the local backend issuer.');
+  if (useBackendAccountApi()) {
+    await backendRequest('/reset-password', {
+      method: 'POST',
+      payload: { token, password },
+    });
+    return { ok: true };
   }
   if (REMOTE_AUTH) {
-    const hook = requireProvider('resetPassword');
-    return hook({ token, password });
+    return requireProvider('resetPassword')({ token, password });
   }
   await latency(700);
   const users = getAllUsers();
@@ -337,8 +360,17 @@ export async function resetPassword({ token, password }) {
 }
 
 export async function updateProfile(user, patch) {
-  if (BACKEND_AUTH) {
-    throw new Error('Profile updates are not enabled for the local backend issuer.');
+  if (useBackendAccountApi()) {
+    const body = await backendRequest('/me', {
+      method: 'PATCH',
+      payload: {
+        name: patch.name ?? undefined,
+        businessName: patch.businessName ?? undefined,
+        email: patch.email ?? undefined,
+      },
+      auth: true,
+    });
+    return body.user;
   }
   if (REMOTE_AUTH) {
     return requireProvider('updateProfile')({ user, patch });
@@ -359,8 +391,13 @@ export async function updateProfile(user, patch) {
 }
 
 export async function changePassword(user, { currentPassword, newPassword }) {
-  if (BACKEND_AUTH) {
-    throw new Error('Password changes are not enabled for the local backend issuer.');
+  if (useBackendAccountApi()) {
+    await backendRequest('/change-password', {
+      method: 'POST',
+      payload: { currentPassword, newPassword },
+      auth: true,
+    });
+    return { ok: true };
   }
   if (REMOTE_AUTH) {
     return requireProvider('changePassword')({ user, currentPassword, newPassword });
@@ -378,22 +415,36 @@ export async function changePassword(user, { currentPassword, newPassword }) {
 }
 
 export async function logoutAllSessions() {
-  if (BACKEND_AUTH) {
+  if (useBackendAccountApi()) {
+    // Revokes the caller's other refresh tokens server-side. This is a real
+    // state change, so it is not allowed to report success without a round
+    // trip the way the old no-op did.
+    await backendRequest('/logout-all', { method: 'POST', auth: true });
     return { ok: true };
   }
   if (REMOTE_AUTH) {
     const hook = provider()?.logoutAllSessions;
-    if (typeof hook !== 'function') return { ok: true };
+    if (typeof hook !== 'function') {
+      throw new Error(
+        'Signing out other sessions is managed by the external identity provider.',
+      );
+    }
     return hook();
   }
   await latency(500);
-  // In the mock there is one session; a real backend would revoke refresh tokens.
+  // In the mock there is one session; a real backend revokes refresh tokens.
   return { ok: true };
 }
 
 export async function deleteAccount(user, password) {
-  if (BACKEND_AUTH) {
-    throw new Error('Account deletion is not enabled for the local backend issuer.');
+  if (useBackendAccountApi()) {
+    const body = await backendRequest('/me', {
+      method: 'DELETE',
+      payload: { password },
+      auth: true,
+    });
+    clearAccessToken();
+    return { ok: true, deletedRows: body.deleted_rows ?? 0 };
   }
   if (REMOTE_AUTH) {
     return requireProvider('deleteAccount')({ user, password });
