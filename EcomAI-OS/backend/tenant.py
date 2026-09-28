@@ -1918,20 +1918,35 @@ class TenantWorkspace:
         moq: int = 0,
         pack_size: int = 1,
     ) -> Dict[str, Any]:
-        """Recommended order quantity, using the shared inventory policy."""
+        """Recommended order quantity, using the shared inventory policy.
 
-        from src.inventory.policy import (
-            calculate_recommended_order_qty,
-            calculate_target_inventory,
-        )
+        The 30-day forecast stays the planning outlook shown on the Forecast
+        page (and reported as ``forecast_total``); it never sizes the order.
+        A reorder only needs to cover demand until the next delivery arrives,
+        so both the reorder point and the order-up-to target are the expected
+        demand during the supplier lead time plus safety stock. The recommended
+        quantity is therefore ``max(0, reorder_point - inventory_position)``
+        (subject to the existing MOQ / pack-size batching).
+        """
+
+        from src.inventory.policy import calculate_recommended_order_qty
         from src.inventory.reorder import should_reorder
 
         state = self._inventory_state(product_id)
         product = self.products[product_id]
         position = float(product.inventory_position)
-        reorder_point = float(state["reorder_point"])
+        safety_stock = float(state["safety_stock"])
+        lead_days = max(int(product.lead_time_days), 1)
+        lead_time_demand = round(
+            sum(
+                point["forecast"]
+                for point in self.demand_forecast(product_id, audit=False)["points"][:lead_days]
+            ),
+            2,
+        )
+        reorder_point = round(lead_time_demand + safety_stock, 2)
         reorder_required = bool(should_reorder(position, reorder_point))
-        target = float(calculate_target_inventory(state["forecast_total"], state["safety_stock"]))
+        target = reorder_point
         quantity = float(
             calculate_recommended_order_qty(
                 target_inventory=target,
@@ -1947,8 +1962,9 @@ class TenantWorkspace:
             "reorder_required": reorder_required,
             "recommended_order_qty": int(round(max(0.0, quantity))),
             "reorder_point": round(reorder_point, 2),
-            "safety_stock": round(float(state["safety_stock"]), 2),
+            "safety_stock": round(safety_stock, 2),
             "target_inventory": round(target, 2),
+            "lead_time_demand": round(lead_time_demand, 2),
             "inventory_position": position,
             "current_stock": product.current_stock,
             "open_order_qty": product.open_order_qty,
