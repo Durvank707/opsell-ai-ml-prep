@@ -6,10 +6,9 @@ import Button from '../../components/ui/Button';
 import { Field, Input } from '../../components/ui/form';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
-import { DEMO_CREDENTIALS } from '../../services/authService';
 
 export default function LoginPage() {
-  const { login } = useAuth();
+  const { login, enterDemo } = useAuth();
   const toast = useToast();
   const navigate = useNavigate();
   const location = useLocation();
@@ -53,10 +52,20 @@ export default function LoginPage() {
     }
   };
 
-  const fillDemo = () => {
-    setEmail(DEMO_CREDENTIALS.email);
-    setPassword(DEMO_CREDENTIALS.password);
+  // One click, no credentials. The server returns a session for the shared demo
+  // tenant, so the visitor lands in a populated workspace instead of being asked
+  // to create an account first. Signing out of it returns them here.
+  const handleDemo = async () => {
     setError('');
+    setLoading(true);
+    try {
+      await enterDemo();
+      navigate('/app');
+    } catch (err) {
+      setError(err.message || 'The demo workspace is unavailable right now.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -128,11 +137,13 @@ export default function LoginPage() {
 
         <button
           type="button"
-          onClick={fillDemo}
-          className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-brand-300 bg-brand-50/50 px-4 py-2.5 text-xs font-semibold text-brand-700 hover:bg-brand-50"
+          onClick={handleDemo}
+          disabled={loading}
+          className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-brand-300 bg-brand-50/50 px-4 py-2.5 text-xs font-semibold text-brand-700 hover:bg-brand-50 disabled:cursor-not-allowed disabled:opacity-60"
         >
           <Sparkles className="h-3.5 w-3.5" />
-          Explore the demo workspace (pre-filled demo account)
+          Explore the demo workspace
+          <span className="font-normal text-brand-600/80">no account needed</span>
         </button>
 
         <p className="mt-7 text-center text-sm text-slate-500">

@@ -45,6 +45,7 @@ from backend.local_auth import (
     issue_access_token,
 )
 from backend.supabase_auth import SupabaseAuthError
+from backend.tenant import DEMO_EMAIL
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 _logger = logging.getLogger(__name__)
@@ -311,6 +312,27 @@ def _subject(principal: AuthPrincipal) -> str:
     return user_id
 
 
+def _is_demo_account(user: dict) -> bool:
+    """Whether this user is the public demo tenant, for display only.
+
+    The flag exists so the interface can tell a visitor they are looking at
+    shared sample data rather than their own, which matters because the demo
+    workspace is one shared tenant: anything a visitor changes there is not saved
+    to an account of theirs.
+
+    It is matched on the reserved demo address rather than on the ``is_demo``
+    metadata flag, so answering it needs no extra request. That is sound
+    *because this value authorizes nothing*. Every tenant boundary in this
+    service is decided by the signed ``sub`` in ``require_auth`` and re-checked by
+    ``resolve_tenant_id``; a wrong answer here could at worst mislabel a badge. A
+    real account cannot be affected: the demo address is owned by the demo tenant,
+    and GoTrue does not allow a second account to register it.
+    """
+
+    email = user.get("email") if isinstance(user, dict) else None
+    return isinstance(email, str) and email.strip().casefold() == DEMO_EMAIL.casefold()
+
+
 def _require_current_password(
     settings: Settings, principal: AuthPrincipal, password: str
 ) -> None:
@@ -428,6 +450,53 @@ async def login(payload: LoginRequest):
     }
 
 
+@router.post("/demo")
+async def enter_demo_workspace():
+    """Open the public demo workspace, without asking for any credentials.
+
+    A visitor who has never signed up still needs to see the product work. The
+    button on the login page calls this and lands in a fully populated
+    workspace — real catalog, real history, real forecasts — using the same
+    dashboard, sales, inventory, recommendation and simulation code as any
+    signed-in tenant.
+
+    What this is **not**, deliberately:
+
+    * It takes no address, user id or password, so it can only ever return the
+      one fixed demo tenant. It is not a way to obtain a session for an
+      arbitrary account.
+    * The demo account's password is random, lives only in the server's memory,
+      and is rewritten on every start, so the account has no credential anyone
+      else could use. Signing in as ``demo@ecomai.app`` through ``/login``
+      therefore still fails.
+    * The session returned is an ordinary signed token for the demo tenant's own
+      subject, so ``require_auth`` and the per-request tenant check treat it
+      exactly like any other session. A demo visitor reaches the demo rows and
+      nothing else; real tenants are unaffected and remain unreadable and
+      unwritable from here.
+
+    With the local identity provider the demo workspace is the seeded store the
+    app has always shipped, so the same button keeps working with no Supabase
+    project configured.
+    """
+
+    settings, issuer = _session_or_503()
+    if issuer != "supabase":
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The demo workspace needs the Supabase identity provider. Run "
+                "with USE_SUPABASE=true, or explore the seeded local workspace."
+            ),
+        )
+    from backend import demo_workspace
+
+    try:
+        return demo_workspace.demo_session(settings)
+    except SupabaseAuthError as exc:
+        raise _auth_error(exc) from exc
+
+
 @router.post("/refresh")
 async def refresh(payload: SessionRefresh):
     """Exchange a refresh token for a new access token.
@@ -456,12 +525,13 @@ async def me(principal: AuthPrincipal = Depends(require_auth)):
     if issuer == "supabase":
         # Addressed by the signed subject only, so a caller cannot read another
         # account by naming one.
-        return {"user": _call_goTrue(supabase_auth.get_user, settings, user_id)}
+        user = _call_goTrue(supabase_auth.get_user, settings, user_id)
+        return {"user": user, "is_demo": _is_demo_account(user)}
 
     user = get_store(settings).get_user(user_id)
     if user is None:
         raise HTTPException(status_code=401, detail="The local account no longer exists.")
-    return {"user": user}
+    return {"user": user, "is_demo": _is_demo_account(user)}
 
 
 @router.post("/logout")

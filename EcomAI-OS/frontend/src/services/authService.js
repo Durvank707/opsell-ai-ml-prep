@@ -280,6 +280,39 @@ export async function login({ email, password }) {
   return { user, token };
 }
 
+/**
+ * Open the public demo workspace.
+ *
+ * The demo is a real, dedicated tenant holding real sample data, so a visitor
+ * needs no account of their own. Against the backend the server provisions that
+ * tenant and returns a real session for it; everything the visitor then sees --
+ * dashboard, products, sales, forecasts, inventory, recommendations,
+ * simulation -- is the same code every signed-in tenant runs, not a mock. The
+ * demo account's password is generated on the server and never sent here, which
+ * is why signing in with DEMO_CREDENTIALS against the backend is expected to
+ * fail and this is the only way in.
+ *
+ * With the local mock there is no server to ask, so the seeded local demo user
+ * is signed in directly -- the behaviour this button has always had, and the
+ * reason it worked before the app moved to a real identity provider.
+ */
+export async function enterDemo() {
+  if (BACKEND_AUTH) {
+    const result = await backendRequest('/demo', { method: 'POST' });
+    const token = storeSession(result);
+    if (!token) throw new Error('The server returned no demo session.');
+    return { user: { ...result.user, isDemo: true }, token };
+  }
+  if (REMOTE_AUTH) {
+    // An externally owned identity provider has no demo tenant of ours to hand
+    // out, and standing one in here would mean minting a credential whose
+    // issuing authority we do not control.
+    throw new Error('The demo workspace is not available with an external sign-in provider.');
+  }
+  const result = await login(DEMO_CREDENTIALS);
+  return { user: { ...result.user, isDemo: true }, token: result.token };
+}
+
 export async function signup({ fullName, businessName, email, password }) {
   if (BACKEND_AUTH) {
     const result = await backendRequest('/signup', {
@@ -343,7 +376,12 @@ export async function getSession() {
       // Renews an expired access token first, so reloading the app an hour
       // after signing in does not sign the user out.
       const result = await authenticatedRequest('/me');
-      return { user: result.user, token: getAccessToken() };
+      // The server, not the browser, decides this: reloading the page must not
+      // drop a demo visitor back into an anonymous-looking workspace.
+      return {
+        user: { ...result.user, isDemo: !!result.is_demo },
+        token: getAccessToken(),
+      };
     } catch {
       clearAccessToken();
       return null;
@@ -368,7 +406,7 @@ export async function getSession() {
     return null;
   }
   const { password: _pw, resetToken: _rt, resetTokenExpiry: _re, ...safe } = record;
-  return { user: { ...safe }, token: session.token };
+  return { user: { ...safe, isDemo: record.email === DEMO_CREDENTIALS.email }, token: session.token };
 }
 
 export async function logout() {

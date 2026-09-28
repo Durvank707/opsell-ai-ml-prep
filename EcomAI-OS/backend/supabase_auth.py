@@ -68,6 +68,12 @@ _GENERIC_BY_STATUS = {
 _MAX_DETAIL = 240
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+#: Rows requested per page when scanning the admin user list for one address.
+_ADMIN_USER_PAGE_SIZE = 200
+#: Ceiling on that scan, so a project with a very large user table cannot turn a
+#: single lookup into an unbounded crawl of ``/admin/users``.
+_ADMIN_USER_SCAN_PAGES = 50
+
 
 class SupabaseAuthError(RuntimeError):
     """A GoTrue call failed. The message is safe to return to the caller.
@@ -303,6 +309,86 @@ def update_user(
         body=body,
         admin=True,
     )
+    return _user_payload(raw)
+
+
+def find_user_id_by_email(settings: Settings, email: str) -> Optional[str]:
+    """Return the id of the auth user with this address, or ``None``.
+
+    GoTrue's admin list endpoint has no email filter -- ``?email=`` is silently
+    ignored and ``?filter=`` matches nothing -- so the lookup pages the list and
+    compares addresses itself. The comparison is case-folded because GoTrue
+    treats addresses case-insensitively, so ``Demo@Example.com`` and
+    ``demo@example.com`` are one account and a case-sensitive scan could create
+    a second one.
+
+    Paging stops at :data:`_ADMIN_USER_SCAN_PAGES` so a project with a very
+    large user table cannot turn one lookup into an unbounded crawl; the caller
+    treats a ``None`` result as "not found" and creates the user, and a
+    duplicate address is refused by GoTrue rather than silently accepted.
+    """
+
+    wanted = str(email or "").strip().casefold()
+    if not wanted:
+        return None
+    for page in range(1, _ADMIN_USER_SCAN_PAGES + 1):
+        raw = _auth_request(
+            "GET",
+            "/admin/users",
+            settings=settings,
+            query={"page": page, "per_page": _ADMIN_USER_PAGE_SIZE},
+            admin=True,
+        )
+        users = raw.get("users") if isinstance(raw, Mapping) else None
+        if not isinstance(users, list) or not users:
+            return None
+        for user in users:
+            if not isinstance(user, Mapping):
+                continue
+            address = user.get("email")
+            if isinstance(address, str) and address.strip().casefold() == wanted:
+                found = user.get("id")
+                if isinstance(found, str) and found:
+                    return found
+        if len(users) < _ADMIN_USER_PAGE_SIZE:
+            return None
+    _logger.warning(
+        "Stopped scanning for %s after %d pages; treating it as absent.",
+        _MAX_DETAIL,
+        _ADMIN_USER_SCAN_PAGES,
+    )
+    return None
+
+
+def create_confirmed_user(
+    settings: Settings,
+    email: str,
+    password: str,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, str]:
+    """Create an already-confirmed auth user through the admin API.
+
+    ``email_confirm`` is set because a demo or service identity has no mailbox to
+    click a confirmation link in, and an unconfirmed account cannot sign in --
+    which is the whole point of creating it.
+    """
+
+    body: Dict[str, Any] = {
+        "email": str(email),
+        "password": str(password),
+        "email_confirm": True,
+    }
+    if metadata:
+        body["user_metadata"] = dict(metadata)
+    raw = _auth_request(
+        "POST",
+        "/admin/users",
+        settings=settings,
+        body=body,
+        admin=True,
+    )
+    if not isinstance(raw, Mapping) or not raw.get("id"):
+        raise SupabaseAuthError("GoTrue created no user id for the new account.")
     return _user_payload(raw)
 
 
@@ -591,6 +677,24 @@ def sign_in(settings: Settings, email: str, password: str) -> Dict[str, Any]:
             status_code=401,
         )
     return session
+
+
+def credentials_rejected(exc: SupabaseAuthError) -> bool:
+    """Whether this failure means the submitted address/password was refused.
+
+    ``sign_in`` deliberately flattens every credential failure into one 401, so
+    the message is what distinguishes "wrong password" from "GoTrue is
+    unreachable" or "the project rejected the request". A caller that can
+    recover from a rejected credential -- re-keying a service account it owns,
+    say -- needs that distinction and must not mistake an outage for a wrong
+    password.
+    """
+
+    return (
+        isinstance(exc, SupabaseAuthError)
+        and exc.status_code == 401
+        and str(exc) == _CREDENTIALS_REJECTED
+    )
 
 
 def sign_up(

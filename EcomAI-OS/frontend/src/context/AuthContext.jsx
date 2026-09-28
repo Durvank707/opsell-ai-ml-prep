@@ -35,6 +35,15 @@ export function AuthProvider({ children }) {
     return u;
   }, []);
 
+  // No credentials involved: the server hands back a session for the shared
+  // demo tenant, so a visitor can look at a populated workspace immediately.
+  // `isDemo` rides along on the user so the shell can say what they are seeing.
+  const enterDemo = useCallback(async () => {
+    const { user: u } = await auth.enterDemo();
+    setUser(u);
+    return u;
+  }, []);
+
   const signup = useCallback(async (payload) => {
     const { user: u, confirmationRequired } = await auth.signup(payload);
     // With "Confirm email" enabled the account exists but there is no session
@@ -60,7 +69,7 @@ export function AuthProvider({ children }) {
     return next;
   }, []);
 
-  const value = { user, initializing, login, signup, logout, refreshProfile };
+  const value = { user, initializing, login, enterDemo, signup, logout, refreshProfile };
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
