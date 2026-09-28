@@ -97,7 +97,7 @@ export default function InventoryPage() {
       },
       {
         key: 'forecast30',
-        label: '30-Day Forecast',
+        label: '30-Day Demand Forecast',
         align: 'right',
         render: (p) => (
           <span className="tnum text-sm text-slate-600">{p.forecast30 != null ? p.forecast30 : '—'}</span>
@@ -130,7 +130,7 @@ export default function InventoryPage() {
       },
       {
         key: 'order',
-        label: 'Recommended Order',
+        label: 'Recommended Order Quantity',
         align: 'right',
         render: (p) => {
           const qty = p.status === 'healthy' || p.status === 'overstocked' ? 0 : p.currentStock < p.reorderPoint ? recOrderHint(p) : 0;

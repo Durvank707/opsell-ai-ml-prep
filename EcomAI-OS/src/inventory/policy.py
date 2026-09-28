@@ -1,14 +1,19 @@
 import numpy as np
 
 
-def calculate_target_inventory(total_forecast, safety_stock):
+def calculate_target_inventory(forecast_demand, safety_stock):
     """
-    Calculate target inventory for the 30-day order-up-to policy.
+    Calculate the order-up-to target inventory for a replenishment horizon.
 
-    Target Inventory = 30-Day Forecast + Safety Stock
+    Target Inventory = Expected Demand over the Horizon + Safety Stock
+
+    The caller supplies the demand figure for the horizon the order must cover.
+    The production V1 reorder endpoint passes expected *lead-time* demand so a
+    replenishment order tops the position back up toward the reorder point;
+    backtests and simulations pass whichever horizon total they are evaluating.
     """
 
-    return total_forecast + safety_stock
+    return forecast_demand + safety_stock
 
 
 def calculate_recommended_order_qty(
@@ -24,7 +29,8 @@ def calculate_recommended_order_qty(
     Parameters
     ----------
     target_inventory : float or np.ndarray
-        Target inventory level (e.g. 30-day forecast + safety stock).
+        Target inventory level (e.g. lead-time demand + safety stock, the
+        replenishment level used by the V1 reorder recommendation).
     inventory_position : float or np.ndarray
         Current stock + open orders.
     reorder_required : bool or np.ndarray

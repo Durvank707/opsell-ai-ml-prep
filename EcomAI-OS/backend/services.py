@@ -326,7 +326,6 @@ class EcomAIService:
             model_features=MODEL_FEATURES,
             horizon=30,
         )
-        total_forecast = float(forecast_df["forecast_units"].sum())
         lead_time_days = meta["lead_time_days"]
         lead_time_demand = float(forecast_df["forecast_units"].iloc[:lead_time_days].sum())
         safety_stock = meta["safety_stock"]
@@ -335,7 +334,16 @@ class EcomAIService:
         inv_pos = meta["inventory_position"]
         reorder_req = should_reorder(inventory_position=inv_pos, reorder_point=rop)
 
-        target_inv = calculate_target_inventory(total_forecast=total_forecast, safety_stock=safety_stock)
+        # The 30-day XGBoost forecast is the longer-horizon demand outlook shown
+        # on the Forecast page; it must NOT size a replenishment order. A reorder
+        # only needs to carry the position through the next delivery, so the
+        # order-up-to target is the expected lead-time demand plus safety stock —
+        # i.e. the reorder point itself. Ordering to that target brings the
+        # position back to the replenishment level rather than to the whole
+        # 30-day forecast total.
+        target_inv = calculate_target_inventory(
+            forecast_demand=lead_time_demand, safety_stock=safety_stock
+        )
         order_qty = calculate_recommended_order_qty(
             target_inventory=target_inv,
             inventory_position=inv_pos,

@@ -239,7 +239,7 @@ def create_policy_order(
 
     # 2. Calculate order quantity using the V1 policy.
     target_inventory = calculate_target_inventory(
-        total_forecast=total_forecast,
+        forecast_demand=total_forecast,
         safety_stock=safety_stock,
     )
 
@@ -622,7 +622,7 @@ def simulate_backtest_day(
     # 10. Calculate V1 target inventory.
     # ---------------------------------------------------------
     target_inventory = calculate_target_inventory(
-        total_forecast=total_forecast,
+        forecast_demand=total_forecast,
         safety_stock=safety_stock,
     )
 
@@ -868,7 +868,7 @@ def run_baseline_backtest(
         )
 
         target_inventory = calculate_target_inventory(
-            total_forecast=baseline_total_forecast,
+            forecast_demand=baseline_total_forecast,
             safety_stock=safety_stock,
         )
 

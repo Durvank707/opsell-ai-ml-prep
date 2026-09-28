@@ -142,7 +142,7 @@ export default function ProductDetailPage() {
 
   const summaryStats = [
     { label: 'Current Stock', value: formatNumber(p.currentStock), icon: Package, tone: 'bg-brand-50 text-brand-600' },
-    { label: '30-Day Forecast', value: p.forecast30 != null ? formatNumber(p.forecast30) : '—', icon: TrendingUp, tone: 'bg-violet-50 text-violet-600' },
+    { label: '30-Day Demand Forecast', value: p.forecast30 != null ? formatNumber(p.forecast30) : '—', icon: TrendingUp, tone: 'bg-violet-50 text-violet-600' },
     { label: 'Reorder Point', value: formatNumber(p.reorderPoint), icon: ShieldAlert, tone: 'bg-amber-50 text-amber-600' },
     { label: 'Safety Stock', value: formatNumber(p.safetyStock), icon: ShieldCheck, tone: 'bg-emerald-50 text-emerald-600' },
     { label: 'Lead Time', value: `${p.leadTimeDays} days`, icon: Timer, tone: 'bg-sky-50 text-sky-600' },
@@ -205,7 +205,7 @@ export default function ProductDetailPage() {
                 <div className="flex flex-wrap items-center gap-3 text-xs text-slate-500">
                   <TrendIndicator trend={forecast.trend} />
                   <span>
-                    Forecast total (30 days):{' '}
+                    30-Day Demand Forecast total:{' '}
                     <span className="tnum font-bold text-slate-800">{formatNumber(forecast.total)} units</span>
                   </span>
                   <span>
@@ -248,6 +248,7 @@ export default function ProductDetailPage() {
             <Row label="Selling price" value={formatINR(p.sellingPrice)} />
             <Row label="Open orders" value={formatNumber(p.openOrderQty)} />
             <Row label="Inventory position" value={formatNumber(p.inventoryPosition)} />
+            <Row label="Recommended Order Quantity" value={`${formatNumber(p.recommendedOrderQty || 0)} units`} />
             <Row label="Supplier" value={p.supplier} />
             <Row label="Daily demand" value={`${formatNumber(p.dailyAvg)} units`} />
           </div>

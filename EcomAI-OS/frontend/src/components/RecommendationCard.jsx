@@ -68,11 +68,11 @@ export default function RecommendationCard({ recommendation, onNavigate }) {
           <p className="tnum mt-0.5 text-sm font-extrabold text-slate-800">{recommendation.currentStock}</p>
         </div>
         <div>
-          <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Reorder pt.</p>
+          <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Reorder Point</p>
           <p className="tnum mt-0.5 text-sm font-extrabold text-slate-800">{recommendation.reorderPoint}</p>
         </div>
         <div>
-          <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Lead-time demand</p>
+          <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Lead-Time Demand</p>
           <p className="tnum mt-0.5 text-sm font-extrabold text-slate-800">{recommendation.projectedDemand}</p>
         </div>
       </div>
@@ -84,7 +84,7 @@ export default function RecommendationCard({ recommendation, onNavigate }) {
           <Package className="h-3.5 w-3.5" />
           {needOrder ? (
             <>
-              Expected order amount:
+              Recommended Order Quantity:
               <span className="font-bold text-slate-800">{recommendation.recommendedOrder || 20} units</span>
             </>
           ) : (
