@@ -134,6 +134,17 @@ export function postIngest(user, { rows, columns, recordType = 'sales' }) {
   });
 }
 
+/**
+ * Download the CSV upload template for an importable record type.
+ * Returns the raw CSV text; the server's response is plain text, not JSON.
+ */
+export function fetchTemplate(user, recordType) {
+  requireApiSession();
+  return requestV2(
+    `/templates/${encodeURIComponent(recordType)}${query(user)}`,
+  );
+}
+
 // ---------------------------------------------------------------- intelligence
 
 export function fetchPortfolioForecast(user, { horizon = 30, category = null } = {}) {

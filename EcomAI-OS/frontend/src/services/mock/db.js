@@ -335,6 +335,43 @@ export class MockUserDB {
     return { importedRows: importedByProduct.size, totalUnits: total };
   }
 
+  importProductRows(rows) {
+    let imported = 0;
+    for (const row of rows) {
+      const productId = String(row.product_id || '').trim();
+      const name = String(row.product_name || '').trim();
+      if (!productId || !name) continue;
+      const lower = productId.toLowerCase();
+      const exists = this.products.some(
+        (p) => p.id.toLowerCase() === lower || p.sku.toLowerCase() === lower,
+      );
+      if (exists) continue;
+      this.addProduct({
+        productId,
+        name,
+        category: row.category || 'Uncategorized',
+        description: row.description || '',
+        unitCost: row.unit_cost,
+        sellingPrice: row.unit_price,
+        currentStock: row.current_stock,
+        minStock: row.safety_stock,
+        leadTimeDays: row.lead_time_days,
+        supplier: row.supplier || 'Not specified',
+      });
+      imported++;
+    }
+    if (imported > 0) {
+      this.pushActivity('products_uploaded', `Imported ${imported} products to the catalog.`);
+      this.pushNotification({
+        title: 'Products import completed.',
+        message: `${imported} product${imported === 1 ? '' : 's'} imported successfully.`,
+        severity: 'success',
+      });
+    }
+    broadcast(this);
+    return imported;
+  }
+
   // ---------------------------------------------------------------- events
 
   pushActivity(type, description) {

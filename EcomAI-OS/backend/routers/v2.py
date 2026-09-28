@@ -35,7 +35,7 @@ from backend.tenant import (
     TenantWorkspace,
     seed_canonical_demo,
 )
-from backend.contracts import contract_for
+from backend.contracts import contract_for, onboarding_template
 from backend.validation import SEV_ERROR, validate_rows
 
 _logger = logging.getLogger(__name__)
@@ -817,6 +817,35 @@ async def sales_summary_v2(
     summary = ws.sales_summary()
     summary["available_channels"] = ws.sales_channels()
     return summary
+
+
+@router.get("/templates/{record_type}")
+async def download_onboarding_template_v2(
+    record_type: str = APIPath(
+        ...,
+        description="The record type to template: 'product' or 'sales'.",
+    ),
+    principal: AuthPrincipal = Depends(require_auth),
+    user_id: str = Query(..., min_length=1, description="Tenant id; must match the token."),
+):
+    """Download a CSV upload template for one importable record type.
+
+    The header is exactly the columns that record type's importer accepts, and
+    the example rows import cleanly, so a new tenant can model its own file on
+    it without guessing or hunting for the schema. Template content is
+    tenant-agnostic, but the route is still authenticated and bound to the
+    signed subject like every other V2 route.
+    """
+    resolve_tenant_id(principal, user_id)
+    try:
+        content = onboarding_template(record_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return Response(
+        content=content,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{record_type}-template.csv"'},
+    )
 
 
 class V2DemoSeedRequest(BaseModel):

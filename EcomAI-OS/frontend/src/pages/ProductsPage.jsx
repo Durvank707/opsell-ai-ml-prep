@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Plus, Package, LayoutGrid, List, RefreshCw } from 'lucide-react';
+import { Plus, Package, LayoutGrid, List, RefreshCw, UploadCloud } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
 import ProductCard from '../components/ProductCard';
 import ProductForm from '../components/ProductForm';
+import ImportProductsModal from '../components/ImportProductsModal';
 import DataTable from '../components/DataTable';
 import Pagination from '../components/ui/Pagination';
 import EmptyState from '../components/ui/EmptyState';
@@ -36,6 +37,7 @@ export default function ProductsPage() {
   const [view, setView] = useState('grid');
 
   const [formOpen, setFormOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [deleting, setDeleting] = useState(null);
@@ -175,9 +177,14 @@ export default function ProductsPage() {
         title="Products"
         subtitle="Manage your product catalog and inventory information."
         actions={
-          <Button icon={Plus} onClick={openAdd}>
-            Add Product
-          </Button>
+          <>
+            <Button variant="secondary" icon={UploadCloud} onClick={() => setImportOpen(true)}>
+              Import Products (CSV)
+            </Button>
+            <Button icon={Plus} onClick={openAdd}>
+              Add Product
+            </Button>
+          </>
         }
       />
 
@@ -287,6 +294,17 @@ export default function ProductsPage() {
         message="This removes the product and its sales history from your workspace. This action cannot be undone."
         confirmLabel="Delete Product"
         loading={deleteLoading}
+      />
+
+      <ImportProductsModal
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        user={user}
+        onImported={(result) => {
+          refresh();
+          load();
+          toast.success(result.message);
+        }}
       />
     </div>
   );

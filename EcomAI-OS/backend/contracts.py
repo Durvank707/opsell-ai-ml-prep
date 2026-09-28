@@ -464,6 +464,109 @@ def sales_channel_label(value: Any) -> str:
     return trimmed or SALES_CHANNEL_UNRECORDED
 
 
+# ---------------------------------------------------------------------------
+# Onboarding upload templates
+# ---------------------------------------------------------------------------
+
+#: Downloadable CSV templates for the Products and Sales upload flows.
+#:
+#: The header of each template is EXACTLY the set of columns the corresponding
+#: importer accepts, so a file based on one downloads cleanly with no
+#: column-mapping errors and no fallback warnings:
+#:
+#: * ``product`` header == the ``PRODUCT_RECORD`` canonical field set, which is
+#:   what ``products`` validation accepts (``reorder_point`` and
+#:   ``forecast_error_std`` included so importing the plain download never trips
+#:   the "optional field is not mapped" warning).
+#: * ``sales`` header == the seven ``SALES_RECORD`` canonical fields.
+#:
+#: No ML feature columns (``lag_*``, ``rolling_*``, ``day_of_week``, …) appear:
+#: the feature pipeline derives those from ``date`` + ``units_sold``, and
+#: ``discount`` is not part of the upload schema at all.
+ONBOARDING_TEMPLATES: Dict[str, Dict[str, Any]] = {
+    "product": {
+        "columns": (
+            "product_id",
+            "product_name",
+            "category",
+            "current_stock",
+            "open_order_qty",
+            "expected_arrival_date",
+            "lead_time_days",
+            "unit_cost",
+            "safety_stock",
+            "reorder_point",
+            "unit_price",
+            "supplier",
+            "description",
+            "forecast_error_std",
+        ),
+        "rows": [
+            [
+                "P001", "Wireless Headphones", "Electronics",
+                225, 0, "2026-10-05", 4, 1000.0, 20, 60, 1999.0,
+                "Acme Audio", "Flagship wireless over-ear headset", 6.2,
+            ],
+            [
+                "P002", "Desk Lamp", "Home",
+                190, 50, "2026-10-10", 7, 1800.0, 15, 40, 899.0,
+                "Sunrise Supplies", "Adjustable LED desk lamp", 4.1,
+            ],
+        ],
+    },
+    "sales": {
+        "columns": (
+            "date",
+            "product_id",
+            "units_sold",
+            "price",
+            "category",
+            "promotion",
+            "channel",
+        ),
+        "rows": [
+            ["2026-09-01", "P001", 14, 1299.0, "Electronics", False, "Online Store"],
+            ["2026-09-02", "P001", 9, 1299.0, "Electronics", True, "Online Store"],
+            ["2026-09-01", "P001", 4, 1299.0, "Electronics", False, "Amazon"],
+            ["2026-09-01", "P002", 3, 899.0, "Home", False, "Offline Store"],
+            ["2026-09-02", "P002", 5, 899.0, "Home", False, "Offline Store"],
+        ],
+    },
+}
+
+
+def _csv_cell(value: Any) -> str:
+    """Render one template cell; quote only when CSV grammar requires it."""
+    if value is True:
+        text = "true"
+    elif value is False:
+        text = "false"
+    else:
+        text = str(value)
+    if "," in text or '"' in text or "\n" in text:
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
+def onboarding_template(record_type: str) -> str:
+    """Render the CSV text of one onboarding upload template.
+
+    The header is canonically named so the file maps straight through the
+    importer's auto-mapping. Raises ``ValueError`` for an unsupported record
+    type; the two supported values are ``"product"`` and ``"sales"``.
+    """
+    try:
+        spec = ONBOARDING_TEMPLATES[record_type]
+    except KeyError:
+        raise ValueError(
+            f"Unknown template {record_type!r}. Supported templates: "
+            f"{sorted(ONBOARDING_TEMPLATES)}."
+        )
+    lines = [",".join(spec["columns"])]
+    lines.extend(",".join(_csv_cell(value) for value in row) for row in spec["rows"])
+    return "\n".join(lines) + "\n"
+
+
 def contract_for(record_type: str) -> RecordContract:
     """Fetch a canonical contract or raise a clear NameError (fail fast)."""
     if not isinstance(record_type, str):

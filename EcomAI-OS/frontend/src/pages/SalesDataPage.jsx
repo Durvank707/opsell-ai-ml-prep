@@ -3,7 +3,6 @@ import { useNavigate } from 'react-router-dom';
 import {
   Database,
   UploadCloud,
-  FileSpreadsheet,
   Calendar,
   Boxes,
   CheckCircle2,
@@ -20,6 +19,8 @@ import DataTable from '../components/DataTable';
 import Pagination from '../components/ui/Pagination';
 import EmptyState from '../components/ui/EmptyState';
 import UploadDropzone from '../components/UploadDropzone';
+import ImportGuide from '../components/ImportGuide';
+import { ErrorsList, ImportStats, ImportStepsIndicator, UploadPhase } from '../components/importFlow';
 import { SearchInput, Select, Field, Input } from '../components/ui/form';
 import { LoadingSkeleton } from '../components/ui/Skeleton';
 import { SimpleBars } from '../components/charts';
@@ -28,20 +29,13 @@ import {
   listSalesRecords,
   uploadSalesCsv,
   validateSalesCsv,
-  downloadSampleCsv,
+  downloadSalesTemplateCsv,
   loadSampleSalesData,
 } from '../services/salesService';
 import { useAuth } from '../context/AuthContext';
 import { useData } from '../context/DataContext';
 import { useToast } from '../context/ToastContext';
 import { formatNumber, formatINR, formatDate, cn } from '../lib/utils';
-
-const STEPS = [
-  { key: 'choose', label: 'Choose File' },
-  { key: 'upload', label: 'Upload' },
-  { key: 'validate', label: 'Validate' },
-  { key: 'import', label: 'Import' },
-];
 
 // The backend's label for sales nobody attributed to a channel, and the
 // display string for it. `channel` is part of the sales business key, so an
@@ -294,31 +288,16 @@ export default function SalesDataPage() {
           title="Upload Sales Data"
           subtitle="Add records from your sales channels"
           className="lg:col-span-2"
-          actions={
-            <div className="flex items-center gap-1">
-              {STEPS.map((s, i) => (
-                <React.Fragment key={s.key}>
-                  <span
-                    className={cn(
-                      'flex h-6 w-6 items-center justify-center rounded-full text-[10px] font-bold',
-                      stepIndex > i || (phase === 'done' && i === 3)
-                        ? 'bg-emerald-100 text-emerald-700'
-                        : stepIndex === i && phase !== 'done'
-                          ? 'bg-brand-600 text-white'
-                          : 'bg-slate-100 text-slate-400',
-                    )}
-                  >
-                    {stepIndex > i || (phase === 'done' && i === 3) ? <CheckCircle2 className="h-3.5 w-3.5" /> : i + 1}
-                  </span>
-                  {i < STEPS.length - 1 && <span className="h-px w-4 bg-slate-200 sm:w-6" />}
-                </React.Fragment>
-              ))}
-            </div>
-          }
+          actions={<ImportStepsIndicator stepIndex={stepIndex} phase={phase} />}
         >
           {phase === 'idle' ? (
-            <div className="flex flex-col items-center gap-4 py-6 text-center">
-              <UploadDropzone onFile={handleFile} onDownloadSample={downloadSampleCsv} disabled={false} />
+            <div className="flex flex-col items-center gap-4 py-2 text-center">
+              <ImportGuide recordType="sales" className="w-full" />
+              <UploadDropzone
+                onFile={handleFile}
+                onDownloadTemplate={() => downloadSalesTemplateCsv(user)}
+                disabled={false}
+              />
               <p className="max-w-md text-xs leading-relaxed text-slate-400">
                 EcomAI-OS never accepts invalid data silently — every row is validated against your product catalog and
                 errors are shown so you can fix and re-upload.
@@ -531,70 +510,6 @@ function SummaryCard({ label, value, icon: Icon, tone }) {
         <span className="text-[11px] font-bold uppercase tracking-wide text-slate-400">{label}</span>
       </div>
       <p className="tnum mt-3 text-xl font-extrabold text-slate-900">{value}</p>
-    </div>
-  );
-}
-
-function UploadPhase({ icon: Icon, title, subtitle, loading }) {
-  return (
-    <div className="flex flex-col items-center py-10 text-center">
-      {loading ? (
-        <span className="h-8 w-8 animate-spin rounded-full border-3 border-slate-200 border-t-brand-600" />
-      ) : (
-        <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-brand-50 text-brand-600">
-          <Icon className="h-5 w-5" />
-        </span>
-      )}
-      <p className="mt-4 text-sm font-bold text-slate-800">{title}</p>
-      <p className="mt-1 text-xs text-slate-500">{subtitle}</p>
-    </div>
-  );
-}
-
-function ImportStats({ validation }) {
-  const items = [
-    { label: 'Total rows', value: formatNumber(validation.totalRows), tone: 'text-slate-800' },
-    { label: 'Valid rows', value: formatNumber(validation.validRows), tone: 'text-emerald-700' },
-    { label: 'Skipped rows', value: formatNumber(validation.skippedRows), tone: validation.skippedRows ? 'text-amber-700' : 'text-slate-400' },
-  ];
-  return (
-    <div className="grid grid-cols-3 gap-3">
-      {items.map((i) => (
-        <div key={i.label} className="rounded-xl bg-slate-50 p-3 text-center">
-          <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">{i.label}</p>
-          <p className={cn('tnum mt-1 text-lg font-extrabold', i.tone)}>{i.value}</p>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function ErrorsList({ validation, showErrors, setShowErrors }) {
-  const visible = showErrors ? validation.errors : validation.errors.slice(0, 5);
-  return (
-    <div className="rounded-xl border border-amber-200 bg-amber-50/40">
-      <div className="flex items-center justify-between border-b border-amber-200/60 px-4 py-2.5">
-        <p className="flex items-center gap-1.5 text-xs font-bold text-amber-700">
-          <FileSpreadsheet className="h-3.5 w-3.5" />
-          {validation.errors.length} invalid {validation.errors.length === 1 ? 'row' : 'rows'}
-        </p>
-        <button onClick={() => setShowErrors((s) => !s)} className="text-[11px] font-semibold text-amber-600 hover:text-amber-800">
-          {showErrors ? 'Show fewer' : `Show all (${validation.errors.length})`}
-        </button>
-      </div>
-      <ul className="max-h-44 overflow-y-auto px-4 py-2">
-        {visible.map((e, i) => (
-          <li key={i} className="flex items-start gap-2 border-b border-amber-100 py-1.5 last:border-0">
-            <span className="tnum shrink-0 font-mono text-[10px] font-bold text-amber-500">L{e.row}</span>
-            <span className="text-xs text-slate-600">{e.reason}</span>
-          </li>
-        ))}
-      </ul>
-      <div className="px-4 py-2.5 pb-3">
-        <p className="text-[11px] text-amber-700">
-          Fix these rows in your file and re-upload. You can also download the template to match the expected format.
-        </p>
-      </div>
     </div>
   );
 }

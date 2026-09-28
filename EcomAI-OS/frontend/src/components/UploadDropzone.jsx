@@ -3,10 +3,20 @@ import { UploadCloud, FileSpreadsheet, AlertCircle } from 'lucide-react';
 import { cn } from '../lib/utils';
 
 /**
- * Drag-and-drop + browse file upload area for CSV sales data.
+ * Drag-and-drop + browse file upload area for CSV data.
  * Files are read as text via FileReader and handed to onFile(text, filename).
+ * `onDownloadTemplate` (or its alias `onDownloadSample`) triggers the
+ * "Download template" link; `hint` is shown next to the format note and should
+ * name the columns the flow accepts.
  */
-export default function UploadDropzone({ onFile, onDownloadSample, compact = false, disabled = false }) {
+export default function UploadDropzone({
+  onFile,
+  onDownloadTemplate,
+  onDownloadSample,
+  hint = 'Columns: date, product_id, units_sold',
+  compact = false,
+  disabled = false,
+}) {
   const inputRef = useRef(null);
   const [dragging, setDragging] = useState(false);
   const [fileName, setFileName] = useState(null);
@@ -82,9 +92,13 @@ export default function UploadDropzone({ onFile, onDownloadSample, compact = fal
             <FileSpreadsheet className="h-3.5 w-3.5" /> Supported format: CSV
           </span>
           <span className="inline-flex items-center gap-1">
-            <AlertCircle className="h-3.5 w-3.5" /> Columns: date, product_id, units_sold
+            <AlertCircle className="h-3.5 w-3.5" /> {hint}
           </span>
-          <button type="button" onClick={onDownloadSample} className="font-semibold text-brand-600 hover:text-brand-700">
+          <button
+            type="button"
+            onClick={onDownloadTemplate || onDownloadSample}
+            className="font-semibold text-brand-600 hover:text-brand-700"
+          >
             Download template
           </button>
         </div>

@@ -275,6 +275,12 @@ export async function loadSampleSalesData(user) {
   return { ok: true, records };
 }
 
-export function downloadSampleCsv() {
-  downloadFile('ecomai-sample-sales.csv', SAMPLE_CSV_TEMPLATE, 'text/csv');
+/** Download the sales history CSV template. */
+export async function downloadSalesTemplateCsv(user) {
+  if (usingApi()) {
+    const text = await api.downloadSalesTemplate(user);
+    downloadFile('sales-template.csv', text, 'text/csv');
+    return;
+  }
+  downloadFile('sales-template.csv', SAMPLE_CSV_TEMPLATE, 'text/csv');
 }

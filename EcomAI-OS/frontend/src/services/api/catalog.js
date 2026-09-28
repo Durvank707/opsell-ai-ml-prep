@@ -8,6 +8,7 @@
 import * as http from './http';
 import { toInventoryOverview, toProduct, toTimeline } from './adapters';
 import { requireApiSession } from './mode';
+import { pollValidationJob, readCsv, toValidationReport } from './validation';
 
 const URGENCY = { critical: 0, low: 1, overstocked: 2, healthy: 3 };
 
@@ -211,4 +212,72 @@ export async function placeSimulatedOrder(user, productId, qty) {
   const openOrderQty = (current.open_order_qty ?? 0) + quantity;
   await http.patchProduct(user, productId, { open_order_qty: openOrderQty });
   return { ok: true, openOrderQty };
+}
+
+// ---------------------------------------------------------------- CSV import
+
+/**
+ * Validate a CSV against the canonical product contract. Writes nothing.
+ *
+ * Mirrors the sales flow: the browser only parses the file into rows, the
+ * server's report decides everything, and large files are polled to completion.
+ */
+export async function validateProductsCsv(csvText, user) {
+  requireApiSession();
+  const { columns, rows } = readCsv(csvText);
+  let report = await http.postValidate(user, {
+    rows,
+    columns,
+    recordType: 'product',
+  });
+  if (report && report.job_id) {
+    report = await pollValidationJob(user, report.job_id);
+  }
+  return toValidationReport(report, rows);
+}
+
+/**
+ * Validate, then commit the rows the report cleared into the catalog.
+ *
+ * The commit is all-or-nothing on the server, so only the accepted subset of
+ * the parsed rows is ever sent.
+ */
+export async function uploadProductsCsv(user, csvText) {
+  const result = await validateProductsCsv(csvText, user);
+  if (result.validRows === 0) {
+    throw new Error(
+      result.errors.length
+        ? 'CSV contains invalid rows. ' + result.errors[0].reason
+        : 'CSV contains invalid rows.',
+    );
+  }
+  const { columns } = readCsv(csvText);
+  const ingested = await http.postIngest(user, {
+    rows: result.payload,
+    columns,
+    recordType: 'product',
+  });
+  const skipped = result.errors.length;
+  return {
+    ...result,
+    ok: true,
+    ingestedRows: ingested.ingested_rows,
+    persistedTo: ingested.persisted_to,
+    durable: Boolean(ingested.durable),
+    message:
+      skipped > 0
+        ? `${skipped} row${skipped === 1 ? ' was' : 's were'} skipped during validation. ${result.validRows} valid row${result.validRows === 1 ? ' was' : 's were'} imported.`
+        : `${result.validRows} row${result.validRows === 1 ? '' : 's'} imported successfully.`,
+  };
+}
+
+/**
+ * Download the CSV upload template for the product catalog.
+ *
+ * The header is exactly the columns the product importer accepts and the
+ * example rows import cleanly.
+ */
+export async function downloadProductTemplate(user) {
+  requireApiSession();
+  return http.fetchTemplate(user, 'product');
 }

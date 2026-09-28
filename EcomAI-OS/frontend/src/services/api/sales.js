@@ -13,8 +13,8 @@
 
 import * as http from './http';
 import { toSalesRecord, toSalesSummary } from './adapters';
-import { parseCSV } from '../../lib/utils';
 import { requireApiSession } from './mode';
+import { pollValidationJob, readCsv, toValidationReport } from './validation';
 
 export async function getSalesData(user) {
   // "Last import" is the moment this tenant last committed sales rows. The
@@ -73,22 +73,6 @@ export async function listSalesRecords(user, filters = {}) {
 }
 
 /** Split a CSV into a header and raw source rows, without judging them. */
-function readCsv(csvText) {
-  if (!csvText || !csvText.trim()) throw new Error('The uploaded file is empty.');
-  const table = parseCSV(csvText);
-  if (table.length === 0) throw new Error('The uploaded file is empty.');
-  const columns = table[0].map((cell) => cell.trim());
-  const rows = table
-    .slice(1)
-    .map((cells) => {
-      const row = {};
-      columns.forEach((column, index) => {
-        row[column] = cells[index] ?? '';
-      });
-      return row;
-    });
-  return { columns, rows };
-}
 
 /**
  * Validate a CSV against the canonical sales contract. Writes nothing.
@@ -108,83 +92,16 @@ export async function validateSalesCsv(csvText, user) {
   return toValidationReport(report, rows);
 }
 
-async function pollValidationJob(user, jobId) {
-  const deadline = Date.now() + 60_000;
-  for (;;) {
-    const job = await http.fetchValidationJob(user, jobId);
-    if (job.status === 'succeeded') return job.result;
-    if (job.status === 'failed') {
-      throw new Error(job.error || 'The validation job failed.');
-    }
-    if (Date.now() > deadline) {
-      throw new Error('Validation is taking longer than expected. Please try again.');
-    }
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-}
-
 /**
- * The accepted subset of the parsed lines, so a commit sends only rows the
- * report cleared.
+ * Download the CSV upload template for sales history.
  *
- * The API numbers data rows from 1 and passes the header separately as
- * `columns`, so data row `n` is `rows[n - 1]` and `rows` never holds the header
- * at all. A row problem's `row_number` is in that numbering, and it is what has
- * to be matched here: resubmitting a rejected line would hand the server a batch
- * it refuses outright, since ingest is all-or-nothing.
+ * The header is exactly the columns the canonical sales contract accepts and
+ * the example rows import cleanly, so a new tenant can model its own file on it
+ * instead of guessing.
  */
-function withoutRejectedRows(rows, errors) {
-  const rejected = new Set(errors.map((error) => error.row));
-  return rows.filter((_row, index) => !rejected.has(index + 1));
-}
-
-function toValidationReport(report, sourceRows) {
-  const problems = [...(report.problems || []), ...(report.schema_problems || [])];
-  const errors = problems
-    .filter((problem) => problem.severity === 'error')
-    .map((problem) => ({
-      row: problem.row_number,
-      reason: problem.detail || 'This row failed validation.',
-      category: problem.category,
-      severity: problem.severity,
-      field: problem.field,
-      rawValue: problem.raw_value,
-      resolution: problem.resolution,
-    }));
-
-  const accepted = report.accepted_rows ?? 0;
-  const total = report.total_rows ?? sourceRows.length;
-
-  // The source lines for the accepted rows, kept so the commit can send the
-  // original text and let the server canonicalise it with the same rules it
-  // just validated against.
-  const payload = withoutRejectedRows(sourceRows, errors);
-
-  return {
-    ok: accepted > 0,
-    totalRows: total,
-    validRows: accepted,
-    skippedRows: errors.length,
-    errors,
-    summary: {
-      missingProductId: errors.filter((e) => e.category === 'missing_required' && e.field === 'product_id').length,
-      unknownProductId: errors.filter((e) => /not in your catalog/i.test(e.reason)).length,
-      invalidUnits: errors.filter((e) => /units_sold/.test(e.field || '')).length,
-    },
-    warnings: problems
-      .filter((problem) => problem.severity === 'warn')
-      .map((problem) => ({
-        row: problem.row_number,
-        reason: problem.detail,
-        category: problem.category,
-        resolution: problem.resolution,
-      })),
-    message:
-      errors.length > 0
-        ? `${errors.length} row${errors.length === 1 ? '' : 's'} failed validation. ${accepted} row${accepted === 1 ? '' : 's'} are ready to import.`
-        : `${accepted} row${accepted === 1 ? '' : 's'} are ready to import.`,
-    payload,
-  };
+export async function downloadSalesTemplate(user) {
+  requireApiSession();
+  return http.fetchTemplate(user, 'sales');
 }
 
 /**
