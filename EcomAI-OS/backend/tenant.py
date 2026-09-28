@@ -26,10 +26,12 @@ Design rules (spec-critical):
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 import csv
 import math
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
@@ -352,6 +354,22 @@ class TenantWorkspace:
     created_at: str = ""
     remote_hydrated: bool = False
 
+    # Demand-forecast memoization. Keyed by (product_id, clamped horizon), each
+    # entry is (stamp, payload) where the stamp holds the sales/product write
+    # versions the payload was built from. A lookup only returns a matching
+    # stamp, so editing one product's own rows invalidates exactly that
+    # product's forecasts — and because the cache lives on this tenant's
+    # workspace instance it can never be read by another tenant. The lock is
+    # held only around dict hashing/assignment, never around model inference,
+    # so concurrent dashboard workers serialize on cache traffic alone rather
+    # than on identical XGBoost computation.
+    _forecast_cache: Dict[Tuple[str, int], Tuple[Tuple[int, int], Dict[str, Any]]] = (
+        field(default_factory=dict, repr=False, compare=False)
+    )
+    _sales_version: Dict[str, int] = field(default_factory=dict, repr=False, compare=False)
+    _product_version: Dict[str, int] = field(default_factory=dict, repr=False, compare=False)
+    _forecast_lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+
     def __post_init__(self) -> None:
         if self.user_id is None:
             raise ValueError("user_id is required for a tenant workspace.")
@@ -443,6 +461,9 @@ class TenantWorkspace:
         # Keyed by product_id, so re-hydrating an already-known product replaces
         # it instead of appending a duplicate.
         self.products[product_id] = _product_row_from_hydrated(row)
+        self._product_version[product_id] = (
+            self._product_version.get(product_id, 0) + 1
+        )
 
     def _hydrate_audit_rows(self) -> int:
         """Restore this tenant's append-only audit history.
@@ -563,6 +584,8 @@ class TenantWorkspace:
             raise ValueError("A hydrated Supabase sales row failed validation.")
         stored = self._stored_sales_values(report.rows[0].values)
         self.sales_records[self._sales_key(stored)] = stored
+        pid = str(stored["product_id"])
+        self._sales_version[pid] = self._sales_version.get(pid, 0) + 1
 
     @staticmethod
     def _sales_key(stored: Dict[str, Any]) -> Tuple[str, str, str]:
@@ -720,6 +743,9 @@ class TenantWorkspace:
         pending_audit: List[AuditEntry] = []
         for product in prepared:
             self.products[product.product_id] = product
+            self._product_version[product.product_id] = (
+                self._product_version.get(product.product_id, 0) + 1
+            )
             pending_audit.append(self._new_audit_entry(
                 "product_upserted",
                 product.product_id,
@@ -793,6 +819,15 @@ class TenantWorkspace:
         ]
         for key in removed_sales:
             del self.sales_records[key]
+        # A deleted product must never resurrect a cached forecast: drop its
+        # entries and versions outright, so a later re-created product id
+        # starts with a fresh memo instead of another product's numbers.
+        self._forecast_cache = {
+            key: entry for key, entry in self._forecast_cache.items()
+            if key[0] != product_id
+        }
+        self._sales_version.pop(product_id, None)
+        self._product_version.pop(product_id, None)
         self._audit("product_deleted", product_id, {
             "sales_rows_removed": len(removed_sales),
             "product_name": product.product_name,
@@ -891,6 +926,7 @@ class TenantWorkspace:
             key = self._sales_key(stored)
             existing = self.sales_records.get(key)
             self.sales_records[key] = stored
+            self._sales_version[pid] = self._sales_version.get(pid, 0) + 1
             audit_detail = {
                 "date": stored["date"],
                 "channel": stored["channel"],
@@ -1455,10 +1491,73 @@ class TenantWorkspace:
         engine's output into ``{date, forecast, lower, upper}`` points. The band
         width comes from the residual error of the product's *own* history, so a
         volatile product is shown a wider interval than a steady one.
+
+        The result is memoized on this workspace per ``(product_id, horizon)``
+        because every dashboard render requests the same forecasts over and
+        over: the inventory overview, the stockout projection, each
+        recommendation row, and the portfolio forecast call :meth:`demand_forecast`
+        independently. Recomputation runs the recursive per-day XGBoost loop,
+        which dominates V2 dashboard latency, so the memo stores each computed
+        payload once and serves a deep copy afterwards. Entries are stamped by
+        the product's own sales/product write versions and evicted when those
+        inputs change, and because the cache lives on this tenant's workspace
+        it can never be observed by another tenant.
+
+        ``audit=True`` bypasses the memo: a decision audit is a per-invocation
+        fact that must be recorded every time, even when the same forecast has
+        already been computed for a read path.
         """
         self._check_product(product_id)
         requested = FORECAST_HORIZON if horizon is None else int(horizon)
         horizon = max(1, min(requested, 180))
+        if audit:
+            # Refuse to serve an audited decision from the memo: the caller
+            # wants the audit row written by THIS invocation, not by whichever
+            # read path happened to populate the cache first.
+            return self._compute_demand_forecast(
+                product_id, horizon=horizon, audit=True
+            )
+
+        with self._forecast_lock:
+            stamp = self._demand_forecast_stamp(product_id)
+            entry = self._forecast_cache.get((product_id, horizon))
+            if entry is not None and entry[0] == stamp:
+                return deepcopy(entry[1])
+
+        payload = self._compute_demand_forecast(
+            product_id, horizon=horizon, audit=False
+        )
+        with self._forecast_lock:
+            # Guard against a data write landing while this forecast was being
+            # computed (sales ingested by another worker). If the stamp moved,
+            # the payload no longer matches the product's rows and must not be
+            # cached; a later caller could otherwise be served stale numbers
+            # for the NEW data.
+            if self._demand_forecast_stamp(product_id) == stamp:
+                self._forecast_cache[(product_id, horizon)] = (stamp, payload)
+        return deepcopy(payload)
+
+    def _demand_forecast_stamp(self, product_id: str) -> Tuple[int, int]:
+        """The (sales, product) write versions one product's forecast is built on.
+
+        Versions are bumped by every write path that mutates that product's own
+        rows (hydration, ingest, product upsert, delete). Sibling products keep
+        their versions, so touching one product never evicts a cached forecast
+        for another.
+        """
+        return (
+            self._sales_version.get(product_id, 0),
+            self._product_version.get(product_id, 0),
+        )
+
+    def _compute_demand_forecast(
+        self,
+        product_id: str,
+        *,
+        horizon: int,
+        audit: bool,
+    ) -> Dict[str, Any]:
+        """Compute (never look up) one product's demand forecast response."""
         result = self.forecast_for(product_id, horizon=horizon, audit=audit)
         raw_points = result.get("forecast") or []
         # The residual spread is measured on the same daily series the forecast

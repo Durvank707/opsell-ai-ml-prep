@@ -33,7 +33,7 @@ _BASELINE = {
     "JWT_USER_ID_CLAIM": "sub",
     "LOCAL_AUTH_ENABLED": "false",
     "V1_ENABLED": "true",
-    "V1_REQUIRE_AUTH": "false",
+    "V1_REQUIRE_AUTH": "true",
 }
 
 # Remove anything that could otherwise survive from the ambient shell.
