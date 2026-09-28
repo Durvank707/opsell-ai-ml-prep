@@ -86,17 +86,17 @@ export default function SignupPage() {
               <MailCheck className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600" />
               <div>
                 <p className="text-sm font-semibold text-emerald-900">
-                  Confirm your email address
+                  Check your email
                 </p>
                 <p className="mt-1 text-sm text-emerald-800">
-                  Your account is created. We sent a confirmation link to{' '}
-                  <span className="font-medium">{awaitingConfirmation}</span>. Open it to
-                  finish setting up your workspace.
+                  If <span className="font-medium">{awaitingConfirmation}</span> is new to
+                  EcomAI-OS, we have sent it a confirmation link. Open that link to finish
+                  setting up your workspace — you will be able to sign in once you have.
                 </p>
               </div>
             </div>
             <p className="mt-5 text-sm text-slate-500">
-              Already confirmed?{' '}
+              Already have an account, or already confirmed?{' '}
               <Link to="/login" className="font-semibold text-brand-600 hover:text-brand-700">
                 Sign in
               </Link>

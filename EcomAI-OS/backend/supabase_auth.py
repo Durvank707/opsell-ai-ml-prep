@@ -89,10 +89,15 @@ class SupabaseAuthError(RuntimeError):
         *,
         status_code: Optional[int] = None,
         upstream_code: Optional[str] = None,
+        upstream_message: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.upstream_code = upstream_code
+        #: GoTrue's own wording, for classifying a failure. Deliberately kept out
+        #: of ``str(self)`` so it can never be returned to a caller by accident --
+        #: it can echo request values, which is why ``message`` is allowlisted.
+        self.upstream_message = upstream_message
 
 
 def supabase_auth_configured(settings: Settings) -> bool:
@@ -220,8 +225,20 @@ def _auth_request(
         upstream = None
         if isinstance(payload, Mapping) and isinstance(payload.get("error_code"), str):
             upstream = payload["error_code"][:64]
+        # GoTrue's own wording, kept only so a caller can classify a failure it
+        # knows how to explain. ``detail`` above deliberately replaces anything
+        # not on the allowlist, which leaves no way to tell a confirmation mail
+        # that would not send apart from any other 500 -- and that one has a
+        # specific, actionable answer. It is never rendered: it is not part of
+        # ``str(exc)``, so it cannot reach a response or a log by accident.
+        upstream_message = None
+        if isinstance(payload, Mapping) and isinstance(payload.get("msg"), str):
+            upstream_message = payload["msg"][:_MAX_DETAIL]
         raise SupabaseAuthError(
-            detail, status_code=exc.code, upstream_code=upstream
+            detail,
+            status_code=exc.code,
+            upstream_code=upstream,
+            upstream_message=upstream_message,
         ) from None
     except (URLError, OSError, TimeoutError) as exc:
         raise SupabaseAuthError(
@@ -697,26 +714,96 @@ def credentials_rejected(exc: SupabaseAuthError) -> bool:
     )
 
 
+#: GoTrue's wording for a signup abandoned because the confirmation mail would
+#: not send. Matched on a substring rather than exactly, and only ever used to
+#: improve a message: GoTrue's strings are not a contract, so nothing depends on
+#: this continuing to match.
+_MAILER_FAILURE_HINT = "sending confirmation email"
+
+#: What a duplicate signup means for someone who is trying to finish signing up.
+#: GoTrue's bare "User already registered" is the single most confusing thing it
+#: can say here: it is exactly what somebody sees when they retried after their
+#: first confirmation mail never arrived, and it leaves them with no way forward.
+_SIGNUP_TAKEN_MESSAGE = (
+    "An account with this email address already exists. Sign in instead, or "
+    "reset your password if you need the confirmation email again."
+)
+
+
+def _signup_failure(exc: SupabaseAuthError) -> SupabaseAuthError:
+    """Recast a signup failure in terms the person signing up can act on.
+
+    A confirmation mail that will not send is the most common signup failure on
+    a project without custom SMTP, and the upstream 500 says nothing a user can
+    do anything about. The replacement promises only what is certain -- the email
+    did not go out, and retrying is the right next step.
+
+    It says the account was not created because that is what was observed: GoTrue
+    abandons the signup when the mail fails and leaves no account behind, which
+    was confirmed against a live project whose user count did not move across four
+    such failures. Were a version ever to create the account anyway, a retry would
+    be answered with the duplicate message above, which now tells the user to sign
+    in, so that path recovers instead of dead-ending.
+    """
+
+    if exc.status_code == 500 and _MAILER_FAILURE_HINT in (exc.upstream_message or "").lower():
+        return SupabaseAuthError(
+            "We could not send your confirmation email, so your account was not "
+            "created. Please try again in a few minutes.",
+            status_code=503,
+        )
+    if str(exc) == "User already registered":
+        return SupabaseAuthError(_SIGNUP_TAKEN_MESSAGE, status_code=exc.status_code)
+    return exc
+
+
 def sign_up(
     settings: Settings,
     email: str,
     password: str,
     metadata: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
-    """Create an account, and return a session when GoTrue issues one."""
+    """Create an account, and return a session only if GoTrue issues one.
+
+    On a project with "Confirm email" enabled -- the recommended setting, and this
+    project's -- **no session is ever issued at signup**: the account has to be
+    verified by email before it can be signed in to. The absence of a session is
+    therefore the expected result, not a failure, and it is returned as-is so the
+    caller can say "check your inbox" rather than hand the browser a credential to
+    store.
+
+    A 2xx means the signup was **accepted**, and nothing more than that. GoTrue
+    deliberately does not disclose whether it created an account: signing up with
+    an address that already has one answers 200 with a synthetic user object, so
+    that this endpoint cannot be used to test whether a given address is
+    registered. So the caller must not promise an account exists either way, and
+    a rejected signup -- which *is* reported -- still propagates.
+
+    The presence of the ``user`` object is deliberately *not* read as the signal
+    that an account was created. GoTrue makes that field optional and omits it
+    from a confirmation-required signup, which is what made this raise
+    "Supabase Auth did not return an account for that signup" for signups that had
+    worked perfectly: the account existed and the mail was on its way. Both a
+    missing user and a decoy one are just accepted signups.
+    """
 
     body: Dict[str, Any] = {"email": email, "password": password}
     if metadata:
         # ``data`` becomes GoTrue's user_metadata. Only ever supplied by the
         # server from a validated request model, never echoed from the caller.
         body["data"] = {str(k): str(v) for k, v in metadata.items()}
-    raw = _auth_request("POST", "/signup", settings=settings, body=body)
+    try:
+        raw = _auth_request("POST", "/signup", settings=settings, body=body)
+    except SupabaseAuthError as exc:
+        raise _signup_failure(exc) from None
     session = _session_payload(raw)
-    if not session["user"]["id"]:
-        raise SupabaseAuthError(
-            "Supabase Auth did not return an account for that signup.",
-            status_code=502,
-        )
+    if not session["access_token"] and not session["user"]["email"]:
+        # GoTrue withheld the user object. The address is the caller's own, just
+        # normalized and validated above, so filling it in keeps the response
+        # self-consistent for a client that reads it. The id stays empty: it is
+        # the one field that cannot be reconstructed, and inventing one would hand
+        # the caller a subject no token was ever issued for.
+        session["user"]["email"] = email
     return session
 
 

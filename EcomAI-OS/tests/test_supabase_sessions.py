@@ -23,8 +23,10 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -350,11 +352,18 @@ def test_signup_reports_a_confirmation_requirement_honestly(monkeypatch):
 
 
 def test_signup_surfaces_a_duplicate_account(monkeypatch):
-    """The local issuer answers 409 for a duplicate; Supabase has its own 422.
+    """A project that *does* say the address is taken gets an actionable message.
 
-    Both disclose that the address is taken. That matches the pre-existing
-    behaviour of this endpoint rather than newly leaking it, and at signup the
-    address is one the caller has just typed.
+    Not every GoTrue configuration is as discreet as this one: the local issuer
+    answers 409 and some projects answer 422. Where the address is disclosed, the
+    wording now says what to do about it, because "User already registered" is
+    precisely what somebody sees when they retry after a confirmation mail never
+    arrived, and it left them with no way forward.
+
+    This project's own GoTrue does not take this path -- it returns 200 with a
+    synthetic user instead, which
+    ``test_a_signup_on_an_existing_account_is_still_answered_as_accepted`` covers.
+    This test is here for the configurations that do.
     """
 
     _enable_supabase_auth(monkeypatch)
@@ -369,7 +378,402 @@ def test_signup_surfaces_a_duplicate_account(monkeypatch):
     )
 
     assert response.status_code == 422
-    assert response.json()["detail"] == "User already registered"
+    detail = response.json()["detail"]
+    # Same 422 and the same disclosure as before, but now it says what to do.
+    # "User already registered" is precisely what somebody sees when they retry
+    # after their first confirmation mail never arrived, and it offered no way on.
+    assert detail != "User already registered"
+    assert "already exists" in detail
+    assert "Sign in" in detail
+    assert "reset your password" in detail
+
+
+# ------------------------------------------------- signup: created, not signed in
+
+
+def test_a_signup_that_omits_the_user_still_asks_the_user_to_verify(monkeypatch):
+    """The reported failure: a signup that succeeded, reported as a 502.
+
+    With "Confirm email" on, GoTrue makes the ``user`` field optional and omits
+    it from the reply. The account was created and the mail was on its way, but
+    the old check read the missing user as "nothing happened" and answered
+    "Supabase Auth did not return an account for that signup" -- telling somebody
+    to try again for an account that already existed, which on a retry would then
+    come back as a duplicate.
+
+    A 2xx is the acknowledgement; the absence of a user is not a failure.
+    """
+
+    _enable_supabase_auth(monkeypatch)
+    _install(
+        monkeypatch,
+        _GoTrue(
+            routes={
+                "/signup": {
+                    "confirmation_sent_at": "2026-01-01T00:00:00Z",
+                    "access_token": "",
+                    "refresh_token": "",
+                    "token_type": "",
+                    "expires_in": 0,
+                }
+            }
+        ),
+    )
+
+    response = client.post(
+        "/api/auth/signup",
+        json={"email": "person@example.com", "password": "correct horse"},
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["confirmation_required"] is True
+    assert body["access_token"] == ""
+    assert body["refresh_token"] == ""
+    # The address is the caller's own, so the envelope stays self-consistent, but
+    # no id is invented: one was never issued and no token will carry it.
+    assert body["user"]["email"] == "person@example.com"
+    assert body["user"]["id"] == ""
+
+
+def test_a_signup_with_no_body_at_all_still_asks_the_user_to_verify(monkeypatch):
+    """A 2xx with an empty body is still an accepted signup.
+
+    ``_auth_request`` returns ``None`` for a body-less 2xx, which is a shape
+    GoTrue is free to send. Rejecting it here would reproduce the original bug for
+    a second reason, so the acknowledgement is taken from the status alone.
+    """
+
+    _enable_supabase_auth(monkeypatch)
+    _install(monkeypatch, _GoTrue(routes={"/signup": {}}))
+
+    response = client.post(
+        "/api/auth/signup",
+        json={"email": "person@example.com", "password": "correct horse"},
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["confirmation_required"] is True
+
+
+def test_a_signup_on_an_existing_account_is_still_answered_as_accepted(monkeypatch):
+    """GoTrue will not say whether the address was already registered.
+
+    Signing up with an address that already has a confirmed account answers 200
+    with a synthetic user -- a fresh-looking id and ``confirmation_sent_at``, for a
+    record that does not exist and an email that was never sent. That was
+    observed against the live project: the reply carried an id absent from the
+    user table, and the table did not grow.
+
+    So the response must be shaped exactly like any other accepted signup, and in
+    particular must not claim an account exists. A test that only covered the
+    "user already registered" 422 would have missed this entirely, which is the
+    shape GoTrue actually sends here.
+    """
+
+    _enable_supabase_auth(monkeypatch)
+    _install(
+        monkeypatch,
+        _GoTrue(
+            routes={
+                # The decoy, exactly as the live project sent it: a bare user
+                # object at the top level, for a record that does not exist.
+                "/signup": {
+                    "id": "decoy-0000-4000-8000-000000000000",
+                    "aud": "authenticated",
+                    "role": "",
+                    "email": "person@example.com",
+                    "confirmation_sent_at": "2026-09-28T06:50:27.620746688Z",
+                    "created_at": "2026-09-28T06:50:27.620746688Z",
+                    "app_metadata": {"provider": "email", "providers": ["email"]},
+                    "user_metadata": {},
+                    "identities": [],
+                }
+            }
+        ),
+    )
+
+    response = client.post(
+        "/api/auth/signup",
+        json={"email": "person@example.com", "password": "correct horse"},
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    # Shaped like any accepted signup: no session, and confirmation still required.
+    assert body["confirmation_required"] is True
+    assert body["access_token"] == ""
+    assert body["refresh_token"] == ""
+    # The address is the caller's own, so the panel can name it.
+    assert body["user"]["email"] == "person@example.com"
+    # The decoy's id is never surfaced. It identifies no account, and a client
+    # that treated it as a subject would be holding a reference to nothing.
+    assert body["user"]["id"] == ""
+
+
+def test_a_pending_verification_never_hands_over_a_credential(monkeypatch):
+    """No token of any kind may appear while verification is outstanding.
+
+    This is the property that stops signup becoming a way around email
+    verification: a client that stored anything from this response would be
+    holding a usable session for an unverified account. Checked over the whole
+    serialized body, not just the two known fields, so a new one cannot slip in.
+    """
+
+    _enable_supabase_auth(monkeypatch)
+    _install(
+        monkeypatch,
+        _GoTrue(
+            routes={
+                "/signup": {
+                    "access_token": "",
+                    "refresh_token": "",
+                    "user": {
+                        "id": "sup-user-1",
+                        "email": "person@example.com",
+                    },
+                }
+            }
+        ),
+    )
+
+    response = client.post(
+        "/api/auth/signup",
+        json={"email": "person@example.com", "password": "correct horse"},
+    )
+
+    assert response.status_code == 201
+    serialized = json.dumps(response.json())
+    assert "access_token" in serialized  # the key is present...
+    assert response.json()["access_token"] == ""  # ...and empty
+    # Nothing that could be replayed as a bearer.
+    assert "eyJ" not in serialized
+
+
+def test_a_signup_that_failed_is_never_reported_as_created(monkeypatch):
+    """The other side of the rule: a non-2xx still fails.
+
+    Reading the acknowledgement too generously would be worse than the original
+    bug -- it would tell people to check an inbox for mail that was never sent.
+    Every rejection has to keep propagating.
+    """
+
+    _enable_supabase_auth(monkeypatch)
+    _install(
+        monkeypatch,
+        _GoTrue(default=_http_error(422, {"msg": "Password should be at least 6 characters"})),
+    )
+
+    response = client.post(
+        "/api/auth/signup",
+        json={"email": "person@example.com", "password": "x"},
+    )
+
+    assert response.status_code == 422
+    assert "confirmation_required" not in response.json()
+
+
+def test_a_mailer_failure_says_what_to_do_instead_of_a_500(monkeypatch):
+    """A confirmation mail that will not send is the common real-world failure.
+
+    A project without custom SMTP cannot deliver to most addresses, and GoTrue
+    answers 500. The upstream wording ("Error sending confirmation email") is not
+    actionable and the status implies a server fault rather than a retry, so both
+    are recast for the person signing up.
+    """
+
+    _enable_supabase_auth(monkeypatch)
+    _install(
+        monkeypatch,
+        _GoTrue(
+            default=_http_error(
+                500,
+                {
+                    "code": 500,
+                    "error_code": "unexpected_failure",
+                    "msg": "Error sending confirmation email",
+                },
+            )
+        ),
+    )
+
+    response = client.post(
+        "/api/auth/signup",
+        json={"email": "person@example.com", "password": "correct horse"},
+    )
+
+    assert response.status_code == 503, response.text
+    detail = response.json()["detail"]
+    assert "Error sending confirmation email" not in detail
+    assert "confirmation email" in detail
+    assert "not created" in detail, "the user must know they hold no account"
+    assert "try again" in detail, "and be given the next step"
+    # It must not also claim a session exists.
+    assert "access_token" not in response.json()
+
+
+def test_an_unexpected_signup_failure_is_left_alone(monkeypatch):
+    """Only the two signup-specific messages are recast.
+
+    Anything else keeps its own status and wording, so a rate limit stays a rate
+    limit and a real outage is not disguised as a retryable mail problem.
+    """
+
+    _enable_supabase_auth(monkeypatch)
+    _install(
+        monkeypatch,
+        _GoTrue(default=_http_error(429, {"msg": "Email rate limit exceeded"})),
+    )
+
+    response = client.post(
+        "/api/auth/signup",
+        json={"email": "person@example.com", "password": "correct horse"},
+    )
+
+    assert response.status_code == 429
+    assert response.json()["detail"] == "Email rate limit exceeded"
+
+
+def test_a_verified_user_signs_in_normally_after_confirming(monkeypatch):
+    """The whole flow, end to end: sign up, verify, then sign in for real.
+
+    Signup deliberately returns no session, so the only way in is the ordinary
+    password grant once the user has confirmed. The stub models the state GoTrue
+    holds -- the account exists but is unconfirmed, and only becomes usable after
+    the emailed link is followed -- so this asserts the two ends of the flow meet
+    correctly: nothing is issued early, and afterwards the normal login works.
+    """
+
+    _enable_supabase_auth(monkeypatch)
+    state = {"confirmed": False}
+
+    def route(request):
+        if request.get_method() == "POST" and request.full_url.endswith("/signup"):
+            # The account is created; no session is issued.
+            return {"confirmation_sent_at": "2026-01-01T00:00:00Z"}
+        if not state["confirmed"]:
+            # What GoTrue answers while the account is still unconfirmed. Our
+            # login flattens every credential failure to one message, so the
+            # wording here must not leak through either.
+            raise _http_error(400, {"msg": "Email not confirmed"})
+        return _session(user_id="sup-user-new", email="person@example.com")
+
+    _install(monkeypatch, _GoTrue(default=route))
+
+    signup = client.post(
+        "/api/auth/signup",
+        json={"email": "person@example.com", "password": "correct horse"},
+    )
+    assert signup.status_code == 201, signup.text
+    assert signup.json()["confirmation_required"] is True
+    assert signup.json()["access_token"] == ""
+    assert signup.json()["refresh_token"] == ""
+
+    # The user follows the emailed link. Up to that point there is no way in.
+    refused = client.post(
+        "/api/auth/login",
+        json={"email": "person@example.com", "password": "correct horse"},
+    )
+    assert refused.status_code == 401
+    assert "not confirmed" not in refused.json()["detail"].lower()
+
+    state["confirmed"] = True
+    login = client.post(
+        "/api/auth/login",
+        json={"email": "person@example.com", "password": "correct horse"},
+    )
+    assert login.status_code == 200, login.text
+    body = login.json()
+    assert body["access_token"] == ACCESS
+    assert body["user"]["id"] == "sup-user-new"
+
+
+# --------------------------------------------------- the client half of the flow
+#
+# The backend change above is only half the fix: the browser has to act on
+# ``confirmation_required`` by *not* signing anyone in, and it has to be able to
+# get them to the login page afterwards. There is no JavaScript test runner in
+# the project, so these read the source. What they check is the control flow
+# rather than the copy -- the failure mode is a well-worded page that quietly
+# stored a session, which reading the rendered text would never reveal.
+
+_SRC = Path(__file__).resolve().parents[1] / "frontend" / "src"
+SIGNUP_JSX = _SRC / "pages" / "auth" / "SignupPage.jsx"
+AUTH_SERVICE_JS = _SRC / "services" / "authService.js"
+AUTH_CONTEXT_JSX = _SRC / "context" / "AuthContext.jsx"
+
+
+def _read(path: Path) -> str:
+    assert path.exists(), f"frontend source not found at {path}"
+    return path.read_text(encoding="utf-8")
+
+
+def test_a_pending_verification_stores_no_session_in_the_browser():
+    # The dangerous line is the one that would make signup a way around email
+    # verification: writing the response into the token store. It has to be
+    # unreachable while confirmation is outstanding, which means the early
+    # return has to come first.
+    source = _read(AUTH_SERVICE_JS)
+    found = re.search(r"export async function signup\((.*?)\n\}", source, re.DOTALL)
+    assert found, "signup is not exported from the auth service"
+    service = found.group(1)
+
+    branch = service.index("confirmation_required")
+    store = service.index("storeSession(result)")
+    assert branch < store, "the confirmation branch must return before storing a session"
+    between = service[branch:store]
+    assert "confirmationRequired: true" in between
+    assert "token: ''" in between, "an empty token, not a stored one"
+    assert "storeSession" not in between
+
+
+def test_the_signup_page_does_not_navigate_into_the_app_while_unverified():
+    source = _read(SIGNUP_JSX)
+    found = re.search(r"const handleSubmit = async \(e\) => \{(.*?)\n  \};", source, re.DOTALL)
+    assert found, "handleSubmit is not defined on the signup page"
+    body = found.group(1)
+
+    assert "if (confirmationRequired) {" in body
+    branch = body[body.index("if (confirmationRequired) {") : body.index("toast.success")]
+    assert "navigate(" not in branch, "the unverified branch must not navigate anywhere"
+    assert "return" in branch, "and it has to stop there"
+    # Signing in afterwards is the only way on, and it is an ordinary link.
+    assert 'to="/login"' in source
+
+
+def test_the_unverified_user_is_never_adopted_as_a_signed_in_user():
+    # Setting the user would render an authenticated shell whose every request
+    # then 401s, which is the confusing half-failure this flow exists to avoid.
+    source = _read(AUTH_CONTEXT_JSX)
+    found = re.search(
+        r"const signup = useCallback\(async \(payload\) => \{(.*?)\n  \}, \[\]\);",
+        source,
+        re.DOTALL,
+    )
+    assert found, "signup is not wired through the auth context"
+    assert "if (!confirmationRequired) setUser(u);" in found.group(1)
+
+
+def test_the_confirmation_screen_does_not_promise_an_account_it_cannot_know_about():
+    """The wording has to be true for every signup GoTrue accepts.
+
+    GoTrue answers 200 both for a new address and for one that already has a
+    confirmed account, on purpose, so that this endpoint cannot be used to test
+    whether somebody is registered. "Your account is created" is therefore false
+    for the second case, where no account was made and no email was sent -- and
+    the user would sit waiting for mail that never arrives. The copy has to
+    survive both, and it always has to offer signing in as the way through.
+    """
+
+    source = _read(SIGNUP_JSX)
+    panel = re.search(r"\{awaitingConfirmation \? \((.*?)\n        \) : \(", source, re.DOTALL)
+    assert panel, "the confirmation screen is not rendered from the signup page"
+    body = panel.group(1)
+
+    assert "awaitingConfirmation" in body, "the message should name the address"
+    assert 'to="/login"' in body, "signing in must be offered, not just mentioned"
+    for overclaim in ("Your account is created", "account has been created", "We sent"):
+        assert overclaim not in body, f"the confirmation screen must not say {overclaim!r}"
 
 
 # ------------------------------------------------------------------ refresh

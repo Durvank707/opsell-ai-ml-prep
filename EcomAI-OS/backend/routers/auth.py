@@ -387,8 +387,17 @@ async def signup(payload: SignupRequest):
             supabase_auth.sign_up, settings, email, payload.password, metadata
         )
         if not session["access_token"]:
-            # "Confirm email" is on. The account exists but there is no session
-            # to hand over, and the user has to act before they can sign in.
+            # The ordinary case: "Confirm email" is on, so GoTrue issues no
+            # session here and the user has to verify before they can sign in.
+            # Saying so -- with both tokens explicitly empty -- is what makes the
+            # client show "check your inbox" instead of storing a credential that
+            # fails on its first protected request. Verification is never skipped
+            # to save the user a step.
+            #
+            # GoTrue does not say whether it created an account, so neither does
+            # this: it answers 200 for an address that already existed, and
+            # claiming an account would be a lie in that case. The client is told
+            # to check the inbox and to sign in if it already has an account.
             return {
                 "user": session["user"],
                 "access_token": "",
@@ -396,6 +405,9 @@ async def signup(payload: SignupRequest):
                 "token_type": session["token_type"],
                 "confirmation_required": True,
             }
+        # Only reachable on a project with autoconfirm enabled. A session that
+        # really was issued is passed through, and the client is told the account
+        # needs no verification.
         return {**session, "confirmation_required": False}
 
     try:
