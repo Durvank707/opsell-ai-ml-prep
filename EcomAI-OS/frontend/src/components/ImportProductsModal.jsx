@@ -95,7 +95,7 @@ export default function ImportProductsModal({ open, onClose, user, onImported })
       footer={
         ready ? (
           <Button icon={UploadCloud} onClick={handleImport}>
-            Import {validation.validRows} Valid {validation.validRows === 1 ? 'Row' : 'Rows'}
+            Import {validation.validRows} New {validation.validRows === 1 ? 'Product' : 'Products'}
           </Button>
         ) : (
           <Button variant="secondary" onClick={onClose}>
@@ -175,7 +175,7 @@ export default function ImportProductsModal({ open, onClose, user, onImported })
               <p className="mt-0.5 text-xs text-slate-600">{validation.message}</p>
             </div>
           </div>
-          <ImportStats validation={validation} />
+          <ImportStats validation={validation} variant="products" />
           {validation.skippedRows > 0 && (
             <ErrorsList validation={validation} showErrors={showErrors} setShowErrors={setShowErrors} />
           )}

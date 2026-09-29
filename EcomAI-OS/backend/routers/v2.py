@@ -92,6 +92,39 @@ def _validation_payload(result: Any) -> Dict[str, Any]:
     }
 
 
+#: How many unknown product ids a rejected sales import names before the list is
+#: summarised instead. A tenant with a mis-keyed column can be looking at
+#: hundreds, and the point of the message is that the batch was refused and why,
+#: not to paste the whole column back.
+_UNKNOWN_PRODUCT_LIMIT = 10
+
+
+def unknown_sales_products_message(product_ids: List[str]) -> str:
+    """Why a sales batch was refused, naming the ids and the fix.
+
+    Sales rows are never allowed to create catalog entries, so a product the
+    tenant has not added is a hard error rather than a warning. The message says
+    how many ids were involved, which ones they were, and the one action that
+    resolves it, so a tenant is not left guessing whether the file or the
+    catalog is at fault.
+    """
+
+    ids = [str(product_id) for product_id in product_ids]
+    count = len(ids)
+    listed = ids[:_UNKNOWN_PRODUCT_LIMIT]
+    remainder = count - len(listed)
+    plural = "s" if count != 1 else ""
+    shown = ", ".join(listed)
+    if remainder:
+        shown += f", and {remainder} more"
+    return (
+        f"Sales import contains {count} product ID{plural} that "
+        f"{'are' if count != 1 else 'is'} not in your catalog: {shown}. "
+        f"Add {'these products' if count != 1 else 'this product'} to your "
+        "catalog first, then upload the sales data."
+    )
+
+
 def workspace_for(user_id: str, email: Optional[str] = None) -> TenantWorkspace:
     """Return the user-scoped workspace, creating an empty one on first sight.
 
@@ -504,25 +537,31 @@ async def ingest_rows_v2(
     canonical_rows = [row.values for row in result.rows]
     try:
         if request.record_type == "product":
-            written = len(ws.add_products(canonical_rows))
+            # A tenant-authored create never replaces an existing product: a
+            # re-created P001 must not discard the name, supplier, price and
+            # stock the tenant already has under that id. The whole batch is
+            # refused if any row conflicts, so a file can never half-apply.
+            written = len(ws.add_new_products(canonical_rows))
             persisted_table = "products"
         else:
-            missing = sorted({
+            # Listed in the order the file named them, not sorted: the tenant
+            # reads the message against their own spreadsheet, and a sorted list
+            # of P1000, P1001, P999 makes them hunt for each id.
+            missing = list(dict.fromkeys(
                 str(row["product_id"])
                 for row in canonical_rows
                 if str(row["product_id"]) not in ws.products
-            })
+            ))
             if missing:
                 # Refuse rather than auto-creating catalog rows from a sales
                 # file: the product catalog is the tenant's own metadata and a
-                # typo must not silently invent a product.
+                # typo must not silently invent a product. Checked against this
+                # workspace's catalog only, so a product that belongs to another
+                # tenant is still unknown here, and checked before the write, so
+                # the batch is all-or-nothing.
                 raise HTTPException(
                     status_code=422,
-                    detail=(
-                        "No rows were ingested because these product_id values "
-                        f"are not in your catalog: {missing}. Ingest the "
-                        "'product' contract first."
-                    ),
+                    detail=unknown_sales_products_message(missing),
                 )
             written = ws.upsert_sales_rows(canonical_rows)
             persisted_table = "sales"

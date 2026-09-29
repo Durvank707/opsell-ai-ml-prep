@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { forwardRef, useImperativeHandle, useRef, useState } from 'react';
 import { UploadCloud, FileSpreadsheet, AlertCircle } from 'lucide-react';
 import { cn } from '../lib/utils';
 
@@ -8,18 +8,39 @@ import { cn } from '../lib/utils';
  * `onDownloadTemplate` (or its alias `onDownloadSample`) triggers the
  * "Download template" link; `hint` is shown next to the format note and should
  * name the columns the flow accepts.
+ *
+ * The file input is opened by clicking anywhere in the zone, by Enter/Space, or
+ * from outside through the ref (`openFilePicker()`), so a page button such as
+ * "Upload Data" can start exactly the flow the zone does — the browser's own
+ * file dialog, feeding the same `onFile` handler. There is one input and one
+ * handler either way, so the two entry points cannot diverge.
  */
-export default function UploadDropzone({
-  onFile,
-  onDownloadTemplate,
-  onDownloadSample,
-  hint = 'Columns: date, product_id, units_sold',
-  compact = false,
-  disabled = false,
-}) {
+const UploadDropzone = forwardRef(function UploadDropzone(
+  {
+    onFile,
+    onDownloadTemplate,
+    onDownloadSample,
+    hint = 'Columns: date, product_id, units_sold',
+    compact = false,
+    disabled = false,
+  },
+  ref,
+) {
   const inputRef = useRef(null);
   const [dragging, setDragging] = useState(false);
   const [fileName, setFileName] = useState(null);
+
+  // Exposed so a button elsewhere on the page can open this zone's picker
+  // instead of rendering a second, hidden <input type="file"> of its own.
+  useImperativeHandle(ref, () => ({
+    openFilePicker() {
+      if (!disabled) inputRef.current?.click();
+    },
+    reset() {
+      setFileName(null);
+      if (inputRef.current) inputRef.current.value = '';
+    },
+  }));
 
   const handleFiles = (files) => {
     const file = files && files[0];
@@ -51,7 +72,13 @@ export default function UploadDropzone({
         role="button"
         tabIndex={disabled ? -1 : 0}
         aria-disabled={disabled || undefined}
-        onClick={() => inputRef.current?.click()}
+        onClick={() => {
+          // A disabled zone must not open a dialog: while an import is running,
+          // a stray click would queue a second file against a flow that cannot
+          // accept it.
+          if (disabled) return;
+          inputRef.current?.click();
+        }}
         onKeyDown={(e) => {
           if (disabled) return;
           if (e.key === 'Enter' || e.key === ' ') {
@@ -94,9 +121,17 @@ export default function UploadDropzone({
           <span className="inline-flex items-center gap-1">
             <AlertCircle className="h-3.5 w-3.5" /> {hint}
           </span>
+          {/* The zone is itself a button, so this nested control stops both
+              click and key events from bubbling: without that, asking for the
+              template also opened the file dialog, and the dialog's cancel
+              read to the tenant as the download having failed. */}
           <button
             type="button"
-            onClick={onDownloadTemplate || onDownloadSample}
+            onClick={(e) => {
+              e.stopPropagation();
+              (onDownloadTemplate || onDownloadSample)?.();
+            }}
+            onKeyDown={(e) => e.stopPropagation()}
             className="font-semibold text-brand-600 hover:text-brand-700"
           >
             Download template
@@ -105,4 +140,6 @@ export default function UploadDropzone({
       </div>
     </div>
   );
-}
+});
+
+export default UploadDropzone;

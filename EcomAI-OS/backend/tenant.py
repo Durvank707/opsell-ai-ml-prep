@@ -33,7 +33,7 @@ import csv
 import math
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from uuid import uuid4
 
 from backend.contracts import (
@@ -77,6 +77,42 @@ DEFAULT_ML_HORIZON = 30
 
 class TenantIsolationError(PermissionError):
     """Raised when code attempts to touch another tenant's row — always a bug."""
+
+
+class DuplicateProductError(ValueError):
+    """A creation named a ``product_id`` this tenant already has in its catalog.
+
+    Raised instead of overwriting. The catalog is the tenant's own metadata, so
+    silently replacing a product would discard a name, a supplier, a price and a
+    stock count the moment a row is re-uploaded. ``conflicts`` carries the
+    offending ids in the order the caller supplied them, so the caller can name
+    them without having to parse the message.
+    """
+
+    def __init__(self, conflicts: Sequence[str]) -> None:
+        self.conflicts = [str(product_id) for product_id in conflicts]
+        super().__init__(duplicate_product_message(self.conflicts))
+
+
+def duplicate_product_message(conflicts: Sequence[str]) -> str:
+    """The one sentence a tenant sees when a create names an existing product.
+
+    A single id reads as a specific instruction about that product; several are
+    listed so a re-uploaded file can be fixed in one pass.
+    """
+
+    ids = [str(product_id) for product_id in conflicts]
+    if len(ids) == 1:
+        return (
+            f"Product ID {ids[0]} already exists in your catalog. Use a "
+            "different Product ID or edit the existing product."
+        )
+    joined = ", ".join(ids)
+    return (
+        f"Product IDs {joined} already exist in your catalog. Use different "
+        "Product IDs, or edit the existing products instead of re-creating "
+        "them."
+    )
 
 
 @dataclass
@@ -706,7 +742,57 @@ class TenantWorkspace:
         :meth:`upsert_sales_rows`. Validation happens for every row first, so an
         invalid row anywhere refuses the whole batch instead of leaving a
         half-written catalog behind.
+
+        A ``product_id`` already in the catalog is **replaced** here. That is what
+        an in-place update needs (see :meth:`update_product`) and what the
+        canonical demo seed relies on, so it is kept. Anything a tenant authors —
+        the add-product form, a product CSV — goes through
+        :meth:`add_new_products` instead, which refuses rather than replaces.
         """
+
+        prepared = self._validated_product_batch(rows)
+        seen: set = set()
+        for product in prepared:
+            if product.product_id in seen:
+                raise ValueError(
+                    "A product batch contains duplicate product_id "
+                    f"{product.product_id!r}."
+                )
+            seen.add(product.product_id)
+        self._commit_product_rows(prepared)
+        return prepared
+
+    def add_new_products(self, rows: Sequence[Dict[str, Any]]) -> List[ProductRow]:
+        """Create canonical product rows, refusing any id already in the catalog.
+
+        The path every tenant-authored product write takes. A ``product_id`` this
+        workspace already holds is a conflict, not an update: creating P001
+        again must not replace the name, supplier, price and stock the tenant
+        already stored under it. The check runs after the whole batch has been
+        validated and before anything is written, so one conflicting row refuses
+        the batch rather than leaving a half-created catalog behind.
+
+        The comparison folds case, because a tenant who typed ``p001`` after
+        ``P001`` means the same product and would otherwise end up with two rows
+        that read identically in every table.
+        """
+
+        prepared = self._validated_product_batch(rows)
+        existing = {product_id.casefold() for product_id in self.products}
+        conflicts = [
+            product.product_id
+            for product in prepared
+            if product.product_id.casefold() in existing
+        ]
+        if conflicts:
+            raise DuplicateProductError(conflicts)
+        self._commit_product_rows(prepared)
+        return prepared
+
+    def _validated_product_batch(
+        self, rows: Sequence[Dict[str, Any]]
+    ) -> List["ProductRow"]:
+        """Build every product row first, refusing the batch on any problem."""
 
         try:
             materialized = list(rows)
@@ -723,7 +809,6 @@ class TenantWorkspace:
                     f"{product.product_id!r}."
                 )
             seen.add(product.product_id)
-        self._commit_product_rows(prepared)
         return prepared
 
     def _commit_product_rows(self, prepared: Sequence["ProductRow"]) -> int:
@@ -1365,6 +1450,37 @@ class TenantWorkspace:
                 })
         return rows
 
+    def _effective_unit_price(
+        self, product_id: str, row: Mapping[str, Any]
+    ) -> Optional[float]:
+        """The price one sales row is worth, and where it came from.
+
+        A sales row may state its own ``price``; when it does, that is the
+        price. When it states none, the product's catalog ``unit_price`` is used
+        instead — the same fallback the forecaster already applies in
+        :meth:`_enrich_history`, and the one ``0008_product_price_and_display_fields``
+        documents ("the price a sales row falls back to when it carries none").
+        One rule, used by the table, the summary and the model, rather than a
+        second price source only the UI knows about.
+
+        ``None`` means neither the row nor the product stated a usable price.
+        That is a gap in the data, not a revenue of zero, so it is reported as
+        absent and the caller shows it as such instead of inventing a figure.
+        """
+
+        stated = row.get("price")
+        if isinstance(stated, (int, float)) and not isinstance(stated, bool):
+            return float(stated)
+        if isinstance(stated, str) and stated.strip():
+            try:
+                return float(stated)
+            except ValueError:
+                return None
+        product = self.products.get(product_id)
+        if product is not None and product.unit_price > 0:
+            return float(product.unit_price)
+        return None
+
     def list_sales(
         self,
         *,
@@ -1383,6 +1499,13 @@ class TenantWorkspace:
         selecting a real channel shows only that one. Rows are ordered newest
         first, then by product and channel so a multi-channel day reads as a
         stable group rather than shuffling between requests.
+
+        Every row carries both prices it could have: ``price`` is what the sales
+        record itself stated, and ``unit_price`` is the price that row is
+        actually worth (:meth:`_effective_unit_price`, which falls back to the
+        product's catalog price). Revenue is ``units_sold × unit_price``, so a
+        file that recorded no per-row price still reports the revenue its units
+        were sold for, and the two values never have to be guessed apart.
         """
 
         if product_id is not None:
@@ -1417,6 +1540,12 @@ class TenantWorkspace:
                     "product_id": pid,
                     "product_name": self.products[pid].product_name
                     if pid in self.products else pid,
+                    # The price this row is worth, and the price the row itself
+                    # stated. Both are always present as keys so a client can
+                    # tell "the row carried no price" from "the field is
+                    # missing", and never has to read either as zero.
+                    "unit_price": self._effective_unit_price(pid, row),
+                    "price": row.get("price"),
                     **row,
                 }
                 for pid, _day, _channel, row in page
@@ -1436,18 +1565,28 @@ class TenantWorkspace:
         )
 
     def sales_summary(self) -> Dict[str, Any]:
-        """Portfolio sales totals for the signed-in tenant."""
+        """Portfolio sales totals for the signed-in tenant.
+
+        Revenue uses the same effective price the records table shows
+        (:meth:`_effective_unit_price`), so the summary and the table can never
+        disagree about what a day's sales were worth. A row with no price
+        anywhere contributes its units but no revenue, and ``priced_records``
+        states how many rows carried a usable price so a total built on a
+        partial column is disclosed rather than presented as complete.
+        """
 
         total_rows = len(self.sales_records)
         units = 0
         revenue = 0.0
+        priced_records = 0
         per_channel: Dict[str, Dict[str, Any]] = {}
-        for row in self.sales_records.values():
+        for (pid, _day, _channel), row in self.sales_records.items():
             sold = int(row.get("units_sold", 0) or 0)
             units += sold
-            price = row.get("price")
-            if isinstance(price, (int, float)):
-                revenue += sold * float(price)
+            price = self._effective_unit_price(pid, row)
+            if price is not None:
+                priced_records += 1
+                revenue += sold * price
             bucket = per_channel.setdefault(
                 str(row["channel"]),
                 {"channel": str(row["channel"]), "count": 0, "units": 0},
@@ -1465,6 +1604,7 @@ class TenantWorkspace:
             "total_records": total_rows,
             "total_units": units,
             "total_revenue": round(revenue, 2),
+            "priced_records": priced_records,
             "products_covered": len({
                 pid for (pid, _day, _channel) in self.sales_records
                 if pid in self.products

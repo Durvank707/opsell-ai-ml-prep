@@ -42,6 +42,19 @@ export function withoutRejectedRows(rows, errors) {
   return rows.filter((_row, index) => !rejected.has(index + 1));
 }
 
+/**
+ * The 1-based data-row numbers the report cleared, in file order.
+ *
+ * `withoutRejectedRows` answers the same question by value; this answers it by
+ * position, so a caller that inspects each accepted row individually can still
+ * name the line it came from. `toValidationReport` reports row numbers in this
+ * numbering, so entry `i` here describes `payload[i]`.
+ */
+export function acceptedRowNumbers(rows, errors) {
+  const rejected = new Set(errors.map((error) => error.row));
+  return rows.map((_row, index) => index + 1).filter((number) => !rejected.has(number));
+}
+
 /** Poll an async validation job to completion (large-file uploads). */
 export async function pollValidationJob(user, jobId) {
   const deadline = Date.now() + 60_000;

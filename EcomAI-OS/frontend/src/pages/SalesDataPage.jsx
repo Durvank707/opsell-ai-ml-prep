@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Database,
@@ -73,6 +73,31 @@ export default function SalesDataPage() {
   const [validation, setValidation] = useState(null);
   const [showErrors, setShowErrors] = useState(false);
   const [uploadError, setUploadError] = useState('');
+  // Whether the upload card is showing the full flow. The card is the page's
+  // main content only while there is nothing to see; once the tenant has sales
+  // records, the summary and the table are the point of the page and importing
+  // is a secondary action. See `showFullUpload`.
+  const [uploadExpanded, setUploadExpanded] = useState(false);
+  // Set when a button outside the dropzone asks for the file dialog. The zone
+  // has to be mounted before its input can be clicked, so the request is held
+  // here and fired from an effect (below) once the zone exists.
+  const [pickerRequested, setPickerRequested] = useState(false);
+  const dropzoneRef = useRef(null);
+  const recordsCardRef = useRef(null);
+  // Counts completed summary loads, so a caller can wait for the refresh an
+  // import triggers without watching the summary object itself.
+  const summaryLoads = useRef(0);
+
+  // A tenant who has records has data to look at, so the page leads with it.
+  // A tenant who has none is told what to upload and shown the guide for it.
+  const hasRecords = (summary?.totalRecords ?? 0) > 0;
+  const showFullUpload = uploadExpanded || !hasRecords;
+
+  useEffect(() => {
+    if (!pickerRequested) return;
+    setPickerRequested(false);
+    dropzoneRef.current?.openFilePicker();
+  }, [pickerRequested, showFullUpload, phase]);
 
   const loadSummary = useCallback(async () => {
     setSummaryLoading(true);
@@ -82,6 +107,7 @@ export default function SalesDataPage() {
     } catch {
       toast.error('Unable to load sales summary. Please try again.');
     } finally {
+      summaryLoads.current += 1;
       setSummaryLoading(false);
     }
   }, [user, toast]);
@@ -180,16 +206,46 @@ export default function SalesDataPage() {
     try {
       const result = await uploadSalesCsv(user, fileText);
       setValidation(result);
-      setPhase('done');
       setStepIndex(4);
       refresh();
       setLoadKey((k) => k + 1);
       toast.success(result.message || 'Sales data imported successfully.');
+      // The import succeeded, so the page now has something to show. Collapse
+      // the upload card back to a secondary action and bring the records into
+      // view: the summary and the table both reload from the bumped `loadKey`,
+      // so the numbers below are the ones that were just written without a page
+      // reload. Waiting for them keeps "imported successfully" from being shown
+      // next to an empty table.
+      await waitForSummary();
+      setPhase('done');
+      setUploadExpanded(false);
+      recordsCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (e) {
       setUploadError(e.message || 'Import failed. Please check the file and try again.');
       setPhase('error');
       toast.error(e.message || 'Import failed.');
     }
+  };
+
+  /**
+   * Resolve once the summary reflects the import.
+   *
+   * `loadSummary` is fired by an effect on `loadKey`, so this waits for the
+   * load the import just queued rather than reading the summary object: it only
+   * decides whether the page may say "imported successfully" next to numbers
+   * that have caught up. It gives up after a few seconds rather than blocking
+   * the UI on a slow request.
+   */
+  const waitForSummary = () => {
+    const target = summaryLoads.current + 1;
+    const started = Date.now();
+    return new Promise((resolve) => {
+      const poll = () => {
+        if (summaryLoads.current >= target || Date.now() - started > 4000) resolve();
+        else setTimeout(poll, 60);
+      };
+      poll();
+    });
   };
 
   const resetUpload = () => {
@@ -200,6 +256,22 @@ export default function SalesDataPage() {
     setValidation(null);
     setShowErrors(false);
     setUploadError('');
+  };
+
+  /**
+   * Start an import from a button outside the dropzone.
+   *
+   * The page header and the records table's empty state both call this. It
+   * reopens the full upload flow if it was collapsed, starts it clean if a
+   * previous file is still on screen, and then asks the dropzone to open the
+   * browser's file dialog. The zone's own "Browse Files" affordance and this
+   * path end at the same input and the same handler, so a file chosen either way
+   * is validated and imported identically.
+   */
+  const requestFilePicker = () => {
+    resetUpload();
+    setUploadExpanded(true);
+    setPickerRequested(true);
   };
 
   const handleSampleImport = async () => {
@@ -216,7 +288,9 @@ export default function SalesDataPage() {
         errors: [],
         message: `${formatNumber(res.records)} historical records imported from the demo dataset.`,
       });
+      await waitForSummary();
       setPhase('done');
+      setUploadExpanded(false);
     } catch (e) {
       setUploadError(e.message || 'Unable to import sample data.');
       setPhase('error');
@@ -241,7 +315,25 @@ export default function SalesDataPage() {
       { key: 'date', label: 'Date', render: (r) => <span className="tnum text-sm text-slate-600">{formatDate(r.date)}</span> },
       { key: 'channel', label: 'Channel', render: (r) => <ChannelBadge channel={r.channel} /> },
       { key: 'units', label: 'Units Sold', align: 'right', render: (r) => <span className="tnum text-sm font-bold text-slate-800">{formatNumber(r.units)}</span> },
-      { key: 'revenue', label: 'Revenue', align: 'right', render: (r) => <span className="tnum text-sm text-slate-600">{formatINR(r.revenue)}</span> },
+      {
+        key: 'revenue',
+        label: 'Revenue',
+        align: 'right',
+        // A row with no price anywhere is missing a price, not worth nothing.
+        // Rendering those as "₹0" claimed the sale made no money and silently
+        // under-reported the total, so the gap is shown as a gap.
+        render: (r) => (
+          <span className="tnum text-sm text-slate-600">
+            {r.revenue == null ? (
+              <span className="text-slate-400" title="No price was recorded for this sale, so its revenue is unknown.">
+                —
+              </span>
+            ) : (
+              formatINR(r.revenue)
+            )}
+          </span>
+        ),
+      },
     ],
     [navigate],
   );
@@ -256,8 +348,11 @@ export default function SalesDataPage() {
             <Button variant="secondary" icon={Sparkles} onClick={handleSampleImport}>
               Load Demo Data
             </Button>
-            <Button icon={UploadCloud} onClick={() => setPhase('idle')}>
-              Upload Sales Data
+            {/* Opens the same file dialog the dropzone's "Browse Files" does,
+                through the dropzone's own input. It used to only set the phase
+                to idle, which looked like nothing happened. */}
+            <Button icon={UploadCloud} onClick={requestFilePicker}>
+              {hasRecords ? 'Import More Sales Data' : 'Upload Sales Data'}
             </Button>
           </>
         }
@@ -285,15 +380,59 @@ export default function SalesDataPage() {
       <div className="grid gap-5 lg:grid-cols-3">
         {/* Upload flow card */}
         <Card
-          title="Upload Sales Data"
-          subtitle="Add records from your sales channels"
+          title={hasRecords ? 'Import More Sales Data' : 'Upload Sales Data'}
+          subtitle={
+            hasRecords
+              ? 'Add another CSV to the history already loaded below'
+              : 'Add records from your sales channels'
+          }
           className="lg:col-span-2"
-          actions={<ImportStepsIndicator stepIndex={stepIndex} phase={phase} />}
+          actions={showFullUpload ? <ImportStepsIndicator stepIndex={stepIndex} phase={phase} /> : null}
         >
-          {phase === 'idle' ? (
+          {!showFullUpload ? (
+            /* Once records exist this card is a secondary action, not the
+               page's subject: the summary above and the table below are what
+               the tenant came for. The success of the import that just ran is
+               still reported here, next to the counts that describe it. */
+            <div className="space-y-3">
+              {phase === 'done' && validation ? (
+                <div className="flex items-start gap-3 rounded-2xl border border-emerald-200 bg-emerald-50/70 p-4">
+                  <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600" />
+                  <div>
+                    <p className="text-sm font-bold text-slate-800">Import completed successfully</p>
+                    <p className="mt-0.5 text-xs text-slate-600">{validation.message}</p>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-xs leading-relaxed text-slate-500">
+                  {formatNumber(summary?.totalRecords || 0)} record
+                  {summary?.totalRecords === 1 ? '' : 's'} and{' '}
+                  {formatNumber(summary?.totalUnits || 0)} unit
+                  {summary?.totalUnits === 1 ? '' : 's'} are loaded. Upload another CSV to
+                  add to them — a row for a product, date and channel that already
+                  exists is updated, never duplicated.
+                </p>
+              )}
+              <div className="flex flex-wrap gap-2">
+                <Button icon={UploadCloud} onClick={requestFilePicker}>
+                  Import More Sales Data
+                </Button>
+                <Button
+                  variant="secondary"
+                  onClick={() => recordsCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                >
+                  View Records
+                </Button>
+                <Button variant="ghost" onClick={() => navigate('/app/forecast')}>
+                  View Forecast
+                </Button>
+              </div>
+            </div>
+          ) : phase === 'idle' ? (
             <div className="flex flex-col items-center gap-4 py-2 text-center">
               <ImportGuide recordType="sales" className="w-full" />
               <UploadDropzone
+                ref={dropzoneRef}
                 onFile={handleFile}
                 onDownloadTemplate={() => downloadSalesTemplateCsv(user)}
                 disabled={false}
@@ -442,6 +581,7 @@ export default function SalesDataPage() {
         subtitle="Recent validated sales transactions"
         bodyClassName="p-0"
         pad={false}
+        ref={recordsCardRef}
       >
         <div className="flex flex-wrap items-center gap-3 border-b border-slate-100 p-4">
           <SearchInput value={search} onChange={setSearch} placeholder="Search products" className="w-full sm:w-56" />
@@ -490,7 +630,7 @@ export default function SalesDataPage() {
                   : 'Try adjusting your search or date filters.'
               }
               actionLabel={records?.total === 0 && summary?.totalRecords === 0 ? 'Upload Sales Data' : undefined}
-              onAction={records?.total === 0 && summary?.totalRecords === 0 ? () => setPhase('idle') : undefined}
+              onAction={records?.total === 0 && summary?.totalRecords === 0 ? requestFilePicker : undefined}
             />
           }
         />

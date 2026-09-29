@@ -295,6 +295,10 @@ export function toSalesSummary(raw) {
     totalRecords: num(row.total_records, 0),
     totalUnits: num(row.total_units, 0),
     totalRevenue: num(row.total_revenue, 0),
+    // How many records carried a usable price. The server prices a record with
+    // its own price, falling back to the product's catalog price, and reports
+    // the count so a total built on a partial price column is disclosed.
+    pricedRecords: num(row.priced_records, null),
     lastImport: null,
     productsCovered: num(row.products_covered, 0),
     dateFrom: row.date_from ? str(row.date_from) : null,
@@ -315,10 +319,43 @@ export function toSalesSummary(raw) {
   };
 }
 
+/**
+ * A monetary value, or `null` when the server said nothing.
+ *
+ * `num` is the right reader for a count, but not for money: `Number(null)` and
+ * `Number('')` are both `0`, so a row whose price column is absent would be read
+ * as a sale worth nothing rather than as a sale whose price is unknown. That
+ * single coercion is what made a missing price render as ₹0, so a price is only
+ * a number when the payload actually carries one.
+ */
+function money(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * The price one sales row is worth.
+ *
+ * A row that states its own `price` is worth that price. A row that states none
+ * falls back to `unit_price`, which the server resolves to the product's catalog
+ * price when the row itself carried none — the same fallback the forecaster
+ * applies, so the table, the summary and the model all price a row the same way.
+ * `null` means neither the row nor the product stated a usable price: that is
+ * missing information, not a sale worth zero rupees, and the caller shows it as
+ * absent rather than inventing a figure.
+ */
+function effectivePrice(record) {
+  const stated = money(record.price);
+  if (stated !== null) return stated;
+  return money(record.unit_price);
+}
+
 /** One row of the sales records table. */
 export function toSalesRecord(row) {
   const record = row || {};
   const channel = str(record.channel) || UNRECORDED_CHANNEL;
+  const price = effectivePrice(record);
   return {
     // channel is part of the record's business key, so a product sold on two
     // channels on one day is two rows and the id has to say so.
@@ -328,9 +365,10 @@ export function toSalesRecord(row) {
     productName: str(record.product_name) || str(record.product_id),
     category: str(record.category),
     units: num(record.units_sold, 0),
-    revenue: num(record.price, null) === null
+    price,
+    revenue: price === null
       ? null
-      : Math.round(num(record.units_sold, 0) * num(record.price, 0) * 100) / 100,
+      : Math.round(num(record.units_sold, 0) * price * 100) / 100,
     channel: channel === UNRECORDED_CHANNEL ? null : channel,
     unrecordedChannel: channel === UNRECORDED_CHANNEL,
     promotion: record.promotion ?? null,

@@ -58,12 +58,44 @@ export function UploadPhase({ icon: Icon, title, subtitle, loading }) {
   );
 }
 
-export function ImportStats({ validation }) {
-  const items = [
-    { label: 'Total rows', value: formatNumber(validation.totalRows), tone: 'text-slate-800' },
-    { label: 'Valid rows', value: formatNumber(validation.validRows), tone: 'text-emerald-700' },
-    { label: 'Skipped rows', value: formatNumber(validation.skippedRows), tone: validation.skippedRows ? 'text-amber-700' : 'text-slate-400' },
-  ];
+/**
+ * The three counts an import is judged by.
+ *
+ * The sales flow answers "how many rows are in this file" (total / valid /
+ * skipped). The product flow answers "what happened to my catalog", which is a
+ * different question: a product the tenant already had is not a bad row, it is a
+ * row that was deliberately left alone, and lumping it in with invalid rows
+ * would make a correct import look broken. So the product variant counts what
+ * each row did — added, already existed, or failed.
+ */
+export function ImportStats({ validation, variant = 'rows' }) {
+  const items =
+    variant === 'products'
+      ? [
+          {
+            label: 'New products',
+            value: formatNumber(validation.validRows),
+            tone: 'text-emerald-700',
+          },
+          {
+            label: 'Already existed',
+            value: formatNumber(validation.summary?.existing ?? 0),
+            tone: validation.summary?.existing ? 'text-amber-700' : 'text-slate-400',
+          },
+          {
+            label: 'Failed',
+            value: formatNumber(validation.skippedRows - (validation.summary?.existing ?? 0)),
+            tone:
+              validation.skippedRows - (validation.summary?.existing ?? 0)
+                ? 'text-rose-700'
+                : 'text-slate-400',
+          },
+        ]
+      : [
+          { label: 'Total rows', value: formatNumber(validation.totalRows), tone: 'text-slate-800' },
+          { label: 'Valid rows', value: formatNumber(validation.validRows), tone: 'text-emerald-700' },
+          { label: 'Skipped rows', value: formatNumber(validation.skippedRows), tone: validation.skippedRows ? 'text-amber-700' : 'text-slate-400' },
+        ];
   return (
     <div className="grid grid-cols-3 gap-3">
       {items.map((i) => (
@@ -76,35 +108,84 @@ export function ImportStats({ validation }) {
   );
 }
 
+/**
+ * The rows the report did not accept, split by what actually happened.
+ *
+ * A product this tenant already has is not a bad row. The import left it alone
+ * on purpose, and calling it invalid tells the tenant to fix it in their file —
+ * advice that cannot be followed, because re-uploading the same file skips the
+ * same product again. Those rows are listed separately, as skipped, and the
+ * invalid rows keep the "fix your file" wording that does help.
+ */
 export function ErrorsList({ validation, showErrors, setShowErrors }) {
-  const visible = showErrors ? validation.errors : validation.errors.slice(0, 5);
+  const errors = validation.errors || [];
+  const skipped = errors.filter((error) => error.category === 'existing_product');
+  const invalid = errors.filter((error) => error.category !== 'existing_product');
+  const visible = showErrors ? invalid : invalid.slice(0, 5);
+
   return (
-    <div className="rounded-xl border border-amber-200 bg-amber-50/40">
-      <div className="flex items-center justify-between border-b border-amber-200/60 px-4 py-2.5">
-        <p className="flex items-center gap-1.5 text-xs font-bold text-amber-700">
-          <FileSpreadsheet className="h-3.5 w-3.5" />
-          {validation.errors.length} invalid {validation.errors.length === 1 ? 'row' : 'rows'}
-        </p>
-        <button
-          onClick={() => setShowErrors((s) => !s)}
-          className="text-[11px] font-semibold text-amber-600 hover:text-amber-800"
-        >
-          {showErrors ? 'Show fewer' : `Show all (${validation.errors.length})`}
-        </button>
-      </div>
-      <ul className="max-h-44 overflow-y-auto px-4 py-2">
-        {visible.map((e, i) => (
-          <li key={i} className="flex items-start gap-2 border-b border-amber-100 py-1.5 last:border-0">
-            <span className="tnum shrink-0 font-mono text-[10px] font-bold text-amber-500">L{e.row}</span>
-            <span className="text-xs text-slate-600">{e.reason}</span>
-          </li>
-        ))}
-      </ul>
-      <div className="px-4 py-2.5 pb-3">
-        <p className="text-[11px] text-amber-700">
-          Fix these rows in your file and re-upload. You can also download the template to match the expected format.
-        </p>
-      </div>
+    <div className="space-y-3">
+      {skipped.length > 0 && (
+        <div className="rounded-xl border border-amber-200 bg-amber-50/40">
+          <div className="border-b border-amber-200/60 px-4 py-2.5">
+            <p className="flex items-center gap-1.5 text-xs font-bold text-amber-700">
+              <FileSpreadsheet className="h-3.5 w-3.5" />
+              {skipped.length} {skipped.length === 1 ? 'product' : 'products'} already in your catalog
+            </p>
+          </div>
+          <ul className="max-h-32 overflow-y-auto px-4 py-2">
+            {skipped.map((e, i) => (
+              <li
+                key={`skipped-${e.row}-${i}`}
+                className="flex items-start gap-2 border-b border-amber-100 py-1.5 last:border-0"
+              >
+                <span className="tnum shrink-0 font-mono text-[10px] font-bold text-amber-500">L{e.row}</span>
+                <span className="text-xs text-slate-600">{e.reason}</span>
+              </li>
+            ))}
+          </ul>
+          <div className="px-4 pb-3">
+            <p className="text-[11px] text-amber-700">
+              These rows were not imported, and the products they name were left exactly as they were. Edit a
+              product on the catalog page to change it — re-uploading the same file will skip it again.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {invalid.length > 0 && (
+        <div className="rounded-xl border border-amber-200 bg-amber-50/40">
+          <div className="flex items-center justify-between border-b border-amber-200/60 px-4 py-2.5">
+            <p className="flex items-center gap-1.5 text-xs font-bold text-amber-700">
+              <FileSpreadsheet className="h-3.5 w-3.5" />
+              {invalid.length} invalid {invalid.length === 1 ? 'row' : 'rows'}
+            </p>
+            <button
+              onClick={() => setShowErrors((s) => !s)}
+              className="text-[11px] font-semibold text-amber-600 hover:text-amber-800"
+            >
+              {showErrors ? 'Show fewer' : `Show all (${invalid.length})`}
+            </button>
+          </div>
+          <ul className="max-h-44 overflow-y-auto px-4 py-2">
+            {visible.map((e, i) => (
+              <li
+                key={`invalid-${e.row}-${i}`}
+                className="flex items-start gap-2 border-b border-amber-100 py-1.5 last:border-0"
+              >
+                <span className="tnum shrink-0 font-mono text-[10px] font-bold text-amber-500">L{e.row}</span>
+                <span className="text-xs text-slate-600">{e.reason}</span>
+              </li>
+            ))}
+          </ul>
+          <div className="px-4 py-2.5 pb-3">
+            <p className="text-[11px] text-amber-700">
+              Fix these rows in your file and re-upload. You can also download the template to match the expected
+              format.
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

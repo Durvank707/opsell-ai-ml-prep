@@ -10,6 +10,7 @@ import { getDB, latency, randomError } from './mock/db';
 import { parseCSV, downloadFile } from '../lib/utils';
 import { usingApi } from './api/mode';
 import * as api from './api/sales';
+import { unknownSalesProductsMessage } from './importMessages';
 
 const CHANNELS = ['Online Store', 'Amazon', 'Flipkart', 'Myntra', 'Offline Store'];
 
@@ -31,15 +32,22 @@ function memo(fn) {
 
 export const getSalesSummary = memo((db) => {
   let totalRecords = 0;
+  let totalUnits = 0;
   let totalRevenue = 0;
+  let pricedRecords = 0;
   const channelCounts = Object.fromEntries(CHANNELS.map((c) => [c, 0]));
-  const today = new Date();
   for (const p of db.products) {
     const series = db.getSales(p.id);
     for (const s of series) {
       if (s.units > 0) {
         totalRecords++;
-        totalRevenue += s.revenue || s.units * p.sellingPrice;
+        totalUnits += s.units;
+        // The store already priced each row (its own price, else the product's
+        // catalog price), so the total adds those rather than repricing here.
+        if (s.revenue != null) {
+          totalRevenue += s.revenue;
+          pricedRecords++;
+        }
         channelCounts[s.channel] = (channelCounts[s.channel] || 0) + 1;
       }
     }
@@ -49,7 +57,11 @@ export const getSalesSummary = memo((db) => {
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
   return {
     totalRecords,
+    // The same key the api adapter emits, so the sales page needs one path
+    // whether the numbers came from here or from the server.
+    totalUnits,
     totalRevenue,
+    pricedRecords,
     lastImport: db.salesMeta.lastImport,
     dateFrom: db.salesMeta.dateFrom,
     dateTo: db.salesMeta.dateTo,
@@ -99,7 +111,11 @@ export async function listSalesRecords(user, filters = {}) {
         productName: p.name,
         category: p.category,
         units: s.units,
-        revenue: s.revenue,
+        // The price this record was sold at, and what those units were worth.
+        // Either may be absent, which the table shows as "—" rather than as a
+        // zero-rupee sale.
+        price: s.price ?? null,
+        revenue: s.revenue ?? null,
         channel: s.channel,
       });
     }
@@ -168,6 +184,7 @@ export async function validateSalesCsv(csvText, user) {
 
   const errors = [];
   const valid = [];
+  const unknownProductIds = [];
   let totalRows = 0;
 
   for (let i = 1; i < rows.length; i++) {
@@ -192,6 +209,11 @@ export async function validateSalesCsv(csvText, user) {
       continue;
     }
     if (!known.has(productId)) {
+      // A sales row never creates a catalog entry, so an id this tenant does not
+      // have is a hard error. The whole file is refused below rather than
+      // importing its other rows, which would leave a partially loaded history
+      // that looks complete.
+      if (!unknownProductIds.includes(productId)) unknownProductIds.push(productId);
       errors.push({ row: lineNumber, reason: `Unknown product ID "${productId}". Add the product first.` });
       continue;
     }
@@ -203,41 +225,64 @@ export async function validateSalesCsv(csvText, user) {
       errors.push({ row: lineNumber, reason: `Units must be a whole number, got "${units}".` });
       continue;
     }
-    valid.push({ date, productId, units: Number(units), channel });
+    const statedPrice = String(row[idx.price] ?? '').trim();
+    valid.push({
+      date,
+      productId,
+      units: Number(units),
+      channel,
+      price: statedPrice === '' ? null : Number(statedPrice),
+    });
   }
 
   const missingProductId = errors.filter((e) => e.reason.includes('Missing product ID')).length;
-  const unknownProductId = errors.filter((e) => e.reason.includes('Unknown product')).length;
   const invalidUnits = errors.filter((e) => e.reason.includes('Invalid units')).length;
+  const blocked = unknownProductIds.length > 0;
+  const ready = blocked ? 0 : valid.length;
 
   return {
-    ok: valid.length > 0,
+    ok: ready > 0,
     totalRows,
-    validRows: valid.length,
+    validRows: ready,
+    // Every row the file offers is reported while it is blocked, so the counts
+    // the upload UI draws add up to the file it was given.
     skippedRows: errors.length,
     errors,
-    summary: { missingProductId, unknownProductId, invalidUnits },
-    message:
-      errors.length > 0
-        ? `${errors.length} row${errors.length === 1 ? '' : 's'} failed validation. ${valid.length} row${valid.length === 1 ? '' : 's'} are ready to import.`
-        : `${valid.length} row${valid.length === 1 ? '' : 's'} are ready to import.`,
-    payload: valid,
+    unknownProductIds,
+    summary: {
+      missingProductId,
+      unknownProductId: unknownProductIds.length,
+      invalidUnits,
+    },
+    message: blocked
+      ? unknownSalesProductsMessage(unknownProductIds)
+      : errors.length > 0
+        ? `${errors.length} row${errors.length === 1 ? '' : 's'} failed validation. ${ready} row${ready === 1 ? '' : 's'} are ready to import.`
+        : `${ready} row${ready === 1 ? '' : 's'} are ready to import.`,
+    // Nothing is handed to the commit while the file is blocked: a refused
+    // import writes no rows at all.
+    payload: blocked ? [] : valid,
   };
 }
 
 /**
  * Validate, then import the valid rows of a CSV file. Loads of invalid rows
  * are surfaced to the user both in the returned result and as structured UI.
+ *
+ * A file naming a product this tenant has not added is refused whole, with the
+ * ids and the fix, and writes nothing: no products are created from sales data,
+ * and a partly-loaded history that looks complete is the worse outcome.
  */
 export async function uploadSalesCsv(user, csvText) {
   if (usingApi()) return api.uploadSalesCsv(user, csvText);
   await latency(1200);
   const result = await validateSalesCsv(csvText, user);
   if (result.validRows === 0) {
-    throw randomError(
-      result.errors.some((e) => e.reason.includes('Unknown product'))
-        ? 'CSV contains invalid rows. ' + result.errors[0].reason
-        : 'CSV contains invalid rows.',
+    if (result.unknownProductIds?.length) {
+      throw new Error(unknownSalesProductsMessage(result.unknownProductIds));
+    }
+    throw new Error(
+      'CSV contains invalid rows. ' + (result.errors[0]?.reason || ''),
     );
   }
   const db = getDB(user);

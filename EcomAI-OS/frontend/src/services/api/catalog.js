@@ -8,7 +8,14 @@
 import * as http from './http';
 import { toInventoryOverview, toProduct, toTimeline } from './adapters';
 import { requireApiSession } from './mode';
-import { pollValidationJob, readCsv, toValidationReport } from './validation';
+import { pollValidationJob, acceptedRowNumbers, readCsv, toValidationReport } from './validation';
+import {
+  duplicateProductMessage,
+  duplicateProductsMessage,
+  productImportMessage,
+  toCanonicalProductRow,
+  validateProductInput,
+} from '../productFields';
 
 const URGENCY = { critical: 0, low: 1, overstocked: 2, healthy: 3 };
 
@@ -137,32 +144,27 @@ export async function getInventoryTimeline(user, productId, { days = 45 } = {}) 
   return toTimeline(raw);
 }
 
+/**
+ * Create one product in the caller's catalog.
+ *
+ * The form's rules are re-checked here so this path cannot create a product the
+ * form would have refused. The row goes to the canonical product contract, and
+ * the server refuses a `product_id` the tenant already has using the sentence
+ * this app shares with it — a create never overwrites an existing product.
+ */
 export async function createProduct(user, payload) {
-  const name = String(payload.name || '').trim();
-  const productId = String(payload.productId || '').trim();
-  if (!name) throw new Error('Please provide a product name.');
-  if (!productId) throw new Error('Please provide a product ID.');
-
-  const row = {
-    product_id: productId,
-    product_name: name,
-    category: payload.category || 'Electronics',
-    current_stock: Math.max(0, Number(payload.currentStock) || 0),
-    lead_time_days: Math.max(0, Number(payload.leadTimeDays) || 7),
-    unit_cost: Math.max(0, Number(payload.unitCost) || 0),
-    unit_price: Math.max(0, Number(payload.sellingPrice) || 0),
-  };
-  if (Number(payload.minStock) > 0) row.safety_stock = Number(payload.minStock);
-  if (payload.supplier) row.supplier = String(payload.supplier).trim();
-  if (payload.description) row.description = String(payload.description).trim();
+  const problem = validateProductInput(payload);
+  if (problem) throw new Error(problem);
+  const productId = String(payload.productId).trim();
+  const row = toCanonicalProductRow(payload);
 
   const result = await http.postIngest(user, {
     recordType: 'product',
     rows: [row],
     columns: Object.keys(row),
   });
-  // A duplicate product id is refused by the server's own uniqueness rules and
-  // arrives as a 422; the workspace returns the written row.
+  // The create either wrote the row or raised, so a 200 here means the product
+  // exists and this is what the tenant will now see.
   const created = await http.fetchProduct(user, productId);
   return toProduct({ ...created, ingested: result.ingested_rows });
 }
@@ -221,6 +223,11 @@ export async function placeSimulatedOrder(user, productId, qty) {
  *
  * Mirrors the sales flow: the browser only parses the file into rows, the
  * server's report decides everything, and large files are polled to completion.
+ *
+ * The one thing the server cannot know is which products this tenant already
+ * has, so that check is made here and folded into the same report — a row the
+ * catalog already holds is reported as such and excluded from the commit, and
+ * the counts (new / already existed / failed) are the ones the upload UI shows.
  */
 export async function validateProductsCsv(csvText, user) {
   requireApiSession();
@@ -233,22 +240,111 @@ export async function validateProductsCsv(csvText, user) {
   if (report && report.job_id) {
     report = await pollValidationJob(user, report.job_id);
   }
-  return toValidationReport(report, rows);
+  return excludeExistingProducts(user, toValidationReport(report, rows), rows);
+}
+
+/**
+ * Drop rows the catalog already has, and report them instead of hiding them.
+ *
+ * A product id this tenant already holds is a conflict, not an update: replacing
+ * it would discard the name, supplier, price and stock stored under that id. The
+ * rows are removed from `payload` and named in `errors`, so a file that
+ * re-uploads yesterday's catalog imports only what is new and the tenant can see
+ * exactly which products were left alone. Comparison folds case, because `p001`
+ * after `P001` is the same product in every table a merchant reads.
+ */
+/**
+ * A product id, folded so two spellings of the same id compare equal.
+ *
+ * `p001` after `P001` is the same product in every table a merchant reads.
+ * This lower-cases rather than using `String.prototype.casefold`, which is not
+ * present in every engine this app runs on — and a missing built-in here would
+ * fail the entire import rather than one comparison.
+ */
+function fold(productId) {
+  return String(productId ?? '').trim().toLowerCase();
+}
+
+async function excludeExistingProducts(user, result, sourceRows) {
+  const known = await existingProductIds(user);
+  const numbers = acceptedRowNumbers(sourceRows, result.errors);
+  const errors = [...result.errors];
+  const toCreate = [];
+  const alreadyPresent = [];
+  const seen = new Set();
+
+  result.payload.forEach((row, index) => {
+    const productId = String(row.product_id ?? '').trim();
+    // A row with no id at all was already reported by the contract check above;
+    // it is carried through to the commit unchanged rather than judged twice.
+    if (!productId) {
+      toCreate.push(row);
+      return;
+    }
+    const key = fold(productId);
+    if (known.has(key)) {
+      if (!alreadyPresent.includes(productId)) alreadyPresent.push(productId);
+      errors.push({
+        row: numbers[index],
+        reason: duplicateProductMessage(productId),
+        category: 'existing_product',
+        severity: 'error',
+      });
+      return;
+    }
+    if (seen.has(key)) {
+      errors.push({
+        row: numbers[index],
+        reason: `Product ID ${productId} appears more than once in this file.`,
+        category: 'duplicate_in_file',
+        severity: 'error',
+      });
+      return;
+    }
+    seen.add(key);
+    toCreate.push(row);
+  });
+
+  const skippedExisting = alreadyPresent.length;
+  return {
+    ...result,
+    ok: toCreate.length > 0,
+    validRows: toCreate.length,
+    skippedRows: errors.length,
+    errors,
+    existingProductIds: alreadyPresent,
+    payload: toCreate,
+    summary: { ...result.summary, existing: skippedExisting },
+    message: productImportMessage({
+      newProducts: toCreate.length,
+      skipped: skippedExisting,
+      failed: errors.length - skippedExisting,
+    }),
+  };
 }
 
 /**
  * Validate, then commit the rows the report cleared into the catalog.
  *
- * The commit is all-or-nothing on the server, so only the accepted subset of
- * the parsed rows is ever sent.
+ * Existing products are detected *before* anything is committed: a
+ * `product_id` the tenant already has is not sent, so a re-uploaded file adds
+ * the new products and leaves the existing ones exactly as they were. The
+ * result reports the three counts that make that visible — new, skipped as
+ * already present, and failed — because a silently smaller catalog is the one
+ * outcome a tenant cannot notice.
+ *
+ * The server is the backstop rather than the only guard: it refuses a duplicate
+ * id outright, so a product created in another tab between the check and the
+ * commit still cannot be overwritten.
  */
 export async function uploadProductsCsv(user, csvText) {
   const result = await validateProductsCsv(csvText, user);
-  if (result.validRows === 0) {
+  if (result.payload.length === 0) {
+    const existing = result.existingProductIds;
     throw new Error(
-      result.errors.length
-        ? 'CSV contains invalid rows. ' + result.errors[0].reason
-        : 'CSV contains invalid rows.',
+      existing.length
+        ? `No new products were imported. ${duplicateProductsMessage(existing)}`
+        : 'CSV contains invalid rows. ' + (result.errors[0]?.reason || ''),
     );
   }
   const { columns } = readCsv(csvText);
@@ -257,18 +353,28 @@ export async function uploadProductsCsv(user, csvText) {
     columns,
     recordType: 'product',
   });
-  const skipped = result.errors.length;
+  const newProducts = ingested.ingested_rows;
   return {
     ...result,
     ok: true,
-    ingestedRows: ingested.ingested_rows,
+    newProducts,
+    skippedExisting: result.summary.existing,
+    failed: result.skippedRows - result.summary.existing,
+    ingestedRows: newProducts,
     persistedTo: ingested.persisted_to,
     durable: Boolean(ingested.durable),
-    message:
-      skipped > 0
-        ? `${skipped} row${skipped === 1 ? ' was' : 's were'} skipped during validation. ${result.validRows} valid row${result.validRows === 1 ? ' was' : 's were'} imported.`
-        : `${result.validRows} row${result.validRows === 1 ? '' : 's'} imported successfully.`,
   };
+}
+
+/** Every `product_id` this tenant already has, folded for comparison. */
+async function existingProductIds(user) {
+  const products = await http.fetchProducts(user);
+  return new Set(
+    (Array.isArray(products?.products) ? products.products : [])
+      .map((product) => String(product?.product_id ?? '').trim())
+      .filter(Boolean)
+      .map((productId) => fold(productId)),
+  );
 }
 
 /**

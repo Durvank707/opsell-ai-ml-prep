@@ -1,9 +1,15 @@
-import React from 'react';
+import React, { forwardRef } from 'react';
 import { cn } from '../../lib/utils';
 
-export default function Card({ title, subtitle, actions, children, className, bodyClassName, pad = true }) {
+// A plain surface with an optional header. The ref goes on the root element so a
+// page can scroll to a specific card — the sales page does that after an import
+// so the records it just wrote come into view.
+const Card = forwardRef(function Card(
+  { title, subtitle, actions, children, className, bodyClassName, pad = true },
+  ref,
+) {
   return (
-    <section className={cn('card', className)}>
+    <section className={cn('card', className)} ref={ref}>
       {(title || actions) && (
         <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 px-5 py-4">
           <div>
@@ -16,4 +22,6 @@ export default function Card({ title, subtitle, actions, children, className, bo
       <div className={cn(pad && 'p-5', bodyClassName)}>{children}</div>
     </section>
   );
-}
+});
+
+export default Card;

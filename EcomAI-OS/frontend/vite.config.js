@@ -15,4 +15,22 @@ export default defineConfig({
       },
     },
   },
+  test: {
+    // The regression tests render real components (the upload zone, the product
+    // form) and exercise the real service modules, so they need a DOM and the
+    // JSX transform. They live beside the code they cover, in `src/**`.
+    environment: 'jsdom',
+    globals: true,
+    include: ['src/**/*.test.{js,jsx}'],
+    setupFiles: ['./src/test/setup.js'],
+    restoreMocks: true,
+    // Pinned rather than inherited: a developer's `.env.local` points the
+    // running app at the real backend, and a test that silently switched to the
+    // api path would then fail on a missing access token instead of testing
+    // anything. A test that wants the api path sets the mode and re-imports.
+    env: {
+      VITE_AUTH_MODE: 'mock',
+      VITE_DATA_MODE: 'mock',
+    },
+  },
 })

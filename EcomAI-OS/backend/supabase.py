@@ -59,6 +59,10 @@ class SupabasePersistenceError(RuntimeError):
 
 _ALLOWED_TABLES = {"sales", "products", "audit_entries"}
 _MAX_ERROR_BODY = 2048
+#: A user-facing explanation is a sentence, not a dump. Bounded well below the
+#: body cap so it survives being shown in a toast and copied into a support
+#: ticket.
+_MAX_EXPLANATION = 500
 
 
 class _NoRedirectHandler(HTTPRedirectHandler):
@@ -250,20 +254,251 @@ def _request(
     except SupabasePersistenceError:
         raise
     except HTTPError as exc:
-        # Do not include the response body: a proxy or PostgREST error can echo
-        # request values, and no caller needs that raw text to recover.
+        # The body is read, bounded, and *classified* -- never echoed. A proxy
+        # or PostgREST error can contain request values, credentials or a stack
+        # trace, so the raw text is discarded after its documented error code
+        # and field name have been extracted into a safe sentence.
         try:
-            exc.read(_MAX_ERROR_BODY)
+            error_body = exc.read(_MAX_ERROR_BODY)
         except (AttributeError, OSError):
-            pass
+            error_body = b""
         raise SupabasePersistenceError(
-            f"Supabase request failed with HTTP status {exc.code}; no local "
-            "change was assumed."
+            _explain_http_failure(table, exc.code, error_body)
         ) from None
     except (URLError, OSError, TimeoutError) as exc:
         raise SupabasePersistenceError(
             "Supabase could not be reached; no local change was assumed."
         ) from exc
+
+
+#: Which migration brings the deployed table up to the canonical payload, named
+#: only so the reader knows what to run. The sentences below supply the verb.
+_SCHEMA_HINT = (
+    "supabase/migrations/0007_full_schema.sql and "
+    "supabase/migrations/0008_product_price_and_display_fields.sql"
+)
+_SALES_SCHEMA_HINT = (
+    "supabase/migrations/0007_full_schema.sql and "
+    "supabase/migrations/0009_sales_channel.sql"
+)
+
+#: PostgREST/Postgres error codes this adapter knows how to explain.
+#:
+#: Each value is a template. ``{field}`` is a phrase, not a bare name, because
+#: not every code states one; ``{table}`` is the table the request was for and
+#: ``{hint}`` is the migration that fixes a schema gap. A code that is not
+#: listed falls back to a generic sentence, so an unknown failure degrades to a
+#: short message rather than to a leaked body.
+_ERROR_EXPLANATIONS = {
+    # A canonical column has no home in the deployed table: a migration was
+    # never applied, or PostgREST's schema cache predates the column.
+    "PGRST204": (
+        "The database cannot store the {table} row: {field} does not exist on "
+        "that table. Run {hint}, then reload the schema cache (run: "
+        "NOTIFY pgrst, 'reload schema'; in the Supabase SQL editor). No data "
+        "was written."
+    ),
+    "42703": (
+        "The database cannot store the {table} row: {field} does not exist on "
+        "that table. Run {hint}, then reload the schema cache (run: "
+        "NOTIFY pgrst, 'reload schema'; in the Supabase SQL editor). No data "
+        "was written."
+    ),
+    # The batch disagreed with itself about which columns exist. Now impossible
+    # from this adapter (every row carries the full canonical key set), so this
+    # names a defect rather than blaming the tenant's file.
+    "PGRST103": (
+        "The batch of {table} rows was rejected because the rows did not all "
+        "carry the same columns. Nothing was written. This is a server-side "
+        "defect rather than a problem with your file; please try again."
+    ),
+    # A unique key the upsert depends on is missing from the table.
+    "PGRST201": (
+        "The {table} table has no unique key on the columns this upsert needs, "
+        "so nothing was written. Run {hint} to create it."
+    ),
+    # The table itself is absent.
+    "42P01": (
+        "The {table} table does not exist in the database, so nothing was "
+        "written. Run {hint} to create it."
+    ),
+    # A required (NOT NULL) column was absent or null.
+    "23502": (
+        "The database rejected the {table} write because {field} was empty, "
+        "and that column cannot be empty. Nothing was written."
+    ),
+    # A value outside the range a CHECK constraint allows, e.g. the
+    # current_stock >= 0 check the products table declares.
+    "23514": (
+        "The database rejected the {table} write because {field} is outside "
+        "the range that table allows. Nothing was written."
+    ),
+    # The row violates the business key the upsert targets. The application
+    # refuses an overwrite before it ever reaches this, so reaching it means two
+    # writers disagreed; say so instead of echoing the conflicting key values.
+    "23505": (
+        "The database refused the {table} write because a row with the same "
+        "value for {field} already exists. Nothing was overwritten."
+    ),
+    # The batch wrote fewer rows than it carried: a policy or trigger removed
+    # rows the service role should have been able to write.
+    "PT008": (
+        "The database rejected the {table} write because the batch was "
+        "filtered before it was saved, which usually means a Row Level "
+        "Security policy is blocking this tenant. Nothing was written."
+    ),
+    "PGRST116": (
+        "The database rejected the {table} write because the batch was "
+        "filtered before it was saved, which usually means a Row Level "
+        "Security policy is blocking this tenant. Nothing was written."
+    ),
+    # A value the column cannot hold: a string where a number/date is required.
+    "22P02": (
+        "The database could not read {field} as the type the {table} table "
+        "requires, so the write was refused. Check the number and date formats "
+        "in your file. Nothing was written."
+    ),
+    "22007": (
+        "The database could not read {field} as a date in the format the "
+        "{table} table expects, so the write was refused. Use YYYY-MM-DD. "
+        "Nothing was written."
+    ),
+    # The service role was refused by the database itself.
+    "42501": (
+        "The database refused the {table} write for this tenant. Check the Row "
+        "Level Security policies on that table. Nothing was written."
+    ),
+}
+
+
+def _explain_http_failure(table: str, status: Optional[int], body: Any) -> str:
+    """Turn one rejected request into a safe, actionable message.
+
+    The response body is read only for its documented ``code`` and for a column
+    name inside the message. The raw text is never included, so a response that
+    echoes a request value, a token or a stack trace cannot reach the caller.
+    """
+
+    label = f"{table} table"
+    hint = _SALES_SCHEMA_HINT if table == "sales" else _SCHEMA_HINT
+    code = _error_code(body)
+    field = _error_field(body)
+    template = _ERROR_EXPLANATIONS.get(code or "")
+    if template is not None:
+        return template.format(
+            table=table, hint=hint, field=_field_phrase(field)
+        )[:_MAX_EXPLANATION]
+    if status in (401, 403):
+        return (
+            f"Supabase refused the {label} request (HTTP {status}). The "
+            "server's Supabase credentials or the table's Row Level Security "
+            "policies rejected it; nothing was written."
+        )[:_MAX_EXPLANATION]
+    if status == 409:
+        return (
+            f"Supabase reported a conflict writing the {label} (HTTP 409). "
+            "The row conflicts with a record that already exists; nothing was "
+            "written."
+        )[:_MAX_EXPLANATION]
+    if status == 413:
+        return (
+            "The batch is larger than Supabase accepts in one request. Split "
+            "the file into smaller parts and upload them one at a time; nothing "
+            "was written."
+        )[:_MAX_EXPLANATION]
+    if status is not None and 500 <= int(status) < 600:
+        return (
+            f"Supabase could not complete the {label} request (HTTP {status}). "
+            "This is a database-side problem; nothing was written."
+        )[:_MAX_EXPLANATION]
+    tail = (
+        f"The database reported error code {code}, which this server does not "
+        "recognise."
+        if code
+        else "The database returned no usable detail."
+    )
+    return (
+        f"Supabase rejected the {label} request with HTTP status {status}; "
+        f"nothing was written. {tail}"
+    )[:_MAX_EXPLANATION]
+
+
+def _field_phrase(field: Optional[str]) -> str:
+    """Name a field when the database named one, without inventing one."""
+
+    return f"the '{field}' field" if field else "one of the submitted fields"
+
+
+def _error_code(body: Any) -> Optional[str]:
+    """Read the documented error code from a PostgREST body, if it has one."""
+
+    payload = _error_payload(body)
+    if payload is None:
+        return None
+    code = payload.get("code")
+    if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_]{1,16}", code):
+        return code
+    return None
+
+
+_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]{0,62}"
+#: Where each documented Postgres/PostgREST message states the column it is
+#: about. Only these shapes are read, and a captured name must be a plain
+#: identifier, so an echoed sentence can never become a field name.
+_ERROR_FIELD_PATTERNS = (
+    # PGRST204: "Could not find the 'x' column of 'products' in the schema cache"
+    re.compile(rf"['\"]({_IDENTIFIER})['\"] column"),
+    # 42703 / 23502: 'column "x" of relation "y"' (quoting varies by version)
+    re.compile(rf"\bcolumn ['\"]?({_IDENTIFIER})['\"]?(?= of relation|\b)"),
+    # 23505: "Key (user_id,product_id)=... already exists."
+    re.compile(rf"\bKey \(({_IDENTIFIER}(?:, ?{_IDENTIFIER})*)\)="),
+)
+#: ``products_current_stock_check`` -> ``current_stock``.
+_CHECK_CONSTRAINT = re.compile(rf"constraint ['\"]({_IDENTIFIER})_check['\"]")
+
+
+def _error_payload(body: Any) -> Optional[Dict[str, Any]]:
+    """Decode a bounded PostgREST error body into a dict, or nothing."""
+
+    if isinstance(body, (bytes, bytearray)):
+        text = body.decode("utf-8", errors="replace")
+    elif isinstance(body, str):
+        text = body
+    else:
+        return None
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _error_field(body: Any) -> Optional[str]:
+    """Find the column or field a PostgREST message names, and only that."""
+
+    payload = _error_payload(body)
+    if payload is None:
+        return None
+    for source in (payload.get("message"), payload.get("details")):
+        if not isinstance(source, str):
+            continue
+        for pattern in _ERROR_FIELD_PATTERNS:
+            match = pattern.search(source)
+            if match:
+                names = [n.strip() for n in match.group(1).split(",")]
+                usable = [
+                    n for n in names if re.fullmatch(_IDENTIFIER, n.strip("\"' "))
+                ]
+                if usable:
+                    # A composite key names several columns; the last one is
+                    # the row's own identifier, which is the one to report.
+                    return usable[-1]
+        match = _CHECK_CONSTRAINT.search(source)
+        if match:
+            name = match.group(1)
+            parts = name.split("_")
+            return "_".join(parts[1:]) if len(parts) > 1 else name
+    return None
 
 
 def _validate_user_id(user_id: Any) -> str:
@@ -329,17 +564,23 @@ def _canonical_sales_payloads(
                 # would disagree about the key for the same logical row.
                 payload[name] = sales_channel_label(values.get(name))
                 continue
-            if name not in values:
-                continue
-            value = values[name]
-            if name == "date":
-                value = value.isoformat() if hasattr(value, "isoformat") else str(value)
-            elif name == "units_sold":
-                value = int(value)
-            elif name == "price":
-                value = float(value)
-            elif name == "promotion":
-                value = bool(value)
+            # Every canonical field is emitted on every row, and a field the
+            # source did not state is sent as an explicit null. See
+            # ``_canonical_product_payloads`` for why the key set is uniform.
+            value = values.get(name)
+            if value is not None:
+                if name == "date":
+                    value = (
+                        value.isoformat()
+                        if hasattr(value, "isoformat")
+                        else str(value)
+                    )
+                elif name == "units_sold":
+                    value = int(value)
+                elif name == "price":
+                    value = float(value)
+                elif name == "promotion":
+                    value = bool(value)
             payload[name] = value
         business_key = (
             payload["product_id"],
@@ -484,6 +725,23 @@ def fetch_sales(
 # ---------------------------------------------------------------------------
 
 
+# Canonical product columns the remote schema declares NOT NULL, with the value
+# to send when the source did not state one.
+#
+# `open_order_qty` is `not null default 0` (supabase/migrations/0003 and 0007).
+# A Postgres default applies only when a column is *omitted*, and omitting keys
+# is precisely what PostgREST refuses in a bulk insert -- the whole batch is
+# rejected with "All object keys must match". So the uniform key set has to carry
+# the column's own default instead of an explicit null, which is also what the
+# tenant means by a catalog row that states no open order.
+#
+# The one consequence worth stating: re-importing a catalog CSV that omits the
+# column resets an existing product's open orders to zero, where omitting the key
+# would have left them alone. A file that carries the true figure carries it, and
+# the alternative -- a write the database refuses outright -- helps nobody.
+_PRODUCT_NOT_NULL_DEFAULTS: Dict[str, Any] = {"open_order_qty": 0}
+
+
 def _canonical_product_payloads(
     user_id: str, rows: Sequence[Mapping[str, Any]]
 ) -> List[Dict[str, Any]]:
@@ -530,19 +788,38 @@ def _canonical_product_payloads(
         payload: Dict[str, Any] = {"user_id": user_id}
         for field in PRODUCT_RECORD.fields:
             name = field.canonical_name
-            if name not in values:
-                continue
-            value = values[name]
-            if name == "expected_arrival_date":
-                value = value.isoformat() if hasattr(value, "isoformat") else str(value)
-            elif name in {
-                "current_stock", "lead_time_days", "open_order_qty"
-            }:
-                value = int(value)
-            elif name in {
-                "safety_stock", "reorder_point", "unit_cost", "forecast_error_std"
-            }:
-                value = float(value)
+            # Every canonical field is emitted on every row, so the whole batch
+            # shares one key set. PostgREST rejects a bulk insert whose objects
+            # disagree about their keys ("All object keys must match", HTTP
+            # 400), which a mixed batch of rows -- one product with a supplier,
+            # another without, or a catalog with a row that left a field blank
+            # -- produced for a file that is perfectly valid. An absent optional
+            # value is now sent as an explicit null, which is exactly what the
+            # nullable column already held; the required columns
+            # (product_id, product_name, current_stock) are never null because
+            # canonical validation has already refused the row if they were.
+            value = values.get(name)
+            if value is None and name in _PRODUCT_NOT_NULL_DEFAULTS:
+                # ...except where the column will not accept a null, where the
+                # schema's own default is the only value a uniform key set can
+                # carry. See ``_PRODUCT_NOT_NULL_DEFAULTS``.
+                value = _PRODUCT_NOT_NULL_DEFAULTS[name]
+            if value is not None:
+                if name == "expected_arrival_date":
+                    value = (
+                        value.isoformat()
+                        if hasattr(value, "isoformat")
+                        else str(value)
+                    )
+                elif name in {
+                    "current_stock", "lead_time_days", "open_order_qty"
+                }:
+                    value = int(value)
+                elif name in {
+                    "safety_stock", "reorder_point", "unit_cost",
+                    "forecast_error_std", "unit_price",
+                }:
+                    value = float(value)
             payload[name] = value
         key = (user_id, str(payload["product_id"]))
         if key in seen:

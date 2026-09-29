@@ -2,11 +2,14 @@ import React from 'react';
 import { Search, X } from 'lucide-react';
 import { cn } from '../../lib/utils';
 
-export function Field({ label, hint, error, required, children, className }) {
+// `htmlFor` is optional, so a caller that needs the label tied to its control can
+// say so: the asterisk alone announces nothing to a screen reader, and a field
+// marked required should be required *as a control*, not just in the caption.
+export function Field({ label, hint, error, required, htmlFor, children, className }) {
   return (
     <div className={cn('space-y-1.5', className)}>
       {label && (
-        <label className="label">
+        <label className="label" htmlFor={htmlFor}>
           {label}
           {required && <span className="text-rose-500"> *</span>}
         </label>

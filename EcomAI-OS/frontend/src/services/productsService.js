@@ -5,19 +5,26 @@ import { getSuppliers } from './mock/catalog';
 import { usingApi } from './api/mode';
 import * as api from './api/catalog';
 import { downloadFile, parseCSV } from '../lib/utils';
+import {
+  duplicateProductMessage,
+  duplicateProductsMessage,
+  productImportMessage,
+  validateProductInput,
+} from './productFields';
 
 export async function createProduct(user, payload) {
+  const problem = validateProductInput(payload);
+  if (problem) throw new Error(problem);
   if (usingApi()) return api.createProduct(user, payload);
   await latency(600);
   const db = getDB(user);
-  if (!payload.name?.trim()) throw randomError('Please provide a product name.');
-  if (!payload.productId?.trim()) throw randomError('Please provide a product ID.');
+  const productId = payload.productId.trim();
   const duplicate = db.products.find(
-    (p) => p.id.toLowerCase() === payload.productId.trim().toLowerCase() || p.sku.toLowerCase() === payload.productId.trim().toLowerCase(),
+    (p) => p.id.toLowerCase() === productId.toLowerCase() || p.sku.toLowerCase() === productId.toLowerCase(),
   );
-  if (duplicate) throw randomError('A product with this ID already exists.');
+  if (duplicate) throw new Error(duplicateProductMessage(productId));
   const product = db.addProduct({
-    productId: payload.productId.trim(),
+    productId,
     name: payload.name.trim(),
     category: payload.category || 'Electronics',
     description: payload.description || '',
@@ -93,10 +100,18 @@ export async function validateProductCsv(csvText, user) {
   }
 
   const idx = Object.fromEntries(header.map((h, i) => [h, i]));
-  const known = new Set([...db.products.map((p) => p.id), ...db.products.map((p) => p.sku)]);
+  // Folded, so `p001` is recognised as the same product as `P001` here exactly
+  // as it is on the server. A demo store that disagreed with the api mode about
+  // which ids exist would teach the tenant the wrong rule.
+  const known = new Set(
+    [...db.products.map((p) => p.id), ...db.products.map((p) => p.sku)]
+      .filter(Boolean)
+      .map((id) => String(id).trim().toLowerCase()),
+  );
 
   const errors = [];
   const valid = [];
+  const existing = [];
   const seen = new Set();
   let totalRows = 0;
 
@@ -109,27 +124,45 @@ export async function validateProductCsv(csvText, user) {
     const currentStock = String(row[idx.current_stock] ?? '').trim();
 
     if (!productId) {
-      errors.push({ row: lineNumber, reason: 'Missing product ID.' });
+      errors.push({ row: lineNumber, reason: 'Missing product ID.', category: 'missing_required' });
       continue;
     }
     if (seen.has(productId.toLowerCase())) {
-      errors.push({ row: lineNumber, reason: `Duplicate product ID "${productId}" within the file.` });
+      errors.push({
+        row: lineNumber,
+        reason: `Duplicate product ID "${productId}" within the file.`,
+        category: 'duplicate_in_file',
+      });
       continue;
     }
-    if (known.has(productId)) {
-      errors.push({ row: lineNumber, reason: `Product ID "${productId}" already exists in your catalog.` });
+    if (known.has(productId.toLowerCase())) {
+      // Already in the catalog: reported and skipped, never applied. The row is
+      // listed by id so the tenant can see exactly which products were left
+      // alone rather than inferring it from a smaller count.
+      if (!existing.includes(productId)) existing.push(productId);
+      // The same category the api report uses, so the upload UI tells the tenant
+      // this row was left alone on purpose rather than calling it a bad row.
+      errors.push({ row: lineNumber, reason: duplicateProductMessage(productId), category: 'existing_product' });
       continue;
     }
     if (!productName) {
-      errors.push({ row: lineNumber, reason: 'Missing product name.' });
+      errors.push({ row: lineNumber, reason: 'Missing product name.', category: 'missing_required' });
       continue;
     }
     if (currentStock === '' || Number.isNaN(Number(currentStock)) || Number(currentStock) < 0) {
-      errors.push({ row: lineNumber, reason: `Invalid current stock value "${currentStock}".` });
+      errors.push({
+        row: lineNumber,
+        reason: `Invalid current stock value "${currentStock}".`,
+        category: 'invalid_value',
+      });
       continue;
     }
     if (!Number.isInteger(Number(currentStock))) {
-      errors.push({ row: lineNumber, reason: `Current stock must be a whole number, got "${currentStock}".` });
+      errors.push({
+        row: lineNumber,
+        reason: `Current stock must be a whole number, got "${currentStock}".`,
+        category: 'invalid_value',
+      });
       continue;
     }
     seen.add(productId.toLowerCase());
@@ -153,9 +186,10 @@ export async function validateProductCsv(csvText, user) {
     validRows: valid.length,
     skippedRows: errors.length,
     errors,
+    existingProductIds: existing,
     summary: {
       dups: errors.filter((e) => /duplicate/i.test(e.reason)).length,
-      existing: errors.filter((e) => /already exists/i.test(e.reason)).length,
+      existing: existing.length,
     },
     message:
       errors.length > 0
@@ -167,23 +201,38 @@ export async function validateProductCsv(csvText, user) {
 
 /**
  * Validate, then import the valid rows of a product CSV file.
+ *
+ * Rows naming a product the catalog already has are left out of the commit, so
+ * a re-uploaded file adds what is new and leaves the rest untouched. All three
+ * counts are reported, so a smaller catalog is always explained.
  */
 export async function uploadProductCsv(user, csvText) {
   if (usingApi()) return api.uploadProductsCsv(user, csvText);
   await latency(1000);
   const result = await validateProductCsv(csvText, user);
+  const existing = result.existingProductIds || [];
   if (result.validRows === 0) {
-    throw randomError(result.errors.length ? 'CSV contains invalid rows. ' + result.errors[0].reason : 'CSV contains invalid rows.');
+    throw new Error(
+      existing.length
+        ? `No new products were imported. ${duplicateProductsMessage(existing)}`
+        : 'CSV contains invalid rows. ' + (result.errors[0]?.reason || ''),
+    );
   }
   const db = getDB(user);
   db.importProductRows(result.payload);
+  const failed = result.errors.length - existing.length;
   return {
     ...result,
     ok: true,
-    message:
-      result.errors.length > 0
-        ? `${result.errors.length} row${result.errors.length === 1 ? ' was' : 's were'} skipped during validation. ${result.validRows} valid row${result.validRows === 1 ? ' was' : 's were'} imported.`
-        : `${result.validRows} row${result.validRows === 1 ? '' : 's'} imported successfully.`,
+    newProducts: result.validRows,
+    skippedExisting: existing.length,
+    failed,
+    ingestedRows: result.validRows,
+    message: productImportMessage({
+      newProducts: result.validRows,
+      skipped: existing.length,
+      failed,
+    }),
   };
 }
 

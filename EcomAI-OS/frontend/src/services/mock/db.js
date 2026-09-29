@@ -307,7 +307,25 @@ export class MockUserDB {
         list = [];
         importedByProduct.set(p.id, list);
       }
-      list.push({ date, units: u, channel: row.channel || 'Import', revenue: Math.round(u * p.sellingPrice) });
+      // One pricing rule, the same one the server applies: a row that states
+      // its own price is worth that price, a row that states none falls back to
+      // the product's catalog price, and a row neither of which can price is
+      // stored with no revenue rather than a fabricated zero. Re-pricing every
+      // import at the catalog price would silently discard the prices the
+      // merchant actually sold at.
+      const stated = Number(row.price);
+      const price = Number.isFinite(stated) && String(row.price ?? '').trim() !== ''
+        ? stated
+        : Number(p.sellingPrice) > 0
+          ? Number(p.sellingPrice)
+          : null;
+      list.push({
+        date,
+        units: u,
+        channel: row.channel || 'Import',
+        price,
+        revenue: price === null ? null : Math.round(u * price),
+      });
       total += u;
       if (!dateMin || date < dateMin) dateMin = date;
       if (!dateMax || date > dateMax) dateMax = date;
