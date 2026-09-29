@@ -18,12 +18,13 @@ import {
 import PageHeader from '../components/ui/PageHeader';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
-import { StatusBadge, TrendIndicator } from '../components/ui/Badge';
+import { StatusBadge, TrendIndicator, ForecastStatusBadge } from '../components/ui/Badge';
 import EmptyState from '../components/ui/EmptyState';
 import { LoadingSkeleton, SkeletonChart } from '../components/ui/Skeleton';
 import { DemandChart, StockLineChart } from '../components/charts';
 import { getProduct, getInventoryTimeline } from '../services/inventoryService';
 import { getProductForecast } from '../services/forecastService';
+import { forecastStatus } from '../services/forecastStatus';
 import { placeSimulatedOrder } from '../services/settingsService';
 import { useAuth } from '../context/AuthContext';
 import { useData } from '../context/DataContext';
@@ -140,9 +141,15 @@ export default function ProductDetailPage() {
           reason: `Current inventory (${p.currentStock} units) is above the calculated reorder point (${p.reorderPoint}), and projected demand during lead time (${p.projectedDemandDuringLeadTime} units) is covered.`,
         };
 
+  // With no observed demand there is no trend to report and no forecast total to
+  // quote, so the demand figures are withheld rather than shown as a confident
+  // "0". The product forecast page spells out why.
+  const demand = forecast ? forecastStatus(forecast) : null;
+  const hasDemandForecast = demand ? demand.trendMeaningful : false;
+
   const summaryStats = [
     { label: 'Current Stock', value: formatNumber(p.currentStock), icon: Package, tone: 'bg-brand-50 text-brand-600' },
-    { label: '30-Day Demand Forecast', value: p.forecast30 != null ? formatNumber(p.forecast30) : '—', icon: TrendingUp, tone: 'bg-violet-50 text-violet-600' },
+    { label: '30-Day Demand Forecast', value: p.forecast30 != null && hasDemandForecast ? formatNumber(p.forecast30) : '—', icon: TrendingUp, tone: 'bg-violet-50 text-violet-600' },
     { label: 'Reorder Point', value: formatNumber(p.reorderPoint), icon: ShieldAlert, tone: 'bg-amber-50 text-amber-600' },
     { label: 'Safety Stock', value: formatNumber(p.safetyStock), icon: ShieldCheck, tone: 'bg-emerald-50 text-emerald-600' },
     { label: 'Lead Time', value: `${p.leadTimeDays} days`, icon: Timer, tone: 'bg-sky-50 text-sky-600' },
@@ -167,9 +174,18 @@ export default function ProductDetailPage() {
         }
         subtitle="Product-level inventory intelligence and demand outlook."
         actions={
-          <Button variant="secondary" icon={Pencil} onClick={() => navigate('/app/products')}>
-            Edit Product
-          </Button>
+          <>
+            <Button
+              variant="secondary"
+              icon={TrendingUp}
+              onClick={() => navigate(`/app/products/${p.id}/forecast`)}
+            >
+              View Forecast
+            </Button>
+            <Button variant="secondary" icon={Pencil} onClick={() => navigate('/app/products')}>
+              Edit Product
+            </Button>
+          </>
         }
       />
 
@@ -203,10 +219,16 @@ export default function ProductDetailPage() {
               formatter={(v) => formatNumber(v) + ' units'}
               footer={
                 <div className="flex flex-wrap items-center gap-3 text-xs text-slate-500">
-                  <TrendIndicator trend={forecast.trend} />
+                  {demand?.trendMeaningful ? (
+                    <TrendIndicator trend={forecast.trend} />
+                  ) : (
+                    <ForecastStatusBadge status={demand} />
+                  )}
                   <span>
                     30-Day Demand Forecast total:{' '}
-                    <span className="tnum font-bold text-slate-800">{formatNumber(forecast.total)} units</span>
+                    <span className="tnum font-bold text-slate-800">
+                      {hasDemandForecast ? `${formatNumber(forecast.total)} units` : 'Not available'}
+                    </span>
                   </span>
                   <span>
                     Peak: <span className="font-semibold">{formatDate(forecast.peakDate)}</span> (

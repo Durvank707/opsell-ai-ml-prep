@@ -4,12 +4,13 @@ import { TrendingUp, Info, Sparkles, Package, ArrowUpRight, ArrowDownRight, Aler
 import PageHeader from '../components/ui/PageHeader';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
-import { TrendIndicator } from '../components/ui/Badge';
+import { TrendIndicator, ForecastStatusBadge } from '../components/ui/Badge';
 import EmptyState from '../components/ui/EmptyState';
 import { SearchInput, Select } from '../components/ui/form';
 import { LoadingSkeleton, SkeletonChart } from '../components/ui/Skeleton';
 import { DemandChart } from '../components/charts';
 import { getForecastOverview, generatePortfolioForecast } from '../services/forecastService';
+import { portfolioRowStatus } from '../services/forecastStatus';
 import { useAuth } from '../context/AuthContext';
 import { useData } from '../context/DataContext';
 import { useToast } from '../context/ToastContext';
@@ -224,7 +225,9 @@ export default function ForecastPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {overview.rows.map((r) => (
+                  {overview.rows.map((r) => {
+                    const rowStatus = portfolioRowStatus(r);
+                    return (
                     <tr
                       key={r.id}
                       onClick={() => navigate(`/app/products/${r.id}`)}
@@ -249,10 +252,15 @@ export default function ForecastPage() {
                         </span>
                       </td>
                       <td className="table-td">
-                        <TrendIndicator trend={r.trend} />
+                        {rowStatus.trendMeaningful ? (
+                          <TrendIndicator trend={r.trend} />
+                        ) : (
+                          <ForecastStatusBadge status={rowStatus} />
+                        )}
                       </td>
                     </tr>
-                  ))}
+                  );
+                  })}
                 </tbody>
               </table>
             </div>

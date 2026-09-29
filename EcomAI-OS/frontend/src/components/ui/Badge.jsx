@@ -73,6 +73,19 @@ export function TrendIndicator({ trend, className }) {
   );
 }
 
+/**
+ * How trustworthy a forecast is, e.g. "No sales history" instead of a trend
+ * that was never calculated. Paired with `TrendIndicator`, which stays reserved
+ * for forecasts that have observed demand behind them.
+ */
+export function ForecastStatusBadge({ status, className }) {
+  return (
+    <Badge tone={status?.tone || 'neutral'} dot className={className}>
+      {status?.label || '—'}
+    </Badge>
+  );
+}
+
 export const SEVERITY_TONE = {
   info: 'blue',
   success: 'green',

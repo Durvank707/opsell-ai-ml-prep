@@ -96,6 +96,10 @@ export function computeProductForecastSync(db, productId, horizon) {
     peakUnits: peak.forecast,
     trend,
     growthPct: Math.round(growthPct * 10) / 10,
+    // The in-browser projection is a mean-and-drift baseline, not the trained
+    // model, and the page says so rather than leaving the model row blank.
+    fallbackUsed: 'baseline',
+    modelVersion: null,
     generatedAt: new Date().toISOString(),
   };
   db.forecasts.set(cacheKey, result);
@@ -173,7 +177,57 @@ export async function getProductForecast(user, productId, horizon = 30) {
   if (usingApi()) return api.getProductForecast(user, productId, horizon);
   await latency(450);
   const db = getDB(user);
-  return computeProductForecastSync(db, productId, horizon);
+  try {
+    return computeProductForecastSync(db, productId, horizon);
+  } catch (e) {
+    // A product with no usable history is not an error on the API: it answers
+    // with a labeled cold-start payload (no points, cold_start eligibility and a
+    // warning) so the page can explain itself. Mirror that here rather than
+    // leaving the demo on a bare "not enough data" failure.
+    if (!/not enough historical sales data/i.test(e?.message || '')) throw e;
+    return coldStartForecast(db, productId, horizon);
+  }
+}
+
+/**
+ * The zero-history forecast, shaped and worded exactly as the API returns it.
+ * Copy is taken from the server's eligibility tiers (backend/eligibility.py) so
+ * the demo and a real tenant read the same way.
+ */
+function coldStartForecast(db, productId, horizon) {
+  const p = db.products.find((x) => x.id === productId);
+  if (!p) throw randomError('Product not found.');
+  const description =
+    'No ML forecast is generated because the product does not yet have enough sales history. A baseline estimate is shown instead while history accumulates.';
+  return {
+    productId,
+    productName: p.name,
+    category: p.category,
+    horizon,
+    points: [],
+    actuals: [],
+    total: 0,
+    avgDaily: 0,
+    peakDate: null,
+    peakUnits: null,
+    trend: 'stable',
+    growthPct: 0,
+    fallbackUsed: 'baseline',
+    modelVersion: null,
+    eligibility: {
+      eligible: false,
+      tier: 'cold_start',
+      tier_label: 'Cold start',
+      confidence_label: 'insufficient_history',
+      description,
+      reasons: [
+        'Required fields are missing, so ML cannot run. A baseline is used instead.',
+        description,
+      ],
+    },
+    warning: `Required fields are missing, so ML cannot run. A baseline is used instead. ${description}`,
+    mlUnavailable: false,
+  };
 }
 
 export async function getForecastOverview(user, { horizon = 30, category = null, productId = null } = {}) {

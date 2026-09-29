@@ -16,6 +16,7 @@ const DashboardPage = lazy(() => import('./pages/DashboardPage'));
 const InventoryPage = lazy(() => import('./pages/InventoryPage'));
 const ProductsPage = lazy(() => import('./pages/ProductsPage'));
 const ProductDetailPage = lazy(() => import('./pages/ProductDetailPage'));
+const ProductForecastPage = lazy(() => import('./pages/ProductForecastPage'));
 const SalesDataPage = lazy(() => import('./pages/SalesDataPage'));
 const ForecastPage = lazy(() => import('./pages/ForecastPage'));
 const RecommendationsPage = lazy(() => import('./pages/RecommendationsPage'));
@@ -108,6 +109,7 @@ export default function App() {
                     <Route path="inventory" element={<InventoryPage />} />
                     <Route path="products" element={<ProductsPage />} />
                     <Route path="products/:productId" element={<ProductDetailPage />} />
+                    <Route path="products/:productId/forecast" element={<ProductForecastPage />} />
                     <Route path="sales" element={<SalesDataPage />} />
                     <Route path="forecast" element={<ForecastPage />} />
                     <Route path="recommendations" element={<RecommendationsPage />} />
