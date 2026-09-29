@@ -1071,6 +1071,9 @@ async def recommendations_v2(
 class V2BacktestRequest(BaseModel):
     """Historical policy backtest parameters for one of the tenant's products."""
 
+    # One product, always. A list, a range, or the whole catalog is a 422
+    # rather than a run against whichever product happened to be first, so the
+    # response can never claim to cover more than it actually replayed.
     product_id: str = Field(..., min_length=1)
     start_date: Optional[str] = None
     end_date: Optional[str] = None
@@ -1078,6 +1081,10 @@ class V2BacktestRequest(BaseModel):
     ordering_cost_per_order: float = Field(default=500.0, ge=0)
     stockout_cost_per_unit: float = Field(default=1000.0, ge=0)
     inventory_days: int = Field(default=5, ge=1, le=180)
+    # Which replenishment policy to replay. Resolved against the known keys
+    # server-side; an unknown key is a 400, not a silent fallback.
+    policy: str = Field(default="current", min_length=1)
+    policy_params: Optional[Dict[str, Any]] = None
 
 
 @router.post("/simulation/backtest")
@@ -1101,6 +1108,8 @@ async def simulation_backtest_v2(
             ordering_cost_per_order=body.ordering_cost_per_order,
             stockout_cost_per_unit=body.stockout_cost_per_unit,
             inventory_days=body.inventory_days,
+            policy=body.policy,
+            policy_params=body.policy_params,
         )
     except Exception as exc:  # noqa: BLE001 - mapped to an honest status below
         raise _intelligence_error(exc) from exc
@@ -1108,6 +1117,7 @@ async def simulation_backtest_v2(
         "start_date": result["start_date"],
         "end_date": result["end_date"],
         "duration_days": result["duration_days"],
+        "policy": result["policy"]["key"],
         "recommended_strategy": result["cost_comparison"]["recommended_strategy"],
     })
     return result

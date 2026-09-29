@@ -12,6 +12,7 @@ import { useAuth } from '../context/AuthContext';
 import { useData } from '../context/DataContext';
 import { useToast } from '../context/ToastContext';
 import { LoadingSkeleton } from '../components/ui/Skeleton';
+import { SIMULATION_DISCLAIMER } from '../services/simulationPolicy';
 
 export default function SimulationPage() {
   const { user } = useAuth();
@@ -84,7 +85,10 @@ export default function SimulationPage() {
   if (loadingProducts || !rangeReady) {
     return (
       <div className="space-y-5">
-        <PageHeader title="Simulation" subtitle="Test inventory policies against historical demand." />
+        <PageHeader
+          title="Simulation"
+          subtitle="Replay historical sales and see how an inventory policy would have performed."
+        />
         <LoadingSkeleton rows={3} />
       </div>
     );
@@ -93,12 +97,15 @@ export default function SimulationPage() {
   if (products.length === 0) {
     return (
       <div className="space-y-5">
-        <PageHeader title="Simulation" subtitle="Test inventory policies against historical demand." />
+        <PageHeader
+          title="Simulation"
+          subtitle="Replay historical sales and see how an inventory policy would have performed."
+        />
         <Card className="py-16">
           <EmptyState
             icon={FlaskConical}
             title="Add products to simulate"
-            description="Simulation evaluates your inventory policies against real demand history. Add products and sales data to get started."
+            description="Simulation evaluates an inventory policy against real demand history. Add products and sales data to get started."
             actionLabel="Add Products"
             onAction={() => window.location.assign('/app/products')}
           />
@@ -107,12 +114,20 @@ export default function SimulationPage() {
     );
   }
 
+  // The engine replays one product at a time, so the run reads as one product's
+  // own history rather than a catalog-wide sweep it never performs.
+  const runningProduct =
+    products.find((p) => p.id === lastConfig?.productIds?.[0])?.name || 'the selected product';
+
   return (
     <div className="space-y-5">
       <PageHeader
         title="Simulation"
-        subtitle="Compare inventory policies and see the impact on service level, stockouts and cost."
+        subtitle="Replay historical sales and see how an inventory policy would have performed."
       />
+      <p className="rounded-lg bg-slate-100 px-3 py-2 text-xs text-slate-600">
+        {SIMULATION_DISCLAIMER}
+      </p>
 
       <div className="grid gap-5 xl:grid-cols-5">
         <div className="xl:col-span-2">
@@ -122,7 +137,9 @@ export default function SimulationPage() {
               dataRange={dataRange}
               onRun={handleRun}
               running={running}
-              progressStep={running ? 'Evaluating demand, stockouts and costs across the selected period…' : ''}
+              progressStep={
+                running ? 'Replaying demand, reorders and arrivals day by day…' : ''
+              }
             />
           </div>
         </div>
@@ -135,8 +152,8 @@ export default function SimulationPage() {
               <span className="h-10 w-10 animate-spin rounded-full border-4 border-slate-200 border-t-brand-600" />
               <h3 className="mt-4 text-base font-bold text-slate-900">Running simulation…</h3>
               <p className="mt-1 max-w-sm text-sm text-slate-500">
-                Replaying {lastConfig?.productSelection === 'all' ? 'all' : 'selected'} products against {lastConfig?.startDate} →{' '}
-                {lastConfig?.endDate}. This usually takes a few seconds.
+                Replaying {runningProduct} against its own recorded demand. This usually
+                takes a few seconds.
               </p>
             </Card>
           ) : (
@@ -145,9 +162,11 @@ export default function SimulationPage() {
                 <FlaskConical className="h-7 w-7" />
               </div>
               <h3 className="mt-4 text-base font-bold text-slate-900">Ready to simulate</h3>
-              <p className="mt-1 max-w-sm text-sm text-slate-500">
-                Configure an inventory policy on the left and run it against historical demand. Results compare current,
-                conservative and aggressive policies automatically.
+              <p className="mt-1 max-w-md text-sm text-slate-500">
+                Choose a product on the left, pick how its inventory should be managed,
+                and replay its historical sales. The results show how the policy would
+                have performed, how the three standard policies compare, and how the two
+                forecasting methods compare.
               </p>
             </Card>
           )}

@@ -1,16 +1,20 @@
-import React, { useState } from 'react';
-import { Play, Boxes } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { Play, FlaskConical, Info } from 'lucide-react';
 import Button from './ui/Button';
 import Card from './ui/Card';
-import { Field, Input, Select } from './ui/form';
+import ProductCombobox from './ProductCombobox';
+import { Field, Input } from './ui/form';
 import { cn } from '../lib/utils';
-
-const POLICIES = [
-  { key: 'current', label: 'Current Policy', desc: 'Your live safety stock & reorder settings' },
-  { key: 'conservative', label: 'Conservative Policy', desc: 'Higher safety stock — fewer stockouts, more holding cost' },
-  { key: 'aggressive', label: 'Aggressive Policy', desc: 'Leaner stock — lower cost, higher stockout risk' },
-  { key: 'custom', label: 'Custom Policy', desc: 'Define your own safety stock and reorder levels' },
-];
+import {
+  CUSTOM_POLICY_FIELDS,
+  CUSTOM_POLICY_KEY,
+  FORECAST_COMPARISON_NOTE,
+  FORECAST_METHODS,
+  INVENTORY_POLICIES,
+  SIMULATION_DISCLAIMER,
+  SIMULATION_SCOPE_NOTE,
+  customPolicyParams,
+} from '../services/simulationPolicy';
 
 // The window the form previews when the user has not chosen one.
 //
@@ -43,133 +47,128 @@ function defaultWindow(dataRange) {
   return { start: toIso(start), end: toIso(end) };
 }
 
-export default function SimulationConfig({ products, dataRange = null, onRun, running = false, progressStep = '' }) {
-  const fallback = defaultWindow(null);
-  const preview = defaultWindow(dataRange);
+function Step({ number, title, description, children }) {
+  return (
+    <div className="space-y-3">
+      <div className="flex items-start gap-3">
+        <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-brand-600 text-xs font-bold text-white">
+          {number}
+        </span>
+        <div>
+          <p className="text-sm font-bold text-slate-900">{title}</p>
+          {description && <p className="mt-0.5 text-xs text-slate-500">{description}</p>}
+        </div>
+      </div>
+      <div className="pl-9">{children}</div>
+    </div>
+  );
+}
+
+export default function SimulationConfig({
+  products,
+  dataRange = null,
+  onRun,
+  running = false,
+  progressStep = '',
+}) {
+  const fallback = useMemo(() => defaultWindow(null), []);
+  const preview = useMemo(() => defaultWindow(dataRange), [dataRange]);
   const defaultStart = preview.start || fallback.start;
   const defaultEnd = preview.end || fallback.end;
 
-  const [config, setConfig] = useState({
-    startDate: defaultStart,
-    endDate: defaultEnd,
-    // Whether the period is still the preview above. While it is, no dates are
-    // sent and the server picks the window from this tenant's own history,
-    // which keeps the two from drifting apart.
-    periodIsDefault: true,
-    // A backtest compares two replenishment policies over one product's own
-    // recorded demand, so a single product is the scope that comparison is
-    // actually defined for. "All Products" stays selectable and says plainly
-    // that it cannot be simulated rather than quietly running one product and
-    // labelling it the catalog.
-    productSelection: 'selected',
-    productIds: products.length > 0 ? [products[0].id] : [],
-    policy: 'current',
-    customParams: {
-      safetyStock: '',
-      leadTime: '',
-      reorderPoint: '',
-      orderQuantity: '',
-    },
-    orderingCost: 500,
-    stockoutCost: 1000,
-    packSize: 1,
-  });
+  const [productId, setProductId] = useState(products.length > 0 ? products[0].id : '');
+  const [policy, setPolicy] = useState('current');
+  const [customValues, setCustomValues] = useState(() =>
+    Object.fromEntries(CUSTOM_POLICY_FIELDS.map((field) => [field.name, ''])),
+  );
+  const [customError, setCustomError] = useState(null);
+  const [startDate, setStartDate] = useState(defaultStart);
+  const [endDate, setEndDate] = useState(defaultEnd);
+  const [periodIsDefault, setPeriodIsDefault] = useState(true);
+  const [orderingCost, setOrderingCost] = useState(500);
+  const [stockoutCost, setStockoutCost] = useState(1000);
 
-  const set = (patch) => setConfig((c) => ({ ...c, ...patch }));
+  const selectedProduct = products.find((p) => p.id === productId) || null;
 
-  const toggleProduct = (id) => {
-    setConfig((c) => ({
-      ...c,
-      productIds: c.productIds.includes(id)
-        ? c.productIds.filter((x) => x !== id)
-        : [...c.productIds, id],
-    }));
+  const handleRun = () => {
+    if (policy === CUSTOM_POLICY_KEY) {
+      const { params, error } = customPolicyParams(customValues);
+      if (error) {
+        setCustomError(error);
+        return;
+      }
+      setCustomError(null);
+      onRun({
+        productIds: productId ? [productId] : [],
+        policy,
+        policyParams: Object.keys(params).length ? params : null,
+        startDate,
+        endDate,
+        periodIsDefault,
+        orderingCost: Number(orderingCost) || 0,
+        stockoutCost: Number(stockoutCost) || 0,
+      });
+      return;
+    }
+
+    onRun({
+      productIds: productId ? [productId] : [],
+      policy,
+      policyParams: null,
+      startDate,
+      endDate,
+      periodIsDefault,
+      orderingCost: Number(orderingCost) || 0,
+      stockoutCost: Number(stockoutCost) || 0,
+    });
   };
 
   return (
     <Card
-      title="Simulation Settings"
-      subtitle="Test inventory policies against historical demand before applying them."
+      title="Set up a simulation"
+      subtitle="Replay historical sales and see how an inventory policy would have performed."
     >
-      <div className="space-y-5">
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="Historical Period — Start Date">
-            <Input
-              type="date"
-              value={config.startDate}
-              max={config.endDate}
-              onChange={(e) => set({ startDate: e.target.value, periodIsDefault: false })}
-            />
-          </Field>
-          <Field label="End Date">
-            <Input
-              type="date"
-              value={config.endDate}
-              min={config.startDate}
-              onChange={(e) => set({ endDate: e.target.value, periodIsDefault: false })}
-            />
-          </Field>
-        </div>
-
-        <div>
-          <p className="label">Products</p>
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              onClick={() => set({ productSelection: 'all' })}
-              className={cn(
-                'rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors',
-                config.productSelection === 'all'
-                  ? 'border-brand-600 bg-brand-600 text-white'
-                  : 'border-slate-300 text-slate-600 hover:bg-slate-50',
-              )}
-            >
-              All Products ({products.length})
-            </button>
-            <button
-              onClick={() => set({ productSelection: 'selected' })}
-              className={cn(
-                'rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors',
-                config.productSelection === 'selected'
-                  ? 'border-brand-600 bg-brand-600 text-white'
-                  : 'border-slate-300 text-slate-600 hover:bg-slate-50',
-              )}
-            >
-              Selected Products
-              {config.productIds.length > 0 && ` (${config.productIds.length})`}
-            </button>
-          </div>
-          {config.productSelection === 'selected' && (
-            <div className="mt-3 max-h-40 overflow-y-auto rounded-xl border border-slate-200 p-2">
-              <div className="flex flex-wrap gap-1.5">
-                {products.map((p) => (
-                  <button
-                    key={p.id}
-                    onClick={() => toggleProduct(p.id)}
-                    className={cn(
-                      'flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors',
-                      config.productIds.includes(p.id)
-                        ? 'border-brand-300 bg-brand-50 text-brand-700'
-                        : 'border-slate-200 text-slate-500 hover:bg-slate-50',
-                    )}
-                  >
-                    <Boxes className="h-3 w-3" />
-                    {p.name}
-                  </button>
-                ))}
-              </div>
-            </div>
+      <div className="space-y-6">
+        <Step
+          number="1"
+          title="Product to simulate"
+          description="Simulation evaluates one product at a time."
+        >
+          {/* A searchable box rather than a select: the catalog is hundreds of
+              products long, and the run is scoped to exactly one of them, so
+              finding that one is the whole job of this field. It holds the same
+              product id the API is sent. */}
+          <ProductCombobox
+            id="sim-product"
+            label="Product"
+            hint={SIMULATION_SCOPE_NOTE}
+            products={products}
+            value={productId}
+            onChange={setProductId}
+          />
+          {selectedProduct && (
+            <p className="mt-2 text-xs text-slate-400">
+              {selectedProduct.category ? `${selectedProduct.category} · ` : ''}
+              Lead time {selectedProduct.leadTimeDays ?? '—'} days
+              {selectedProduct.currentStock !== undefined
+                ? ` · ${selectedProduct.currentStock} units on hand`
+                : ''}
+            </p>
           )}
-        </div>
+        </Step>
 
-        <div>
-          <p className="label">Inventory Policy</p>
+        <Step
+          number="2"
+          title="Inventory policy"
+          description="How should inventory be managed?"
+        >
           <div className="space-y-2">
-            {POLICIES.map((policy) => (
+            {INVENTORY_POLICIES.map((option) => (
               <label
-                key={policy.key}
+                key={option.key}
                 className={cn(
                   'flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition-colors',
-                  config.policy === policy.key
+                  policy === option.key
                     ? 'border-brand-400 bg-brand-50/60 ring-1 ring-brand-200'
                     : 'border-slate-200 hover:border-slate-300',
                 )}
@@ -178,91 +177,189 @@ export default function SimulationConfig({ products, dataRange = null, onRun, ru
                   type="radio"
                   name="policy"
                   className="mt-0.5 accent-brand-600"
-                  checked={config.policy === policy.key}
-                  onChange={() => set({ policy: policy.key })}
+                  checked={policy === option.key}
+                  onChange={() => setPolicy(option.key)}
                 />
                 <span>
-                  <span className="block text-sm font-semibold text-slate-800">{policy.label}</span>
-                  <span className="block text-xs text-slate-500">{policy.desc}</span>
+                  <span className="block text-sm font-semibold text-slate-800">
+                    {option.label}
+                  </span>
+                  <span className="block text-xs text-slate-500">{option.description}</span>
                 </span>
               </label>
             ))}
           </div>
-        </div>
 
-        {config.policy === 'custom' && (
-          <div className="grid grid-cols-2 gap-3 rounded-xl border border-brand-100 bg-brand-50/40 p-4">
-            <Field label="Safety Stock">
+          {policy === CUSTOM_POLICY_KEY && (
+            <div className="mt-3 space-y-3 rounded-xl border border-brand-100 bg-brand-50/40 p-4">
+              <p className="flex items-start gap-2 text-xs text-slate-500">
+                <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-brand-500" />
+                These are the only policy parameters the simulator applies. Leave a
+                field blank to use the current policy's own value.
+              </p>
+              <div className="grid gap-3 sm:grid-cols-2">
+                {CUSTOM_POLICY_FIELDS.map((field) => (
+                  <Field
+                    key={field.name}
+                    label={field.label}
+                    hint={field.hint}
+                    htmlFor={`sim-custom-${field.name}`}
+                  >
+                    <Input
+                      id={`sim-custom-${field.name}`}
+                      type="number"
+                      min={field.min}
+                      step={field.integer ? 1 : 0.5}
+                      value={customValues[field.name]}
+                      placeholder={field.placeholder}
+                      onChange={(e) => {
+                        // A number input reports text it cannot represent as an
+                        // empty value, which is indistinguishable from a field the
+                        // user left blank — and blank means "use the current
+                        // policy's value". Without this, pasted nonsense would
+                        // quietly run a different policy than the one on screen.
+                        const badInput = e.target.value === '' && e.target.validity?.badInput;
+                        setCustomError(
+                          badInput ? `${field.label.replace(/\s*\(.*\)$/, '')} must be a number.` : null,
+                        );
+                        setCustomValues((values) => ({
+                          ...values,
+                          [field.name]: e.target.value,
+                        }));
+                      }}
+                    />
+                  </Field>
+                ))}
+              </div>
+              {customError && <p className="text-xs font-semibold text-rose-600">{customError}</p>}
+            </div>
+          )}
+        </Step>
+
+        <Step
+          number="3"
+          title="Historical period to replay"
+          description="The window of recorded sales the simulation replays."
+        >
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label="Start date" htmlFor="sim-start">
               <Input
-                type="number"
-                min="0"
-                value={config.customParams.safetyStock}
-                onChange={(e) => set({ customParams: { ...config.customParams, safetyStock: e.target.value } })}
-                placeholder="Units"
+                id="sim-start"
+                type="date"
+                value={startDate || ''}
+                max={endDate || undefined}
+                onChange={(e) => {
+                  setStartDate(e.target.value);
+                  setPeriodIsDefault(false);
+                }}
               />
             </Field>
-            <Field label="Lead Time">
+            <Field label="End date" htmlFor="sim-end">
               <Input
-                type="number"
-                min="1"
-                value={config.customParams.leadTime}
-                onChange={(e) => set({ customParams: { ...config.customParams, leadTime: e.target.value } })}
-                placeholder="Days"
-              />
-            </Field>
-            <Field label="Reorder Point">
-              <Input
-                type="number"
-                min="0"
-                value={config.customParams.reorderPoint}
-                onChange={(e) => set({ customParams: { ...config.customParams, reorderPoint: e.target.value } })}
-                placeholder="Units"
-              />
-            </Field>
-            <Field label="Order Quantity">
-              <Input
-                type="number"
-                min="1"
-                value={config.customParams.orderQuantity}
-                onChange={(e) => set({ customParams: { ...config.customParams, orderQuantity: e.target.value } })}
-                placeholder="Units"
+                id="sim-end"
+                type="date"
+                value={endDate || ''}
+                min={startDate || undefined}
+                onChange={(e) => {
+                  setEndDate(e.target.value);
+                  setPeriodIsDefault(false);
+                }}
               />
             </Field>
           </div>
-        )}
+          <p className="mt-2 text-xs text-slate-400">
+            {periodIsDefault
+              ? 'Default period: the most recent recorded sales window. Leave it untouched to let EcomAI-OS pick the range from your history.'
+              : 'A custom period. The simulation needs some recorded history before the start date to estimate an opening stock.'}
+          </p>
+        </Step>
 
-        <div className="grid gap-4 sm:grid-cols-3">
-          <Field label="Always use Current Policy" className="hidden" />
-          <Field label="Ordering Cost (₹/order)">
-            <Input
-              type="number"
-              min="0"
-              value={config.orderingCost}
-              onChange={(e) => set({ orderingCost: Number(e.target.value) })}
-            />
-          </Field>
-          <Field label="Stockout Cost (₹/unit)">
-            <Input
-              type="number"
-              min="0"
-              value={config.stockoutCost}
-              onChange={(e) => set({ stockoutCost: Number(e.target.value) })}
-            />
-          </Field>
-          <Field label="Order Pack Size">
-            <Input type="number" min="1" value={config.packSize} onChange={(e) => set({ packSize: Number(e.target.value) })} />
-          </Field>
+        <Step
+          number="4"
+          title="Cost assumptions (optional)"
+          description="Used only to price the simulated inventory and stockouts."
+        >
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field
+              label="Ordering cost (₹ per order)"
+              htmlFor="sim-ordering-cost"
+              hint="The fixed cost of placing one purchase order — admin, freight, handling."
+            >
+              <Input
+                id="sim-ordering-cost"
+                type="number"
+                min="0"
+                value={orderingCost}
+                onChange={(e) => setOrderingCost(Number(e.target.value))}
+              />
+            </Field>
+            <Field
+              label="Stockout cost (₹ per unit)"
+              htmlFor="sim-stockout-cost"
+              hint="The margin lost when a unit of demand cannot be fulfilled from stock."
+            >
+              <Input
+                id="sim-stockout-cost"
+                type="number"
+                min="0"
+                value={stockoutCost}
+                onChange={(e) => setStockoutCost(Number(e.target.value))}
+              />
+            </Field>
+          </div>
+        </Step>
+
+        <Step number="5" title="Run the simulation">
+          <Button
+            onClick={handleRun}
+            loading={running}
+            icon={running ? undefined : Play}
+            disabled={!productId}
+            className="w-full sm:w-auto"
+          >
+            {running ? 'Running simulation…' : 'Run Simulation'}
+          </Button>
+          <p className="mt-2 text-xs text-slate-500">
+            Replay historical sales and see how this policy would have performed.
+          </p>
+          {running && progressStep && <p className="mt-1 text-xs text-slate-400">{progressStep}</p>}
+        </Step>
+
+        {/* A different question from the policy above, so it gets its own
+            heading rather than sitting inside the policy step. */}
+        <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+          <div className="flex items-start gap-3">
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white text-brand-600 ring-1 ring-slate-200">
+              <FlaskConical className="h-4 w-4" />
+            </span>
+            <div>
+              <p className="text-sm font-bold text-slate-900">
+                Forecast comparison: which forecast performed better?
+              </p>
+              <p className="mt-0.5 text-xs text-slate-500">{FORECAST_COMPARISON_NOTE}</p>
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {FORECAST_METHODS.map((method) => (
+                  <span
+                    key={method.key}
+                    className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600"
+                    title={method.description}
+                  >
+                    {method.label}
+                  </span>
+                ))}
+              </div>
+              <p className="mt-2 text-xs text-slate-400">
+                This compares forecasting methods, and is separate from the policy you
+                choose above. It runs automatically with every simulation.
+              </p>
+            </div>
+          </div>
         </div>
 
-        <Button
-          onClick={() => onRun(config)}
-          loading={running}
-          icon={running ? undefined : Play}
-          className="w-full sm:w-auto"
-        >
-          {running ? 'Running simulation…' : 'Run Simulation'}
-        </Button>
-        {running && progressStep && <p className="text-xs text-slate-500">{progressStep}</p>}
+        <p className="flex items-start gap-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          {SIMULATION_DISCLAIMER}
+        </p>
       </div>
     </Card>
   );

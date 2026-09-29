@@ -2165,28 +2165,68 @@ class TenantWorkspace:
         ordering_cost_per_order: float = 500.0,
         stockout_cost_per_unit: float = 1000.0,
         inventory_days: int = 5,
+        policy: str = "current",
+        policy_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Historical policy backtest for one of this tenant's products.
+        """Historical backtest for one of this tenant's products.
+
+        One product at a time. A portfolio backtest would compare a *sum* of
+        stockouts against a *sum* of stockouts, which is not the same question
+        a per-product answer gives, so the scope is deliberately one product and
+        the response says so in ``scope``.
 
         Reuses the shared simulation engine unchanged; only the *input data*
         differs from V1 — it is this tenant's own sales history and this
-        tenant's own error spread, never the global CSV. The comparison is
-        therefore a like-for-like test of the XGBoost policy against a moving
-        average baseline on the customer's own demand.
+        tenant's own error spread, never the global CSV.
+
+        Two independent comparisons come out of one run, over the same product
+        and the same days:
+
+        * **Policy** — the same XGBoost forecast replayed under each standard
+          policy. The forecast is identical across those replays, so the only
+          difference between their numbers is the policy.
+        * **Forecasting method** — the selected policy replayed once per method.
+          Same product, same days, same starting stock, same policy, so the
+          only difference is how demand was forecast.
+
+        The forecast is prepared once and replayed for every combination, so a
+        policy comparison costs one XGBoost pass rather than one per policy.
         """
 
         import pandas as pd
 
         from src.inventory.config import prepare_product_inventory_config
         from src.inventory.simulation import (
-            run_backtest,
-            run_baseline_backtest,
+            prepare_backtest_forecast,
+            run_policy_replay,
         )
-        from src.evaluation.metrics import compare_inventory_strategies
+        from src.inventory.policy_profiles import (
+            COMPARABLE_POLICY_KEYS,
+            describe_custom_fields,
+            describe_profiles,
+            get_profile,
+            policy_keys,
+        )
+        from src.evaluation.metrics import (
+            calculate_inventory_metrics,
+            compare_inventory_strategies,
+        )
         from backend.services import MODEL_FEATURES
 
         self._check_product(product_id)
         product = self.products[product_id]
+
+        # Resolved before the model is touched so an unusable policy is refused
+        # immediately rather than after a full forecast pass.
+        profile = get_profile(policy)
+        custom = dict(policy_params or {})
+        if custom and not profile.accepts_custom:
+            raise ValueError(
+                f"'{profile.key}' is a fixed policy and takes no custom "
+                "parameters. Choose the custom policy to set safety_stock or "
+                "coverage_days."
+            )
+
         # The backtest simulates one product's inventory day by day, so it needs
         # the combined daily demand series, not the per-channel records.
         history = self.daily_history_for(product_id)
@@ -2238,35 +2278,103 @@ class TenantWorkspace:
         from backend.main import get_service
 
         model = get_service().model
-        xgb_results = run_backtest(
+        starting_stock = config["starting_stock"]
+        base_safety_stock = config["safety_stock"]
+
+        # One forecast pass, then one inventory replay per (method, policy).
+        # The forecast is a function of the recorded history alone, so every
+        # replay below sees an identical demand series and the differences
+        # between their results are attributable to the policy or the method
+        # and nothing else.
+        days = prepare_backtest_forecast(
             product_history=frame,
             start_date=backtest_start,
             end_date=backtest_end,
-            starting_stock=config["starting_stock"],
             model=model,
             model_features=MODEL_FEATURES,
-            safety_stock=config["safety_stock"],
             lead_time_days=lead_time_days,
         )
-        baseline_results = run_baseline_backtest(
-            product_history=frame,
-            start_date=backtest_start,
-            end_date=backtest_end,
-            starting_stock=config["starting_stock"],
-            safety_stock=config["safety_stock"],
-            lead_time_days=lead_time_days,
+
+        def replay(method: str, policy_key: str, policy_custom: Optional[Dict[str, Any]] = None):
+            return run_policy_replay(
+                days,
+                starting_stock=starting_stock,
+                safety_stock=base_safety_stock,
+                lead_time_days=lead_time_days,
+                profile=policy_key,
+                custom=policy_custom,
+                method=method,
+            )
+
+        # The two method arms both run under the *selected* policy, so the
+        # forecasting comparison isolates the forecasting method.
+        xgb_results = replay("xgboost", profile.key, custom)
+        baseline_results = replay("baseline", profile.key, custom)
+
+        cost_kwargs = dict(
+            unit_cost=float(product.unit_cost or 0.0),
+            holding_cost_rate=holding_cost_rate,
+            ordering_cost_per_order=ordering_cost_per_order,
+            stockout_cost_per_unit=stockout_cost_per_unit,
         )
+        xgb_metrics = calculate_inventory_metrics(xgb_results, **cost_kwargs)
+        baseline_metrics = calculate_inventory_metrics(baseline_results, **cost_kwargs)
 
         comparison = compare_inventory_strategies(
             strategy_a_name="xgboost",
             strategy_a_results=xgb_results,
             strategy_b_name="baseline",
             strategy_b_results=baseline_results,
-            unit_cost=float(product.unit_cost or 0.0),
-            holding_cost_rate=holding_cost_rate,
-            ordering_cost_per_order=ordering_cost_per_order,
-            stockout_cost_per_unit=stockout_cost_per_unit,
+            **cost_kwargs,
         )
+
+        def _effective_policy(key: str, results) -> Dict[str, Any]:
+            """What the engine actually used, averaged over the simulated days.
+
+            Safety stock is constant; the reorder point and the order-up-to
+            level move with the daily forecast, so they are reported as the
+            mean over the window rather than as one day's value.
+            """
+            from src.inventory.policy_profiles import get_profile as _profile_for
+
+            return {
+                **_profile_for(key).to_dict(),
+                "safety_stock": round(float(results["safety_stock"].iloc[0]), 2),
+                "coverage_days": round(float(results["coverage_days"].mean()), 2),
+                "average_reorder_point": round(float(results["reorder_point"].mean()), 2),
+                "average_order_up_to": round(float(results["target_inventory"].mean()), 2),
+            }
+
+        def _excess_inventory(results) -> float:
+            """Average stock held above the safety buffer, in units.
+
+            Measured against the buffer this run actually used, so a policy that
+            deliberately holds more is not reported as pure waste.
+            """
+            buffer = float(results["safety_stock"].iloc[0])
+            return round(
+                float((results["closing_stock"] - buffer).clip(lower=0).mean()), 2
+            )
+
+        # Policy comparison: identical forecast, one column per policy.
+        policy_comparison: List[Dict[str, Any]] = []
+        for key in COMPARABLE_POLICY_KEYS:
+            if key == profile.key:
+                results = xgb_results
+            else:
+                results = replay("xgboost", key)
+            metrics = calculate_inventory_metrics(results, **cost_kwargs)
+            policy_comparison.append({
+                **_effective_policy(key, results),
+                "stockout_days": metrics["stockout_days"],
+                "stockout_units": metrics["lost_sales_units"],
+                "service_level": metrics["service_level"],
+                "average_inventory": round(metrics["average_inventory"], 2),
+                "excess_inventory": _excess_inventory(results),
+                "number_of_orders": metrics["number_of_orders"],
+                "total_units_ordered": metrics["total_units_ordered"],
+                "total_inventory_cost": metrics["total_inventory_cost"],
+            })
 
         trajectory: List[Dict[str, Any]] = []
         for index in range(len(xgb_results)):
@@ -2283,6 +2391,12 @@ class TenantWorkspace:
                 "baseline_stockout_units": int(base_row["stockout_units"]),
                 "xgb_inventory_position": int(xgb_row["inventory_position"]),
                 "baseline_inventory_position": int(base_row["inventory_position"]),
+                # Units bought but not yet delivered on the selected policy's
+                # arm, so the chart and the table can show in-transit stock.
+                "xgb_open_order_units": int(xgb_row["open_order_units"]),
+                "baseline_open_order_units": int(base_row["open_order_units"]),
+                "xgb_reorder_point": round(float(xgb_row["reorder_point"]), 2),
+                "baseline_reorder_point": round(float(base_row["reorder_point"]), 2),
             })
 
         return {
@@ -2292,12 +2406,22 @@ class TenantWorkspace:
             "end_date": str(backtest_end.date()),
             "duration_days": (backtest_end - backtest_start).days + 1,
             "unit_cost": float(product.unit_cost or 0.0),
-            "starting_stock": config["starting_stock"],
-            "safety_stock": round(float(config["safety_stock"]), 2),
+            "starting_stock": starting_stock,
+            "safety_stock": round(float(base_safety_stock), 2),
             "forecast_error_std": round(float(config["forecast_error_std"]), 3),
             "lead_time_days": lead_time_days,
-            "xgb_metrics": comparison["xgboost"],
-            "baseline_metrics": comparison["baseline"],
+            # Stated, not implied: the engine replays one product's recorded
+            # days and has no notion of a portfolio total.
+            "scope": "single_product",
+            "policy": {
+                **_effective_policy(profile.key, xgb_results),
+                "parameters": custom if profile.accepts_custom else {},
+            },
+            "policy_comparison": policy_comparison,
+            "available_policies": list(describe_profiles()),
+            "custom_parameters": describe_custom_fields(),
+            "xgb_metrics": xgb_metrics,
+            "baseline_metrics": baseline_metrics,
             "cost_comparison": {
                 "recommended_strategy": comparison["recommended_strategy"],
                 "expected_savings": comparison["expected_savings"],

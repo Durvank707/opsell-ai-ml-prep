@@ -1,324 +1,523 @@
-// Inventory simulation (V2) — evaluates inventory policies against historical demand.
+// Inventory simulation (V2) — evaluates replenishment policies against
+// historical demand.
 //
-// In `mock` mode the policies are replayed in the browser against the
-// deterministic store. In `api` mode the same call is a real backtest on the
-// server, run through the shared simulation engine over this tenant's own sales
-// history and this tenant's own error spread.
+// In `api` mode this is a real backtest: one product's recorded days are
+// replayed through the same replenishment helpers the live V2 recommendation
+// uses, on the server, over this tenant's own sales history and error spread.
+//
+// In `mock` mode there is no server to call, so this file replays the same
+// *rule* against the deterministic browser store: lead-time demand plus safety
+// stock, reorder point reached, order topped up to that level, arrival after the
+// supplier lead time. It is a demo estimate, not the production engine, and the
+// results panel labels it as one — but it no longer contradicts the server, and
+// it is no longer a different formula wearing the same policy names.
+//
+// Either way the payload is handed to `toSimulationResult`, so the results panel
+// renders one shape and cannot accidentally render the two modes differently.
 
 import { getDB, latency, randomError } from './mock/db';
-import { hashString, mulberry32 } from '../lib/utils';
 import { usingApi } from './api/mode';
 import * as api from './api/intelligence';
+import { toSimulationResult } from './simulationResult';
+import {
+  COMPARABLE_POLICY_KEYS,
+  CUSTOM_POLICY_FIELDS,
+  INVENTORY_POLICIES,
+  POLICY_LOOKUP,
+  SIMULATION_SCOPE,
+  policyLabel,
+} from './simulationPolicy';
 
-export const POLICY_PRESETS = [
-  { key: 'current', label: 'Current Policy', safetyMultiplier: 1, reorderMultiplier: 1, orderMultiplier: 1 },
-  { key: 'conservative', label: 'Conservative Policy', safetyMultiplier: 1.5, reorderMultiplier: 1.15, orderMultiplier: 1.25 },
-  { key: 'aggressive', label: 'Aggressive Policy', safetyMultiplier: 0.5, reorderMultiplier: 0.8, orderMultiplier: 0.9 },
-];
-
-const WEEKDAY_FACTOR = [0.8, 0.9, 0.95, 1.0, 1.08, 1.3, 1.18];
-
-function demandForDay(db, p, dateStr) {
-  const series = db.getSales(p.id);
-  const exact = series.find((s) => s.date === dateStr);
-  if (exact) return exact.units;
-  // Beyond history — projected demand.
-  const d = new Date(dateStr);
-  return Math.max(0, Math.round(p.dailyAvg * WEEKDAY_FACTOR[d.getDay()] * (1 + p.sigma / Math.max(p.dailyAvg, 1) * 0)));
-}
-
-function simulateProduct(db, p, { start, end, safety, reorderPoint, targetOrderQty, pack }) {
-  const dates = [];
-  const endDate = new Date(end);
-  for (let d = new Date(start); d <= endDate; d.setDate(d.getDate() + 1)) {
-    dates.push(d.toISOString().slice(0, 10));
-  }
-
-  let stock = p.currentStock;
-  const arrivals = []; // {date, qty}
-  let stockoutEvents = 0;
-  let stockoutUnits = 0;
-  let excessUnits = 0;
-  let orders = 0;
-  let holding = 0;
-  let inStockDays = 0;
-
-  for (const ds of dates) {
-    // incoming shipment
-    const idx = arrivals.findIndex((a) => a.date === ds);
-    if (idx >= 0) {
-      stock += arrivals[idx].qty;
-      arrivals.splice(idx, 1);
-    }
-    const demand = demandForDay(db, p, ds);
-    const fulfilled = Math.min(demand, stock);
-    stock -= fulfilled;
-    if (fulfilled < demand) {
-      stockoutUnits += demand - fulfilled;
-      stockoutEvents++;
-    } else {
-      inStockDays++;
-    }
-
-    const effectiveRop = Math.round(reorderPoint * p.dailyAvg + p.dailyAvg * p.leadTimeDays);
-    const target = Math.round(targetOrderQty);
-    if (stock <= effectiveRop && arrivals.length === 0) {
-      const deficit = target - (stock + arrivals.reduce((s, a) => s + a.qty, 0));
-      if (deficit > 0) {
-        const qty = Math.max(pack, Math.ceil(deficit / pack) * pack);
-        const arrival = new Date(ds);
-        arrival.setDate(arrival.getDate() + p.leadTimeDays);
-        arrivals.push({ date: arrival.toISOString().slice(0, 10), qty });
-        orders++;
-      }
-    }
-
-    if (stock > target * 1.1) excessUnits += stock - target;
-    // daily holding cost (₹) — approximated from average stock during the day
-    holding += Math.max(0, stock) * p.unitCost * 0.2 / 365;
-  }
-
-  return {
-    productId: p.id,
-    name: p.name,
-    category: p.category,
-    stockoutEvents,
-    stockoutUnits,
-    excessUnits,
-    orders,
-    holding,
-    serviceDays: inStockDays,
-    totalDays: dates.length,
-    unitCost: p.unitCost,
-  };
-}
-
-const cache = new Map(); // configHash -> result
-
-function runPolicy(db, productIds, config, policy) {
-  const { start, end, pack, safety, reorder, orderQty } = config;
-  const perProduct = productIds.map((id) => {
-    const p = db.products.find((x) => x.id === id);
-    if (!p) throw randomError('A selected product no longer exists.');
-    return simulateProduct(db, p, {
-      start,
-      end,
-      safety: safety * policy.safetyMultiplier,
-      reorderPoint: reorder * policy.reorderMultiplier,
-      targetOrderQty: orderQty * policy.orderMultiplier,
-      pack,
-    });
-  });
-
-  const totalDemandDays = perProduct.reduce((s, r) => s + r.totalDays, 0);
-  const totalServiceDays = perProduct.reduce((s, r) => s + r.serviceDays, 0);
-  const totalStockoutUnits = perProduct.reduce((s, r) => s + r.stockoutUnits, 0);
-  const totalStockoutEvents = perProduct.reduce((s, r) => s + r.stockoutEvents, 0);
-  const totalExcess = perProduct.reduce((s, r) => s + r.excessUnits, 0);
-  const totalOrders = perProduct.reduce((s, r) => s + r.orders, 0);
-  const holding = perProduct.reduce((s, r) => s + r.holding, 0);
-
-  const orderingCost = totalOrders * config.orderingCostPerOrder;
-  const stockoutCost = totalStockoutUnits * config.stockoutCostPerUnit;
-  const totalCost = holding + orderingCost + stockoutCost;
-  const serviceLevel = totalDemandDays
-    ? Math.round((totalServiceDays / totalDemandDays) * 1000) / 10
-    : 0;
-
-  const affected = perProduct
-    .filter((r) => r.stockoutUnits > 0)
-    .sort((a, b) => b.stockoutUnits - a.stockoutUnits)
-    .slice(0, 8);
-  const avgDuration = affected.length
-    ? Math.round((affected.reduce((s, r) => s + r.stockoutEvents, 0) / affected.length) * 10) / 10
-    : 0;
-
-  const excessProducts = perProduct
-    .filter((r) => r.excessUnits > 0)
-    .sort((a, b) => b.excessUnits - a.excessUnits)
-    .slice(0, 8);
-  const avgExcess = excessProducts.length
-    ? Math.round(excessProducts.reduce((s, r) => s + r.excessUnits, 0) / excessProducts.length)
-    : 0;
-
-  return {
-    kpis: {
-      serviceLevel,
-      stockoutEvents: totalStockoutEvents,
-      stockoutUnits: totalStockoutUnits,
-      excessInventory: Math.round(totalExcess),
-      inventoryCost: Math.round(totalCost),
-      totalOrders,
-      holdingCost: Math.round(holding),
-      orderingCost: Math.round(orderingCost),
-      stockoutCost: Math.round(stockoutCost),
-      stockoutsAvoidedDemandUnits: totalStockoutUnits,
-    },
-    stockout: {
-      events: totalStockoutEvents,
-      productsAffected: affected,
-      totalLostUnits: totalStockoutUnits,
-      avgDuration,
-    },
-    excess: {
-      products: excessProducts,
-      avgExcess,
-      holdingCost: Math.round(holding),
-      totalExcess: Math.round(totalExcess),
-    },
-    perProduct,
-  };
-}
+/** Mirrors `calculate_financial_metrics`'s default annual holding rate. */
+const HOLDING_COST_RATE = 0.2;
+/** Mirrors `moving_average_forecast`'s default window. */
+const BASELINE_WINDOW = 7;
+/** Mirrors `TenantWorkspace.backtest`'s default window and lead-in. */
+const BACKTEST_WINDOW_DAYS = 89;
+const BACKTEST_LEAD_IN_DAYS = 28;
+const WEEKDAY_FACTOR = [0.9, 0.95, 0.98, 1.0, 1.05, 1.18, 1.1];
 
 export async function runSimulation(user, config) {
   if (usingApi()) return api.runSimulation(user, config);
-  await latency(2200);
+  await latency(1400);
 
   const db = getDB(user);
-  const today = new Date();
-  const DEFAULT_END = today.toISOString().slice(0, 10);
-  const endDate = config.endDate || DEFAULT_END;
-  const startDate = config.startDate || DEFAULT_END;
+  const productIds = config.productIds || [];
+  if (productIds.length === 0) {
+    throw randomError('Choose a product to simulate.');
+  }
+  if (productIds.length > 1) {
+    throw randomError(
+      'Simulation evaluates one product at a time so the comparison stays ' +
+        'like-for-like. Choose a single product.',
+    );
+  }
 
-  const productIds =
-    config.productSelection === 'all'
-      ? db.products.map((p) => p.id)
-      : (config.productIds || []).length
-        ? config.productIds
-        : db.products.slice(0, 20).map((p) => p.id);
+  const product = db.products.find((p) => p.id === productIds[0]);
+  if (!product) throw randomError('That product no longer exists.');
 
-  if (productIds.length === 0) throw randomError('Select at least one product to simulate.');
-  if (startDate >= endDate) throw randomError('The historical period must have a start date before the end date.');
+  const payload = buildPayload(db, product, config);
+  const result = toSimulationResult(payload, { ...config, mode: 'mock' });
 
-  const selectedProducts = db.products.filter((p) => productIds.includes(p.id));
-  if (selectedProducts.length === 0) throw randomError('No products match the selected scope.');
-
-  const avgDaily = selectedProducts.reduce((s, p) => s + p.dailyAvg, 0) / selectedProducts.length;
-  const avgLead = selectedProducts.reduce((s, p) => s + p.leadTimeDays, 0) / selectedProducts.length;
-  const params =
-    config.policy === 'custom'
-      ? {
-          safety: Number(config.customParams?.safetyStock) || Math.round(avgDaily * avgLead * 0.5),
-          reorder: Number(config.customParams?.reorderPoint) || Math.round(avgDaily * avgLead),
-          orderQty: Number(config.customParams?.orderQuantity) || Math.round(avgDaily * 30),
-        }
-      : {
-          safety: Math.round(avgDaily * avgLead * 0.5),
-          reorder: Math.round(avgDaily * avgLead),
-          orderQty: Math.round(avgDaily * 30),
-        };
-
-  const simConfig = {
-    start: startDate,
-    end: endDate,
-    pack: Number(config.packSize) || 1,
-    orderingCostPerOrder: Number(config.orderingCost) || 500,
-    stockoutCostPerUnit: Number(config.stockoutCost) || 1000,
-  };
-
-  const hashKey = JSON.stringify({ productIds, startDate, endDate, config });
-  const rng = mulberry32(hashString(hashKey)());
-  const cachedResult = cache.get(hashKey);
-  if (cachedResult) return cachedResult;
-
-  const policy =
-    POLICY_PRESETS.find((p) => p.key === config.policy) || POLICY_PRESETS[0];
-  const result = runPolicy(
-    db,
-    productIds,
-    { ...simConfig, safety: params.safety, reorder: params.reorder, orderQty: params.orderQty },
-    policy,
+  db.simulations = [result, ...(db.simulations || [])].slice(0, 5);
+  db.pushActivity(
+    'simulation_completed',
+    `Inventory policy simulation completed for ${product.name} (${result.policy.label}).`,
   );
-
-  // Policy comparison across the three standard presets
-  const comparison = {
-    metrics: ['Service Level', 'Stockouts', 'Excess Inventory', 'Inventory Cost'],
-    rows: [
-      {
-        metric: 'Service Level',
-        format: 'percent',
-        values: POLICY_PRESETS.map((pre) => {
-          const r = runPolicy(db, productIds, { ...simConfig, safety: params.safety, reorder: params.reorder, orderQty: params.orderQty }, pre);
-          return r.kpis.serviceLevel;
-        }),
-      },
-      {
-        metric: 'Stockouts',
-        format: 'number',
-        values: POLICY_PRESETS.map((pre) => {
-          const r = runPolicy(db, productIds, { ...simConfig, safety: params.safety, reorder: params.reorder, orderQty: params.orderQty }, pre);
-          return r.kpis.stockoutUnits;
-        }),
-      },
-      {
-        metric: 'Excess Inventory',
-        format: 'number',
-        values: POLICY_PRESETS.map((pre) => {
-          const r = runPolicy(db, productIds, { ...simConfig, safety: params.safety, reorder: params.reorder, orderQty: params.orderQty }, pre);
-          return r.kpis.excessInventory;
-        }),
-      },
-      {
-        metric: 'Inventory Cost',
-        format: 'currency',
-        values: POLICY_PRESETS.map((pre) => {
-          const r = runPolicy(db, productIds, { ...simConfig, safety: params.safety, reorder: params.reorder, orderQty: params.orderQty }, pre);
-          return r.kpis.inventoryCost;
-        }),
-      },
-    ],
-    labels: POLICY_PRESETS.map((p) => p.label),
-    raw: POLICY_PRESETS.map((pre) =>
-      runPolicy(db, productIds, { ...simConfig, safety: params.safety, reorder: params.reorder, orderQty: params.orderQty }, pre),
-    ),
-  };
-
-  // Inventory level over time (portfolio aggregate)
-  const chart = buildPortfolioTimeline(db, productIds, startDate, endDate);
-
-  const full = {
-    config: { ...config, productCount: productIds.length, start: startDate, end: endDate },
-    selectedPolicy: policy.label,
-    kpis: result.kpis,
-    stockout: result.stockout,
-    excess: result.excess,
-    chart,
-    comparison,
-    generatedAt: new Date().toISOString(),
-  };
-  cache.set(hashKey, full);
-
-  db.simulations = [full, ...db.simulations].slice(0, 5);
-  db.pushActivity('simulation_completed', `Inventory policy simulation completed for ${productIds.length} SKUs (${policy.label}).`);
-  db.pushNotification({
-    title: 'Simulation completed.',
-    message: `"${policy.label}" was evaluated — service level ${result.kpis.serviceLevel}%.`,
-    severity: 'success',
-  });
-  return full;
+  return result;
 }
 
-function buildPortfolioTimeline(db, productIds, start, end) {
-  const dates = [];
-  for (let d = new Date(start); d <= new Date(end); d.setDate(d.getDate() + 1)) {
-    dates.push(d.toISOString().slice(0, 10));
+// ---------------------------------------------------------------- demand series
+
+function sortedSales(db, productId) {
+  return db
+    .getSales(productId)
+    .slice()
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+}
+
+/** The window the server would choose for an untouched form. */
+function defaultWindow(series) {
+  if (!series.length) return { start: null, end: null };
+  const first = series[0].date;
+  const last = series[series.length - 1].date;
+  const end = last;
+  const minusWindow = shiftDate(end, -(BACKTEST_WINDOW_DAYS));
+  const plusLeadIn = shiftDate(first, BACKTEST_LEAD_IN_DAYS);
+  return { start: minusWindow > plusLeadIn ? minusWindow : plusLeadIn, end };
+}
+
+function shiftDate(dateStr, days) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function mean(values) {
+  if (!values.length) return 0;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+/**
+ * One row per simulated day: the recorded demand, and the two forecasts that
+ * could have been made for it using only the days before it.
+ *
+ * XGBoost is not run in the browser. The "AI" arm here is a weekday-seasonal
+ * projection of the product's own average, and the baseline arm is the same
+ * seven-day moving average the server's baseline uses. Both are built from
+ * history strictly before the day, which is the property the comparison depends
+ * on.
+ */
+function buildDays(db, product, start, end) {
+  const series = sortedSales(db, product.id);
+  const byDate = new Map(series.map((row) => [row.date, row]));
+
+  const days = [];
+  let cursor = start;
+  while (cursor <= end) {
+    const history = series.filter((row) => row.date < cursor);
+    const recent = history.slice(-BASELINE_WINDOW).map((row) => row.units);
+    const weekday = new Date(`${cursor}T00:00:00Z`).getUTCDay();
+    const sameWeekday = history
+      .filter((row) => new Date(`${row.date}T00:00:00Z`).getUTCDay() === weekday)
+      .map((row) => row.units);
+
+    const recorded = byDate.get(cursor);
+    const demand = recorded ? recorded.units : 0;
+    const baselineDaily = history.length
+      ? mean(recent)
+      : product.dailyAvg;
+    const xgbDaily = sameWeekday.length
+      ? mean(sameWeekday) * WEEKDAY_FACTOR[weekday]
+      : product.dailyAvg * WEEKDAY_FACTOR[weekday];
+
+    days.push({
+      date: cursor,
+      demand,
+      xgbDaily: Math.max(0, xgbDaily),
+      baselineDaily: Math.max(0, baselineDaily),
+      recorded: Boolean(recorded),
+    });
+    cursor = shiftDate(cursor, 1);
   }
-  return dates.map((ds) => {
-    let stock = 0;
-    for (const id of productIds) {
-      const p = db.products.find((x) => x.id === id);
-      if (!p) continue;
-      const series = db.getSales(p.id);
-      const match = series.find((s) => s.date === ds);
-      const demand = match ? match.units : 0;
-      // Simple projected closing stock per product (no reorder in this view)
-      const cumulativeBefore = series.filter((s) => s.date < ds).reduce((s, x) => s + x.units, 0);
-      const pastCum = series.filter((s) => s.date <= ds).reduce((s, x) => s + x.units, 0);
-      const positionAtEnd = p.currentStock + (p.openOrderQty || 0) - pastCum;
-      stock += Math.max(0, positionAtEnd);
-      void demand;
-      void cumulativeBefore;
+  return days;
+}
+
+// ---------------------------------------------------------------- replay
+
+/**
+ * Resolve a policy key into the effective levels for one day.
+ *
+ * This is the browser's copy of `resolve_policy`: presets scale the configured
+ * safety stock, the custom policy substitutes two explicit values, and both
+ * levels are derived from lead-time demand plus safety stock. It exists because
+ * mock mode has no server; it is deliberately small and pinned by a test so it
+ * cannot quietly drift from the backend rule.
+ */
+export function resolvePolicyLevels(
+  profile,
+  { safetyStock, dailyForecast, leadTimeDays, custom },
+) {
+  const baseSafety = Math.max(0, Number(safetyStock) || 0);
+  const baseCoverage = Math.max(0, (Number(dailyForecast) || 0) * leadTimeDays);
+
+  let safety;
+  let coverage;
+  let coverageDays;
+
+  if (profile.acceptsCustom) {
+    const supplied = custom || {};
+    safety =
+      supplied.safety_stock !== undefined && supplied.safety_stock !== null
+        ? Math.max(0, Number(supplied.safety_stock))
+        : baseSafety;
+    coverageDays =
+      supplied.coverage_days !== undefined && supplied.coverage_days !== null
+        ? Math.max(0, Number(supplied.coverage_days))
+        : leadTimeDays;
+    coverage = Math.max(0, (Number(dailyForecast) || 0) * coverageDays);
+  } else {
+    safety = Math.ceil(baseSafety * profile.safetyMultiplier);
+    coverage = baseCoverage * profile.coverageMultiplier;
+    coverageDays = leadTimeDays * profile.coverageMultiplier;
+  }
+
+  // Reorder point and order-up-to are the same level under every policy, which
+  // is exactly how the production recommendation behaves.
+  const reorderPoint = coverage + safety;
+  return { safety, coverage, coverageDays, reorderPoint, orderUpTo: reorderPoint };
+}
+
+function replay(days, options) {
+  const {
+    startingStock,
+    safetyStock,
+    leadTimeDays,
+    profile,
+    custom,
+    method,
+  } = options;
+  const forecastField = method === 'baseline' ? 'baselineDaily' : 'xgbDaily';
+
+  let stock = Number(startingStock) || 0;
+  const openOrders = [];
+  const rows = [];
+
+  for (const day of days) {
+    const arriving = openOrders.filter((order) => order.arrival === day.date);
+    stock += arriving.reduce((sum, order) => sum + order.qty, 0);
+    if (arriving.length) {
+      openOrders.splice(
+        0,
+        openOrders.length,
+        ...openOrders.filter((order) => order.arrival !== day.date),
+      );
     }
-    return { date: ds, stock: Math.round(stock) };
+
+    const demand = Math.max(0, Number(day.demand) || 0);
+    const fulfilled = Math.min(demand, stock);
+    stock -= fulfilled;
+
+    // Stock on hand plus everything already ordered but not yet delivered is
+    // what the reorder trigger is measured against, at this same moment.
+    const inTransit = openOrders.reduce((sum, order) => sum + order.qty, 0);
+    const position = stock + inTransit;
+
+    const levels = resolvePolicyLevels(profile, {
+      safetyStock,
+      dailyForecast: day[forecastField],
+      leadTimeDays,
+      custom,
+    });
+
+    const triggered = position < levels.reorderPoint;
+    const orderQty = triggered
+      ? Math.max(0, Math.round(levels.orderUpTo - position))
+      : 0;
+    if (orderQty > 0) {
+      openOrders.push({ arrival: shiftDate(day.date, leadTimeDays), qty: orderQty });
+    }
+
+    rows.push({
+      date: day.date,
+      demand,
+      opening_stock: stock + fulfilled,
+      arrival_qty: arriving.reduce((sum, order) => sum + order.qty, 0),
+      units_fulfilled: fulfilled,
+      stockout_units: demand - fulfilled,
+      closing_stock: stock,
+      inventory_position: position,
+      open_order_units: inTransit,
+      order_qty: orderQty,
+      reorder_point: levels.reorderPoint,
+      target_inventory: levels.orderUpTo,
+      safety_stock: levels.safety,
+      coverage_days: levels.coverageDays,
+      total_forecast: day[forecastField] * 30,
+      recorded: day.recorded,
+    });
+  }
+
+  return rows;
+}
+
+function metricsFor(rows, { unitCost, orderingCostPerOrder, stockoutCostPerUnit }) {
+  const totalDemand = rows.reduce((sum, row) => sum + row.demand, 0);
+  const totalFulfilled = rows.reduce((sum, row) => sum + row.units_fulfilled, 0);
+  const lostSales = rows.reduce((sum, row) => sum + row.stockout_units, 0);
+  const numberOfOrders = rows.filter((row) => row.order_qty > 0).length;
+  const totalUnitsOrdered = rows.reduce((sum, row) => sum + row.order_qty, 0);
+  const durationDays = rows.length;
+
+  const averageInventory = mean(rows.map((row) => row.closing_stock));
+  const maximumInventory = rows.reduce(
+    (max, row) => Math.max(max, row.closing_stock),
+    0,
+  );
+
+  const holdingCost =
+    averageInventory * unitCost * HOLDING_COST_RATE * (durationDays / 365);
+  const orderingCost = numberOfOrders * orderingCostPerOrder;
+  const stockoutCost = lostSales * stockoutCostPerUnit;
+
+  return {
+    unit_cost: unitCost,
+    duration_days: durationDays,
+    total_demand: totalDemand,
+    total_fulfilled: totalFulfilled,
+    lost_sales_units: lostSales,
+    stockout_days: rows.filter((row) => row.stockout_units > 0).length,
+    number_of_orders: numberOfOrders,
+    total_units_ordered: totalUnitsOrdered,
+    service_level: totalDemand
+      ? Math.round((totalFulfilled / totalDemand) * 10000) / 100
+      : 100,
+    average_inventory: Math.round(averageInventory * 100) / 100,
+    maximum_inventory: maximumInventory,
+    holding_cost: Math.round(holdingCost * 100) / 100,
+    ordering_cost: Math.round(orderingCost * 100) / 100,
+    stockout_cost: Math.round(stockoutCost * 100) / 100,
+    total_inventory_cost: Math.round((holdingCost + orderingCost + stockoutCost) * 100) / 100,
+  };
+}
+
+function excessAbove(rows, safetyStock) {
+  const buffer = Math.max(0, Number(safetyStock) || 0);
+  return mean(rows.map((row) => Math.max(0, row.closing_stock - buffer)));
+}
+
+// ---------------------------------------------------------------- validation
+
+/**
+ * The custom parameters the server accepts, checked with the server's rules.
+ *
+ * The demo engine has to refuse the same inputs the API refuses, or a value that
+ * would be a 400 in api mode silently produces a result here — which is the
+ * whole class of problem the policy layer exists to close.
+ */
+export function validateCustomParams(profile, custom) {
+  const supplied = custom || {};
+  if (!Object.keys(supplied).length) return null;
+  if (!profile.acceptsCustom) {
+    return `'${profile.key}' is a fixed policy and takes no custom parameters.`;
+  }
+
+  const unknown = Object.keys(supplied).filter(
+    (key) => !CUSTOM_POLICY_FIELDS.some((field) => field.name === key),
+  );
+  if (unknown.length) {
+    return `A custom policy accepts only safety_stock and coverage_days, but ${unknown.join(', ')} was supplied.`;
+  }
+
+  for (const field of CUSTOM_POLICY_FIELDS) {
+    const value = supplied[field.name];
+    if (value === undefined || value === null || value === '') continue;
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+      return `'${field.name}' must be a number, but ${value} was supplied.`;
+    }
+    // Safety stock is a quantity of stock and may be zero; coverage is a
+    // duration and a zero-day order would never arrive.
+    const positive = field.name === 'coverage_days';
+    if (positive ? number <= 0 : number < 0) {
+      return positive
+        ? `'${field.name}' must be greater than zero.`
+        : `'${field.name}' must be zero or more.`;
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------- payload
+
+function buildPayload(db, product, config) {
+  const series = sortedSales(db, product.id);
+  if (!series.length) {
+    throw randomError(
+      `'${product.name}' has no sales history, so there is nothing to backtest.`,
+    );
+  }
+
+  const fallback = defaultWindow(series);
+  const start = config.periodIsDefault ? fallback.start : config.startDate || fallback.start;
+  const end = config.periodIsDefault ? fallback.end : config.endDate || fallback.end;
+  if (!start || !end) throw randomError('The historical period is incomplete.');
+  if (start >= end) {
+    throw randomError('The historical period must start before it ends.');
+  }
+
+  const leadTimeDays = Math.max(1, Number(product.leadTimeDays) || 1);
+  const safetyStock = Math.max(0, Number(product.safetyStock) || 0);
+  const unitCost = Number(product.unitCost) || 0;
+  const orderingCostPerOrder = Number(config.orderingCost) || 500;
+  const stockoutCostPerUnit = Number(config.stockoutCost) || 1000;
+  // Whatever was handed over is validated against the chosen policy, so a
+  // preset given parameters is refused exactly as the server refuses them
+  // rather than quietly dropping them.
+  const custom = config.policyParams || {};
+
+  const profile = POLICY_LOOKUP[config.policy];
+  if (!profile) {
+    throw randomError(`'${config.policy}' is not a supported inventory policy.`);
+  }
+  const customError = validateCustomParams(profile, custom);
+  if (customError) throw randomError(customError);
+  const applied = profile.acceptsCustom ? custom : {};
+
+  const days = buildDays(db, product, start, end);
+  const costs = { unitCost, orderingCostPerOrder, stockoutCostPerUnit };
+
+  const xgbRows = replay(days, {
+    startingStock: product.currentStock,
+    safetyStock,
+    leadTimeDays,
+    profile,
+    custom: applied,
+    method: 'xgboost',
   });
+  const baselineRows = replay(days, {
+    startingStock: product.currentStock,
+    safetyStock,
+    leadTimeDays,
+    profile,
+    custom: applied,
+    method: 'baseline',
+  });
+
+  const xgbMetrics = metricsFor(xgbRows, costs);
+  const baselineMetrics = metricsFor(baselineRows, costs);
+
+  // The comparison columns are always the three fixed presets, so a custom run
+  // compares itself against them rather than replacing one of them.
+  const policyComparison = COMPARABLE_POLICY_KEYS.map((key) => {
+    const rows =
+      key === profile.key
+        ? xgbRows
+        : replay(days, {
+            startingStock: product.currentStock,
+            safetyStock,
+            leadTimeDays,
+            profile: POLICY_LOOKUP[key],
+            custom: {},
+            method: 'xgboost',
+          });
+    const metrics = metricsFor(rows, costs);
+    const levels = resolvePolicyLevels(POLICY_LOOKUP[key], {
+      safetyStock,
+      dailyForecast: mean(days.map((day) => day.xgbDaily)),
+      leadTimeDays,
+      custom: {},
+    });
+    return {
+      key,
+      label: policyLabel(key),
+      description: POLICY_LOOKUP[key].description,
+      safety_stock: levels.safety,
+      coverage_days: Math.round(levels.coverageDays * 100) / 100,
+      average_reorder_point: mean(rows.map((row) => row.reorder_point)),
+      average_order_up_to: mean(rows.map((row) => row.target_inventory)),
+      stockout_days: metrics.stockout_days,
+      stockout_units: metrics.lost_sales_units,
+      service_level: metrics.service_level,
+      average_inventory: metrics.average_inventory,
+      excess_inventory: Math.round(excessAbove(rows, levels.safety) * 100) / 100,
+      number_of_orders: metrics.number_of_orders,
+      total_units_ordered: metrics.total_units_ordered,
+      total_inventory_cost: metrics.total_inventory_cost,
+    };
+  });
+
+  const trajectory = xgbRows.map((row, index) => {
+    const base = baselineRows[index];
+    return {
+      date: row.date,
+      actual_demand: row.demand,
+      xgb_closing_stock: row.closing_stock,
+      baseline_closing_stock: base.closing_stock,
+      xgb_order_qty: row.order_qty,
+      baseline_order_qty: base.order_qty,
+      xgb_stockout_units: row.stockout_units,
+      baseline_stockout_units: base.stockout_units,
+      xgb_inventory_position: row.inventory_position,
+      baseline_inventory_position: base.inventory_position,
+      xgb_open_order_units: row.open_order_units,
+      baseline_open_order_units: base.open_order_units,
+      xgb_reorder_point: row.reorder_point,
+      baseline_reorder_point: base.reorder_point,
+    };
+  });
+
+  const selectedLevels = resolvePolicyLevels(profile, {
+    safetyStock,
+    dailyForecast: mean(days.map((day) => day.xgbDaily)),
+    leadTimeDays,
+    custom: applied,
+  });
+  const selectedRows = xgbRows;
+  const costDifference = xgbMetrics.total_inventory_cost - baselineMetrics.total_inventory_cost;
+
+  return {
+    product_id: product.id,
+    product_name: product.name,
+    start_date: start,
+    end_date: end,
+    duration_days: days.length,
+    unit_cost: unitCost,
+    starting_stock: product.currentStock,
+    safety_stock: safetyStock,
+    forecast_error_std: Math.round((Number(product.sigma) || 0) * 1000) / 1000,
+    lead_time_days: leadTimeDays,
+    scope: SIMULATION_SCOPE,
+    policy: {
+      key: profile.key,
+      label: profile.label,
+      description: profile.description,
+      safety_stock: selectedLevels.safety,
+      coverage_days: Math.round(selectedLevels.coverageDays * 100) / 100,
+      average_reorder_point: mean(selectedRows.map((row) => row.reorder_point)),
+      average_order_up_to: mean(selectedRows.map((row) => row.target_inventory)),
+      parameters: applied,
+    },
+    policy_comparison: policyComparison,
+    available_policies: INVENTORY_POLICIES.map((entry) => ({
+      key: entry.key,
+      label: entry.label,
+      description: entry.description,
+    })),
+    custom_parameters: Object.fromEntries(
+      CUSTOM_POLICY_FIELDS.map((field) => [field.name, field.hint]),
+    ),
+    xgb_metrics: xgbMetrics,
+    baseline_metrics: baselineMetrics,
+    // Reported for parity with the API. The results panel deliberately does not
+    // turn it into a verdict — a lower cost on a shorter replay is not proof one
+    // forecasting method is better.
+    cost_comparison: {
+      recommended_strategy: costDifference <= 0 ? 'xgboost' : 'baseline',
+      expected_savings: Math.abs(costDifference),
+      cost_difference: costDifference,
+    },
+    daily_trajectory: trajectory,
+    mode: 'mock',
+  };
 }

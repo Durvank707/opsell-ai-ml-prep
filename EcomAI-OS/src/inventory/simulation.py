@@ -16,6 +16,8 @@ from src.inventory.reorder import (
     should_reorder,
 )
 
+from src.models.forecasting import forecast_product_demand
+
 @dataclass
 class PurchaseOrder:
     """Represents a purchase order placed with a supplier."""
@@ -478,24 +480,331 @@ def simulate_inventory_with_policy(
     return pd.DataFrame(results)
 
 
-from src.models.forecasting import forecast_product_demand
+# The backtest half of the module. The daily forecast is produced once per
+# simulated day by the same recursive call the live forecast uses, and the
+# replenishment decision is then made by the shared policy helpers so the
+# simulator and the live V2 recommendation cannot drift apart.
 
-from dataclasses import dataclass
+from typing import Iterable
 
-import numpy as np
-import pandas as pd
-
-from src.models.forecasting import forecast_product_demand
-
-from src.inventory.policy import (
-    calculate_target_inventory,
-    calculate_recommended_order_qty,
+from src.inventory.policy_profiles import (
+    PolicyProfile,
+    get_profile,
+    resolve_policy,
 )
 
-from src.inventory.reorder import (
-    calculate_reorder_point,
-    should_reorder,
-)
+
+def _forecast_columns(method: str) -> dict:
+    """The per-day forecast columns one forecasting method is replayed with.
+
+    Both methods produce the same three quantities — a single day's demand, the
+    demand across the supplier lead time, and the whole-horizon total — so the
+    replay loop never branches on the method.
+    """
+
+    key = (method or "xgboost").strip().lower()
+    if key in ("xgboost", "xgb", "ai"):
+        return {
+            "daily": "xgb_daily_forecast",
+            "lead": "xgb_lead_time_demand",
+            "total": "xgb_total_forecast",
+        }
+    if key in ("baseline", "moving_average", "ma"):
+        return {
+            "daily": "baseline_daily_forecast",
+            "lead": "baseline_lead_time_demand",
+            "total": "baseline_total_forecast",
+        }
+    raise ValueError(
+        f"'{method}' is not a forecasting method the simulator can replay. "
+        "Use 'xgboost' or 'baseline'."
+    )
+
+
+def prepare_backtest_forecast(
+    product_history: pd.DataFrame,
+    start_date,
+    end_date,
+    *,
+    model=None,
+    model_features: list[str] | None = None,
+    lead_time_days: int,
+    forecast_window: int = 7,
+    horizon: int = 30,
+    methods: Iterable[str] = ("xgboost", "baseline"),
+) -> pd.DataFrame:
+    """Forecast every simulated day once, for the requested methods.
+
+    A backtest day may only look at demand recorded before it, so the forecast
+    for each day is produced by the same recursive call the live forecast makes.
+    Two facts make this worth doing up front rather than inside the inventory
+    loop:
+
+    * The forecast does not depend on the inventory policy. A policy decides
+      when to order and how much; it never changes what the demand will be. So
+      one pass of forecasts is enough to replay any number of policies against.
+    * The moving-average baseline is one line of arithmetic per day, and the
+      XGBoost call is the expensive part. Preparing both together means a
+      multi-policy comparison costs one XGBoost pass, not one per policy.
+
+    The 30-day total is returned because it is a real planning figure worth
+    reporting, but nothing downstream may size an order from it. Replenishment
+    covers lead-time demand plus safety stock, exactly as live V2 does.
+
+    Parameters
+    ----------
+    methods:
+        Which forecasting methods to prepare. ``'xgboost'`` requires ``model``
+        and ``model_features``; ``'baseline'`` is arithmetic over the recorded
+        history and needs neither, so
+        :func:`run_baseline_backtest` does not take a model at all. Only the
+        requested columns are produced.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per simulated day with ``date``, ``demand`` and the forecast
+        columns for each requested method.
+    """
+
+    start_date = pd.Timestamp(start_date)
+    end_date = pd.Timestamp(end_date)
+
+    wanted = {(str(m).strip().lower()) for m in methods}
+    # Validate the method names through the same table the replay uses, so an
+    # unsupported name is refused here rather than half way through a replay.
+    for name in wanted:
+        _forecast_columns(name)
+    if "xgboost" in wanted and (model is None or not model_features):
+        # Caught here rather than inside the per-day forecast call, so the
+        # caller is told which argument it left out.
+        raise ValueError(
+            "An XGBoost backtest needs the trained model and its feature list."
+        )
+
+    history = product_history.copy()
+    history["date"] = pd.to_datetime(history["date"])
+    history = history.sort_values("date").reset_index(drop=True)
+
+    backtest_days = history[
+        (history["date"] >= start_date) & (history["date"] <= end_date)
+    ]
+
+    if backtest_days.empty:
+        raise ValueError(
+            "No historical demand exists in the selected backtest period."
+        )
+
+    from src.models.baselines import moving_average_forecast
+
+    rows = []
+    for current_date in backtest_days["date"]:
+        history_before_today = history[history["date"] < current_date].copy()
+
+        row = {
+            "date": pd.Timestamp(current_date),
+        }
+
+        if "xgboost" in wanted:
+            forecast = forecast_product_demand(
+                model=model,
+                product_history=history_before_today,
+                model_features=model_features,
+                horizon=horizon,
+            )
+            units = forecast["forecast_units"].astype(float)
+            row["xgb_daily_forecast"] = float(units.mean())
+            row["xgb_lead_time_demand"] = float(units.head(max(lead_time_days, 1)).sum())
+            row["xgb_total_forecast"] = float(units.sum())
+
+        if "baseline" in wanted:
+            daily = float(moving_average_forecast(
+                history=history_before_today,
+                window=forecast_window,
+            ))
+            row["baseline_daily_forecast"] = daily
+            row["baseline_lead_time_demand"] = daily * max(lead_time_days, 1)
+            row["baseline_total_forecast"] = daily * horizon
+
+        today_rows = history[history["date"] == current_date]
+        if today_rows.empty:
+            raise ValueError(
+                f"No historical demand found for {current_date.date()}."
+            )
+        row["demand"] = int(today_rows["units_sold"].iloc[0])
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def run_policy_replay(
+    days: pd.DataFrame,
+    *,
+    starting_stock: int,
+    safety_stock: float,
+    lead_time_days: int,
+    profile="current",
+    custom: dict | None = None,
+    method: str = "xgboost",
+    purchase_orders: list[PurchaseOrder] | None = None,
+) -> pd.DataFrame:
+    """Replay recorded demand one day at a time under one inventory policy.
+
+    Each day, in order: purchase orders placed ``lead_time_days`` ago arrive,
+    that day's recorded demand is consumed, the inventory position (stock plus
+    everything still in transit) is measured against the policy's reorder
+    point, and any resulting order is placed and scheduled to arrive after the
+    lead time.
+
+    The replenishment levels come from :func:`resolve_policy`, which builds them
+    out of :func:`~src.inventory.reorder.calculate_reorder_point` and
+    :func:`~src.inventory.policy.calculate_target_inventory` — the same helpers
+    the live V2 reorder recommendation uses. Under the ``current`` profile the
+    order-up-to level is lead-time demand plus safety stock; the 30-day forecast
+    total is recorded for reporting but never sizes an order.
+
+    Parameters
+    ----------
+    days:
+        The output of :func:`prepare_backtest_forecast`.
+    starting_stock:
+        Stock on hand on the first simulated day.
+    safety_stock:
+        The safety stock the inventory configuration derived for this product.
+        The policy scales or replaces it.
+    lead_time_days:
+        This product's supplier lead time.
+    profile:
+        A policy key or a :class:`~src.inventory.policy_profiles.PolicyProfile`.
+    custom:
+        ``{"safety_stock": units, "coverage_days": days}``, used only by the
+        custom profile.
+    method:
+        ``'xgboost'`` or ``'baseline'`` — which prepared forecast series to
+        replay against.
+    purchase_orders:
+        An existing list of open orders to seed the replay with. It is appended
+        to in place, so the caller keeps ownership of its own order book.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per simulated day.
+    """
+
+    if days is None or days.empty:
+        raise ValueError(
+            "No historical demand exists in the selected backtest period."
+        )
+
+    resolved_profile = get_profile(profile) if not isinstance(profile, PolicyProfile) else profile
+    columns = _forecast_columns(method)
+    for column in columns.values():
+        if column not in days.columns:
+            raise ValueError(
+                f"The prepared forecast is missing '{column}', so the "
+                f"'{method}' method cannot be replayed."
+            )
+
+    days = days.sort_values("date").reset_index(drop=True)
+
+    lead_time_days = max(int(lead_time_days or 0), 1)
+    orders = purchase_orders if purchase_orders is not None else []
+    current_stock = int(starting_stock)
+
+    results = []
+    for row in days.itertuples(index=False):
+        current_date = pd.Timestamp(row.date)
+
+        # 1. Purchase orders placed `lead_time_days` ago land today.
+        arrival_qty = get_arrivals_for_date(
+            purchase_orders=orders,
+            date=current_date,
+        )
+
+        # 2. Demand is served from stock on hand plus what just arrived.
+        available_stock = current_stock + arrival_qty
+
+        # 3. Consume the day's recorded demand.
+        units_fulfilled, stockout_units, closing_stock = process_daily_demand(
+            available_stock=available_stock,
+            demand=int(row.demand),
+        )
+
+        # 4. Stock still on hand plus everything already ordered but not yet
+        #    delivered is what the reorder trigger is measured against. The
+        #    in-transit figure is read at this same moment, so
+        #    `inventory_position == closing_stock + open_order_units` holds for
+        #    every day — including a day that goes on to place an order.
+        open_order_units = int(sum(
+            order.quantity
+            for order in orders
+            if order.arrival_date > current_date
+        ))
+        inventory_position = calculate_inventory_position(
+            current_stock=closing_stock,
+            purchase_orders=orders,
+            current_date=current_date,
+        )
+
+        # 5. Apply the policy for today.
+        policy = resolve_policy(
+            resolved_profile,
+            safety_stock=safety_stock,
+            daily_forecast=getattr(row, columns["daily"]),
+            lead_time_demand=getattr(row, columns["lead"]),
+            lead_time_days=lead_time_days,
+            custom=custom,
+        )
+
+        reorder_required = bool(should_reorder(
+            inventory_position=inventory_position,
+            reorder_point=policy.reorder_point,
+        ))
+
+        order_qty = float(np.asarray(calculate_recommended_order_qty(
+            target_inventory=policy.order_up_to,
+            inventory_position=inventory_position,
+            reorder_required=reorder_required,
+        )).item())
+
+        # 6. Place the order; it lands `lead_time_days` from now.
+        if order_qty > 0:
+            orders.append(create_purchase_order(
+                order_date=current_date,
+                quantity=int(order_qty),
+                lead_time_days=lead_time_days,
+            ))
+
+        results.append({
+            "date": current_date,
+            "opening_stock": current_stock,
+            "arrival_qty": arrival_qty,
+            "demand": int(row.demand),
+            "units_fulfilled": units_fulfilled,
+            "stockout_units": stockout_units,
+            "closing_stock": closing_stock,
+            "open_order_units": open_order_units,
+            "inventory_position": inventory_position,
+            "order_qty": int(order_qty),
+            "reorder_required": reorder_required,
+            # Reported, never used to size the order above.
+            "total_forecast": float(getattr(row, columns["total"])),
+            "daily_forecast": float(getattr(row, columns["daily"])),
+            "lead_time_demand": float(getattr(row, columns["lead"])),
+            "coverage_demand": policy.coverage_demand,
+            "coverage_days": policy.coverage_days,
+            "safety_stock": policy.safety_stock,
+            "reorder_point": policy.reorder_point,
+            "target_inventory": policy.order_up_to,
+        })
+
+        # 7. Today's closing stock is tomorrow's opening stock.
+        current_stock = closing_stock
+
+    return pd.DataFrame(results)
+
 
 def simulate_backtest_day(
     current_date: pd.Timestamp,
@@ -506,175 +815,45 @@ def simulate_backtest_day(
     model_features: list[str],
     safety_stock: float,
     lead_time_days: int,
+    *,
+    profile="current",
+    custom: dict | None = None,
+    method: str = "xgboost",
 ) -> tuple[dict, PurchaseOrder | None]:
+    """Simulate one historical backtest day.
+
+    A thin wrapper over :func:`prepare_backtest_forecast` and
+    :func:`run_policy_replay` so a single day and a whole window run through
+    exactly the same replenishment code. The forecast uses only historical
+    information available before ``current_date``.
+
+    ``purchase_orders`` is the caller's open order book and is appended to in
+    place. The order placed today, if any, is returned alongside the day's
+    result.
     """
-    Simulate one historical backtest day.
 
-    The forecast is generated using only historical information
-    available before current_date.
-    """
-
-    current_date = pd.Timestamp(current_date)
-
-    product_history = product_history.copy()
-
-    product_history["date"] = pd.to_datetime(
-        product_history["date"]
-    )
-
-    # ---------------------------------------------------------
-    # 1. History available BEFORE today's date.
-    # ---------------------------------------------------------
-    history_before_today = (
-        product_history[
-            product_history["date"] < current_date
-        ]
-        .copy()
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
-
-    # ---------------------------------------------------------
-    # 2. Generate the existing V1 30-day forecast.
-    # ---------------------------------------------------------
-    forecast = forecast_product_demand(
+    before = len(purchase_orders)
+    days = prepare_backtest_forecast(
+        product_history,
+        current_date,
+        current_date,
         model=model,
-        product_history=history_before_today,
         model_features=model_features,
-        horizon=30,
+        lead_time_days=lead_time_days,
     )
-
-    # ---------------------------------------------------------
-    # 3. Calculate V1 forecast quantities.
-    # ---------------------------------------------------------
-    total_forecast = float(
-        forecast["forecast_units"].sum()
-    )
-
-    lead_time_demand = float(
-        forecast.head(lead_time_days)["forecast_units"].sum()
-    )
-
-    # ---------------------------------------------------------
-    # 4. Inventory arriving TODAY.
-    # ---------------------------------------------------------
-    arrival_qty = get_arrivals_for_date(
-        purchase_orders=purchase_orders,
-        date=current_date,
-    )
-
-    available_stock = current_stock + arrival_qty
-
-    # ---------------------------------------------------------
-    # 5. Actual historical demand for TODAY.
-    # ---------------------------------------------------------
-    today_rows = product_history[
-        product_history["date"] == current_date
-    ]
-
-    if today_rows.empty:
-        raise ValueError(
-            f"No historical demand found for {current_date}."
-        )
-
-    actual_demand = int(
-        today_rows["units_sold"].iloc[0]
-    )
-
-    # ---------------------------------------------------------
-    # 6. Consume today's actual demand.
-    # ---------------------------------------------------------
-    (
-        units_fulfilled,
-        stockout_units,
-        closing_stock,
-    ) = process_daily_demand(
-        available_stock=available_stock,
-        demand=actual_demand,
-    )
-
-    # ---------------------------------------------------------
-    # 7. Calculate inventory position AFTER demand.
-    # ---------------------------------------------------------
-    inventory_position = calculate_inventory_position(
-        current_stock=closing_stock,
-        purchase_orders=purchase_orders,
-        current_date=current_date,
-    )
-
-    # ---------------------------------------------------------
-    # 8. Calculate reorder point.
-    # ---------------------------------------------------------
-    reorder_point = calculate_reorder_point(
-        lead_time_demand=lead_time_demand,
+    replayed = run_policy_replay(
+        days,
+        starting_stock=current_stock,
         safety_stock=safety_stock,
+        lead_time_days=lead_time_days,
+        profile=profile,
+        custom=custom,
+        method=method,
+        purchase_orders=purchase_orders,
     )
 
-    # ---------------------------------------------------------
-    # 9. Decide whether V1 wants to reorder.
-    # ---------------------------------------------------------
-    reorder_required = should_reorder(
-        inventory_position=inventory_position,
-        reorder_point=reorder_point,
-    )
-
-    # ---------------------------------------------------------
-    # 10. Calculate V1 target inventory.
-    # ---------------------------------------------------------
-    target_inventory = calculate_target_inventory(
-        forecast_demand=total_forecast,
-        safety_stock=safety_stock,
-    )
-
-    # ---------------------------------------------------------
-    # 11. Calculate V1 order quantity.
-    # ---------------------------------------------------------
-    order_qty = calculate_recommended_order_qty(
-        target_inventory=target_inventory,
-        inventory_position=inventory_position,
-        reorder_required=reorder_required,
-    )
-
-    order_qty = float(
-        np.asarray(order_qty).item()
-    )
-
-    # ---------------------------------------------------------
-    # 12. Create today's purchase order if required.
-    # ---------------------------------------------------------
-    new_order = None
-
-    if order_qty > 0:
-
-        new_order = create_purchase_order(
-            order_date=current_date,
-            quantity=int(order_qty),
-            lead_time_days=lead_time_days,
-        )
-
-    # ---------------------------------------------------------
-    # 13. Record today's simulation result.
-    # ---------------------------------------------------------
-    daily_result = {
-        "date": current_date,
-        "opening_stock": current_stock,
-        "arrival_qty": arrival_qty,
-        "demand": actual_demand,
-        "units_fulfilled": units_fulfilled,
-        "stockout_units": stockout_units,
-        "closing_stock": closing_stock,
-        "total_forecast": total_forecast,
-        "lead_time_demand": lead_time_demand,
-        "safety_stock": safety_stock,
-        "reorder_point": reorder_point,
-        "inventory_position": inventory_position,
-        "reorder_required": reorder_required,
-        "target_inventory": target_inventory,
-        "order_qty": int(order_qty),
-    }
-
-    return daily_result, new_order
-
+    new_order = purchase_orders[before] if len(purchase_orders) > before else None
+    return replayed.iloc[0].to_dict(), new_order
 
 
 def run_backtest(
@@ -686,77 +865,43 @@ def run_backtest(
     model_features: list[str],
     safety_stock: float,
     lead_time_days: int,
+    *,
+    profile="current",
+    custom: dict | None = None,
 ) -> pd.DataFrame:
-    """
-    Run the V2 historical backtest for one product.
+    """Run the V2 historical backtest for one product.
 
     Each day:
         1. Use only history available before the day.
         2. Generate the existing V1 forecast.
-        3. Apply the existing V1 inventory policy.
+        3. Apply the replenishment policy — reorder point, inventory
+           position, order-up-to level, recommended order quantity.
         4. Create a purchase order if required.
         5. Receive orders arriving that day.
         6. Consume actual historical demand.
         7. Carry the inventory state into the next day.
+
+    ``profile`` selects the inventory policy; it defaults to ``current``, which
+    is the live V2 replenishment rule.
     """
 
-    start_date = pd.Timestamp(start_date)
-    end_date = pd.Timestamp(end_date)
-
-    product_history = product_history.copy()
-
-    product_history["date"] = pd.to_datetime(
-        product_history["date"]
+    days = prepare_backtest_forecast(
+        product_history,
+        start_date,
+        end_date,
+        model=model,
+        model_features=model_features,
+        lead_time_days=lead_time_days,
     )
-
-    product_history = (
-        product_history
-        .sort_values("date")
-        .reset_index(drop=True)
+    return run_policy_replay(
+        days,
+        starting_stock=starting_stock,
+        safety_stock=safety_stock,
+        lead_time_days=lead_time_days,
+        profile=profile,
+        custom=custom,
+        method="xgboost",
     )
-
-    backtest_days = product_history[
-        (product_history["date"] >= start_date)
-        & (product_history["date"] <= end_date)
-    ].copy()
-
-    if backtest_days.empty:
-        raise ValueError(
-            "No historical demand exists in the selected backtest period."
-        )
-
-    current_stock = int(starting_stock)
-
-    purchase_orders = []
-
-    results = []
-
-    for current_date in backtest_days["date"]:
-
-        daily_result, new_order = simulate_backtest_day(
-            current_date=current_date,
-            product_history=product_history,
-            current_stock=current_stock,
-            purchase_orders=purchase_orders,
-            model=model,
-            model_features=model_features,
-            safety_stock=safety_stock,
-            lead_time_days=lead_time_days,
-        )
-
-        # Keep the new order in the outstanding PO list.
-        if new_order is not None:
-            purchase_orders.append(new_order)
-
-        # Today's closing stock becomes tomorrow's opening stock.
-        current_stock = daily_result["closing_stock"]
-
-        results.append(daily_result)
-
-    return pd.DataFrame(results)
-
-
-
 
 
 def run_baseline_backtest(
@@ -767,153 +912,37 @@ def run_baseline_backtest(
     safety_stock,
     lead_time_days,
     forecast_window=7,
-):
+    *,
+    profile="current",
+    custom: dict | None = None,
+) -> pd.DataFrame:
+    """Run a historical inventory backtest using a moving-average forecast.
+
+    The same replenishment policy and simulation mechanics are used as the
+    XGBoost backtest — same product, same days, same starting stock, same
+    safety stock, same lead time. Only the forecasting method changes, which is
+    what makes the two comparable.
+
+    No model is taken because this arm never uses one: the moving average is
+    arithmetic over the days recorded before the simulated day, which is the
+    whole point of the comparison — it is the forecast EcomAI-OS would have
+    produced without any trained model at all.
     """
-    Run a historical inventory backtest using a moving-average forecast.
 
-    The same V1 inventory policy and simulation mechanics are used
-    as the XGBoost backtest. Only the forecasting method changes.
-    """
-
-    from src.models.baselines import moving_average_forecast
-
-    start_date = pd.Timestamp(start_date)
-    end_date = pd.Timestamp(end_date)
-
-    product_history = product_history.copy()
-    product_history["date"] = pd.to_datetime(
-        product_history["date"]
+    days = prepare_backtest_forecast(
+        product_history,
+        start_date,
+        end_date,
+        lead_time_days=lead_time_days,
+        forecast_window=forecast_window,
+        methods=("baseline",),
     )
-
-    product_history = (
-        product_history
-        .sort_values("date")
-        .reset_index(drop=True)
+    return run_policy_replay(
+        days,
+        starting_stock=starting_stock,
+        safety_stock=safety_stock,
+        lead_time_days=lead_time_days,
+        profile=profile,
+        custom=custom,
+        method="baseline",
     )
-
-    backtest_days = product_history[
-        (product_history["date"] >= start_date)
-        & (product_history["date"] <= end_date)
-    ].copy()
-
-    if backtest_days.empty:
-        raise ValueError(
-            "No historical demand exists in the selected backtest period."
-        )
-
-    current_stock = int(starting_stock)
-    purchase_orders = []
-    results = []
-
-    for current_date in backtest_days["date"]:
-
-        history_before_today = product_history[
-            product_history["date"] < current_date
-        ].copy()
-
-        baseline_daily_forecast = moving_average_forecast(
-            history=history_before_today,
-            window=forecast_window,
-        )
-
-        baseline_total_forecast = (
-            baseline_daily_forecast * 30
-        )
-
-        baseline_lead_time_demand = (
-            baseline_daily_forecast * lead_time_days
-        )
-
-        arrival_qty = get_arrivals_for_date(
-            purchase_orders=purchase_orders,
-            date=current_date,
-        )
-
-        available_stock = current_stock + arrival_qty
-
-        today_rows = product_history[
-            product_history["date"] == current_date
-        ]
-
-        if today_rows.empty:
-            raise ValueError(
-                f"No historical demand found for {current_date}."
-            )
-
-        actual_demand = int(
-            today_rows["units_sold"].iloc[0]
-        )
-
-        units_fulfilled, stockout_units, closing_stock = (
-            process_daily_demand(
-                available_stock=available_stock,
-                demand=actual_demand,
-            )
-        )
-
-        inventory_position = calculate_inventory_position(
-            current_stock=closing_stock,
-            purchase_orders=purchase_orders,
-            current_date=current_date,
-        )
-
-        reorder_point = calculate_reorder_point(
-            lead_time_demand=baseline_lead_time_demand,
-            safety_stock=safety_stock,
-        )
-
-        reorder_required = should_reorder(
-            inventory_position=inventory_position,
-            reorder_point=reorder_point,
-        )
-
-        target_inventory = calculate_target_inventory(
-            forecast_demand=baseline_total_forecast,
-            safety_stock=safety_stock,
-        )
-
-        order_qty = calculate_recommended_order_qty(
-            target_inventory=target_inventory,
-            inventory_position=inventory_position,
-            reorder_required=reorder_required,
-        )
-
-        order_qty = float(
-            np.asarray(order_qty).item()
-        )
-
-        new_order = None
-
-        if order_qty > 0:
-            new_order = create_purchase_order(
-                order_date=current_date,
-                quantity=int(order_qty),
-                lead_time_days=lead_time_days,
-            )
-
-            purchase_orders.append(new_order)
-
-        results.append(
-            {
-                "date": current_date,
-                "opening_stock": current_stock,
-                "arrival_qty": arrival_qty,
-                "demand": actual_demand,
-                "units_fulfilled": units_fulfilled,
-                "stockout_units": stockout_units,
-                "closing_stock": closing_stock,
-                "baseline_daily_forecast": baseline_daily_forecast,
-                "baseline_total_forecast": baseline_total_forecast,
-                "baseline_lead_time_demand": baseline_lead_time_demand,
-                "safety_stock": safety_stock,
-                "reorder_point": reorder_point,
-                "inventory_position": inventory_position,
-                "reorder_required": reorder_required,
-                "target_inventory": target_inventory,
-                "order_qty": int(order_qty),
-            }
-        )
-
-        current_stock = closing_stock
-
-    return pd.DataFrame(results)
