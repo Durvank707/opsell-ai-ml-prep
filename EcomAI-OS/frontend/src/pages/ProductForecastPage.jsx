@@ -141,7 +141,7 @@ export default function ProductForecastPage() {
               icon={LineChart}
               onClick={() => navigate('/app/forecast')}
             >
-              Portfolio Forecast
+              All Forecasts
             </Button>
           </>
         }

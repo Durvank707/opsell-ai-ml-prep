@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { TrendingUp, Info, Sparkles, Package, ArrowUpRight, ArrowDownRight, AlertTriangle } from 'lucide-react';
+import { TrendingUp, Info, Sparkles, Package, ArrowUpRight, ArrowDownRight, AlertTriangle, Search, ChevronRight } from 'lucide-react';
 import PageHeader from '../components/ui/PageHeader';
 import Button from '../components/ui/Button';
 import Card from '../components/ui/Card';
@@ -10,13 +10,32 @@ import { SearchInput, Select } from '../components/ui/form';
 import { LoadingSkeleton, SkeletonChart } from '../components/ui/Skeleton';
 import { DemandChart } from '../components/charts';
 import { getForecastOverview, generatePortfolioForecast } from '../services/forecastService';
+import { listProducts } from '../services/inventoryService';
 import { portfolioRowStatus } from '../services/forecastStatus';
+import { normalizeQuery, searchProducts } from '../services/productSearch';
 import { useAuth } from '../context/AuthContext';
 import { useData } from '../context/DataContext';
 import { useToast } from '../context/ToastContext';
 import { formatNumber, cn } from '../lib/utils';
 
 const HORIZONS = [7, 30, 90];
+
+// The catalog is paginated, so a search reads it a page at a time and then
+// keeps the whole list. The walk is bounded so a very large catalog cannot
+// turn one search into an unbounded request loop.
+const CATALOG_PAGE_SIZE = 200;
+const CATALOG_MAX_PAGES = 20;
+
+async function loadProductIndex(user) {
+  const items = [];
+  for (let page = 1; page <= CATALOG_MAX_PAGES; page += 1) {
+    const result = await listProducts(user, { page, pageSize: CATALOG_PAGE_SIZE });
+    const pageItems = result?.items || [];
+    items.push(...pageItems);
+    if (items.length >= (result?.total ?? pageItems.length)) break;
+  }
+  return items;
+}
 
 export default function ForecastPage() {
   const { user } = useAuth();
@@ -32,16 +51,17 @@ export default function ForecastPage() {
   const [error, setError] = useState('');
   const [generating, setGenerating] = useState(false);
   const [showHow, setShowHow] = useState(false);
+  const [catalog, setCatalog] = useState(null);
+  const [catalogError, setCatalogError] = useState('');
+
+  // The comparison is normalized, so every spelling of the same name resolves
+  // to the same product. A blank or whitespace-only box is no search at all.
+  const query = normalizeQuery(search);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       const data = await getForecastOverview(user, { horizon, category: category === 'all' ? null : category });
-      // apply client-side search filter to rows
-      if (search.trim()) {
-        const q = search.toLowerCase();
-        data.rows = data.rows.filter((r) => r.name.toLowerCase().includes(q) || r.id.toLowerCase().includes(q));
-      }
       setOverview(data);
       setError('');
     } catch (e) {
@@ -49,12 +69,30 @@ export default function ForecastPage() {
     } finally {
       setLoading(false);
     }
-  }, [user, horizon, category, search]);
+  }, [user, horizon, category]);
 
   useEffect(() => {
     const t = setTimeout(load, 150);
     return () => clearTimeout(t);
   }, [load]);
+
+  // The catalog is only needed to answer a search, so it is read on the first
+  // search and then kept for the life of the page. Typing never re-reads it, and
+  // the portfolio forecast above is not re-requested while the user searches.
+  // The guard is a ref rather than the state, so a keystroke that changes the
+  // query mid-flight cannot cancel the read that is already under way.
+  const catalogRequested = useRef(false);
+  useEffect(() => {
+    if (!query || catalogRequested.current) return;
+    catalogRequested.current = true;
+    loadProductIndex(user)
+      .then(setCatalog)
+      .catch((e) => setCatalogError(e.message || 'Unable to search your products.'));
+  }, [query, user]);
+
+  // One match is unambiguous, but several are not: the list is shown and the
+  // reader picks the product they meant.
+  const matches = useMemo(() => searchProducts(catalog, query), [catalog, query]);
 
   const handleGenerate = async () => {
     setGenerating(true);
@@ -146,7 +184,12 @@ export default function ForecastPage() {
             <option value="Office">Office</option>
             <option value="Mobile">Mobile</option>
           </Select>
-          <SearchInput value={search} onChange={setSearch} placeholder="Search products…" className="w-full sm:w-56" />
+          <SearchInput
+            value={search}
+            onChange={setSearch}
+            placeholder="Search a product’s forecast…"
+            className="w-full sm:w-64"
+          />
           <button
             onClick={() => setShowHow((s) => !s)}
             className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
@@ -171,8 +214,73 @@ export default function ForecastPage() {
         )}
       </Card>
 
+      {/* A search resolves a product and hands over to its own forecast page. */}
+      {query && (
+        <Card
+          title={
+            catalog && matches.length > 0
+              ? `${matches.length} product${matches.length > 1 ? 's' : ''} matching “${search.trim()}”`
+              : 'Product forecast'
+          }
+          subtitle="Open a product to see its own demand forecast, its model and its history."
+          actions={
+            <Button variant="secondary" icon={TrendingUp} onClick={() => setSearch('')}>
+              All Forecasts
+            </Button>
+          }
+          bodyClassName="p-0"
+          pad={false}
+        >
+          {catalogError ? (
+            <div className="p-5">
+              <EmptyState
+                icon={AlertTriangle}
+                title="Search unavailable"
+                description={catalogError}
+                actionLabel="Back to all forecasts"
+                onAction={() => setSearch('')}
+              />
+            </div>
+          ) : !catalog ? (
+            <p className="px-5 py-6 text-sm text-slate-500">Searching your products…</p>
+          ) : matches.length === 0 ? (
+            <div className="p-5">
+              <EmptyState
+                icon={Search}
+                title="No product found"
+                description={`No product in your catalog is named “${search.trim()}”. Check the spelling, or search by product ID such as P006.`}
+                actionLabel="Back to all forecasts"
+                onAction={() => setSearch('')}
+              />
+            </div>
+          ) : (
+            <ul className="divide-y divide-slate-100">
+              {matches.map((p) => (
+                <li key={p.id}>
+                  <button
+                    type="button"
+                    onClick={() => navigate(`/app/products/${p.id}/forecast`)}
+                    className="flex w-full items-center gap-3 px-5 py-3.5 text-left transition-colors hover:bg-slate-50"
+                  >
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-bold text-slate-800">{p.name}</span>
+                      <span className="block text-xs text-slate-400">
+                        <span className="font-mono">{p.id}</span>
+                        {p.category ? <span> · {p.category}</span> : null}
+                      </span>
+                    </span>
+                    <span className="shrink-0 text-xs font-semibold text-brand-600">View forecast</span>
+                    <ChevronRight className="h-4 w-4 shrink-0 text-slate-300" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </Card>
+      )}
+
       {/* Metrics */}
-      {overview && overview.metrics.totalForecastUnits > 0 ? (
+      {!query && (overview && overview.metrics.totalForecastUnits > 0 ? (
         <>
           <div className="grid grid-cols-2 gap-4 xl:grid-cols-4">
             {metricsCards.map((m) => (
@@ -276,7 +384,7 @@ export default function ForecastPage() {
             onAction={() => navigate('/app/sales')}
           />
         </Card>
-      )}
+      ))}
     </div>
   );
 }
