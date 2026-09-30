@@ -139,27 +139,27 @@ export default function SimulationPage() {
         past the viewport, so the page scrolled while the form stayed pinned —
         leaving a tall empty column beside results the reader was still working
         through, and giving the timeline a third of the width it needs. Stacking
-        them keeps both in the normal document flow: the form is read once, and
-        the results get the full content width.
+        them keeps both in the normal document flow.
+
+        Both sections carry no width classes at all, which is what makes them
+        align. An earlier version capped the form at `max-w-4xl` on the theory
+        that a form reads better in a narrow measure; in practice it left the
+        setup card visibly narrower than the results beneath it, so the page
+        looked like two different documents stacked. Same container, same edges.
       */}
       <section aria-labelledby="simulation-setup-heading">
         <h2 id="simulation-setup-heading" className="sr-only">
           Configure simulation
         </h2>
-        {/* A form is a reading column, not a page. Capping the measure keeps the
-            four steps compact and stops a two-field row stretching the width of
-            the content area; the results below are what use the full width. */}
-        <div className="max-w-4xl">
-          <SimulationConfig
-            products={products}
-            dataRange={dataRange}
-            onRun={handleRun}
-            running={running}
-            progressStep={
-              running ? 'Replaying demand, reorders and arrivals day by day…' : ''
-            }
-          />
-        </div>
+        <SimulationConfig
+          products={products}
+          dataRange={dataRange}
+          onRun={handleRun}
+          running={running}
+          progressStep={
+            running ? 'Replaying demand, reorders and arrivals day by day…' : ''
+          }
+        />
       </section>
 
       <section aria-labelledby="simulation-results-heading">

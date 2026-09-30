@@ -405,13 +405,44 @@ describe('nothing on the page scrolls on its own', () => {
   });
 });
 
-describe('the results get the full width', () => {
-  it('constrains only the form, which is a reading column', async () => {
+// The page stacks two sections. They have to look like two panels of the same
+// document, which means the same left and right edges — so neither may carry a
+// width or offset class the other lacks. A cap on the form (it was `max-w-4xl`)
+// left the setup card visibly narrower than the results under it.
+describe('both sections are the same width', () => {
+  it('gives the two sections identical boxes', async () => {
     await renderPage();
-    // A form stretched across a wide screen is harder to read, not easier, so
-    // the setup keeps a measure of its own. The results get everything else.
-    expect(setupRegion().querySelector('.max-w-4xl')).not.toBeNull();
-    expect(resultsRegion().querySelector('.max-w-4xl')).toBeNull();
+    // Neither <section> declares a class at all, so there is no max-width, no
+    // fixed width and no margin offset that could make one box differ from the
+    // other. The setup was once wrapped in `max-w-4xl`, which left it visibly
+    // narrower than the results beneath it; this is the whole guarantee.
+    expect(setupRegion().className).toBe('');
+    expect(resultsRegion().className).toBe(setupRegion().className);
+  });
+
+  it('caps neither the setup nor the results', async () => {
+    await renderPage();
+    fireEvent.click(runButton());
+    await waitFor(() => expect(screen.getByTestId('results-panel')).toBeInTheDocument());
+
+    // Checked on the outermost box of each section, since a cap could be
+    // reintroduced on the section itself or on a wrapper just inside it.
+    const setupCard = setupRegion().querySelector('section.card');
+    expect(setupCard).not.toBeNull();
+    for (const node of [setupRegion(), setupCard, resultsRegion(), screen.getByTestId('results-panel')]) {
+      expect(node.className || '').not.toMatch(/max-w-|w-\[/);
+    }
+  });
+
+  it('does not narrow the form with an inner wrapper', async () => {
+    await renderPage();
+    // The form's card is a direct child of the section. One level in, nothing
+    // sits between the section and the card to reintroduce a narrower measure.
+    const children = [...setupRegion().children];
+    expect(children).toHaveLength(2);
+    expect(children[0].tagName).toBe('H2');
+    expect(children[1].className).toBe('card');
+    expect(setupRegion().querySelector('.max-w-4xl')).toBeNull();
   });
 
   it('puts no width cap between the results and the content area', async () => {
