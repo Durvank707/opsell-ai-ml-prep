@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { NAV_SECTIONS } from './Sidebar';
 import { Avatar } from './Logo';
+import ThemeToggle from '../ThemeToggle';
 import { useAuth } from '../../context/AuthContext';
 import { useData } from '../../context/DataContext';
 import { listProducts } from '../../services/inventoryService';
@@ -152,6 +153,11 @@ export default function Header({ onMenuClick, onLogout }) {
       </div>
 
       <div className="ml-auto flex items-center gap-1.5 md:ml-0">
+        {/* Theme — the app has one, and this is where the header puts global
+            controls. AuthLayout renders the same component, because those pages
+            sit outside the app shell. */}
+        <ThemeToggle />
+
         {/* Notifications */}
         <div ref={notifRef} className="relative">
           <button

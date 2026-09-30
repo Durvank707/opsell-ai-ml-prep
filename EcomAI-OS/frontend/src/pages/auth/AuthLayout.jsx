@@ -1,13 +1,17 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
 import { Logo } from '../../components/layout/Logo';
+import ThemeToggle from '../../components/ThemeToggle';
 import { cn } from '../../lib/utils';
 
 export default function AuthLayout({ children }) {
   return (
     <div className="flex min-h-screen bg-slate-50">
-      {/* Left brand panel */}
-      <div className="relative hidden w-1/2 flex-col justify-between overflow-hidden bg-slate-900 lg:flex">
+      {/* Left brand panel. `surface-inverse` rather than `bg-slate-900`: the
+          neutral ramp inverts between themes, and this panel has to stay the
+          dark brand panel in both — white text on a light panel would be
+          unreadable. */}
+      <div className="surface-inverse relative hidden w-1/2 flex-col justify-between overflow-hidden lg:flex">
         <div className="absolute inset-0 opacity-[0.16]" aria-hidden>
           <InventoryViz />
         </div>
@@ -48,13 +52,17 @@ export default function AuthLayout({ children }) {
 
       {/* Right form panel */}
       <div className="flex w-full flex-col lg:w-1/2">
-        <div className="flex items-center justify-between p-5 lg:hidden">
-          <Link to="/" className="flex items-center gap-2.5">
+        {/* The auth pages sit outside the app shell, so this bar is where the
+            one theme toggle lives for them. It is the same component the app
+            header uses, reading the same context — not a second control. */}
+        <div className="flex items-center justify-between p-5">
+          <Link to="/" className="flex items-center gap-2.5 lg:hidden">
             <Logo size="sm" />
             <span className="text-base font-extrabold text-slate-900">
               EcomAI<span className="text-brand-600">-OS</span>
             </span>
           </Link>
+          <ThemeToggle className="ml-auto" />
         </div>
         <div className={cn('flex flex-1 items-center justify-center px-4 pb-12 sm:px-8')}>
           <div className="w-full max-w-sm">{children}</div>

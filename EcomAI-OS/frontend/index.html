@@ -14,6 +14,35 @@
       name="description"
       content="EcomAI-OS helps e-commerce businesses understand inventory, predict demand, and make better stock decisions."
     />
+    <script>
+      // Apply the saved (or system) theme before the first paint.
+      //
+      // Every colour in the app is a CSS custom property declared twice in
+      // src/index.css — once under :root and once under .dark — so flipping one
+      // class on <html> is the whole switch. Doing it here rather than in React
+      // means the first frame is already the right theme instead of flashing
+      // white before the bundle loads. ThemeProvider re-reads the same values
+      // once it mounts and finds them already correct, so nothing jumps.
+      (function () {
+        try {
+          var stored = localStorage.getItem('ecomai-theme');
+          var theme =
+            stored === 'dark' || stored === 'light'
+              ? stored
+              : window.matchMedia('(prefers-color-scheme: dark)').matches
+                ? 'dark'
+                : 'light';
+          var root = document.documentElement;
+          root.classList.toggle('dark', theme === 'dark');
+          root.dataset.theme = theme;
+          root.style.colorScheme = theme;
+          var meta = document.querySelector('meta[name="theme-color"]');
+          if (meta) meta.setAttribute('content', theme === 'dark' ? '#090e1a' : '#ffffff');
+        } catch (e) {
+          /* storage blocked: fall through to the light theme in index.css */
+        }
+      })();
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link

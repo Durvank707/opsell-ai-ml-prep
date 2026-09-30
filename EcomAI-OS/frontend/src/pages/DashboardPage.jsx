@@ -368,7 +368,7 @@ function OnboardingView({ setup, firstName, greeting }) {
             {/* decorative chart bars */}
             <div className="flex h-full items-end justify-end gap-2 p-8">
               {[40, 65, 50, 78, 60, 88, 72, 96].map((h, i) => (
-                <div key={i} className="w-8 rounded-t-lg bg-white" style={{ height: `${h}%` }} />
+                <div key={i} className="on-accent w-8 rounded-t-lg" style={{ height: `${h}%` }} />
               ))}
             </div>
           </div>

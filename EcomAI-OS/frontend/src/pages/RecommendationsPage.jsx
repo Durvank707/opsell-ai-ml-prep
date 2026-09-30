@@ -101,7 +101,7 @@ export default function RecommendationsPage() {
                     <span
                       className={cn(
                         'tnum rounded-full px-1.5 text-[10px] font-bold',
-                        filter === f.value ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-500',
+                        filter === f.value ? 'on-accent-soft text-white' : 'bg-slate-100 text-slate-500',
                       )}
                     >
                       {formatNumber(count)}

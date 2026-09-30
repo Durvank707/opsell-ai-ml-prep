@@ -2,8 +2,271 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ==========================================================================
+   Theme tokens
+   --------------------------------------------------------------------------
+   Every colour the app paints with is declared here exactly once, in two
+   blocks: `:root` for the light theme and `.dark` for the dark theme.
+
+   tailwind.config.js maps Tailwind's utility names onto these properties, so
+   a component keeps writing the same utilities in both themes
+   (`bg-white`, `text-slate-600`, `border-rose-200`) and never needs a `dark:`
+   variant of its own. The dark theme is therefore a palette swap, not a second
+   set of component styles.
+
+   Channels are space separated so Tailwind can layer its own opacity
+   modifiers on top: `bg-rose-50/60` compiles to
+   `rgb(var(--rose-surface) / 0.6)`.
+   ========================================================================== */
+
 :root {
   font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  color-scheme: light;
+
+  /* Surfaces. `--surface` is what `bg-white` means: cards, inputs, menus,
+     popovers. The page itself is `--slate-50`. */
+  --surface: 255 255 255;
+
+  /* The scrim behind modals, the mobile drawer and the auth brand panel. It
+     has to stay a dark scrim in both themes; see the utility overrides at the
+     bottom of this file, which repoint slate-900's alpha forms at it. */
+  --scrim: 15 23 42;
+
+  /* The always-dark brand panel on the auth pages. Deliberately not part of
+     the neutral ramp: the ramp inverts, and a light panel behind white text
+     would be unreadable in the dark theme. */
+  --surface-inverse: 15 23 42;
+  --surface-inverse-2: 30 41 59;
+
+  /* White, for the parts of a brand-coloured surface that need to read as
+     light: the decorative bars on the dashboard hero, and a translucent
+     version of the same for the filter pill sitting on that gradient. Neither
+     follows the theme, which is the point — they sit on a saturated fill. */
+  --on-accent: 255 255 255;
+  --on-accent-soft: 255 255 255;
+
+  /* ---- Neutrals --------------------------------------------------------
+     The neutral ramp is inverted between themes so that "light surface,
+     dark text" keeps meaning the same thing: slate-50 is always the page
+     background and slate-900 is always the strongest body text. In the dark
+     theme that means the ramp runs from near-black to near-white, which keeps
+     every existing `text-slate-*` utility readable without touching it. */
+  --slate-50: 248 250 252; /* #f8fafc page background */
+  --slate-100: 241 245 249; /* #f1f5f9 subtle fill, hover */
+  --slate-200: 226 232 240; /* #e2e8f0 hairline border */
+  --slate-300: 203 213 225; /* #cbd5e1 control border */
+  --slate-400: 148 163 184; /* #94a3b8 muted text */
+  --slate-500: 100 116 139; /* #64748b secondary text */
+  --slate-600: 71 85 105; /* #475569 body text */
+  --slate-700: 51 65 85; /* #334155 */
+  --slate-800: 30 41 59; /* #1e293b */
+  --slate-900: 15 23 42; /* #0f172a strongest text */
+  --slate-950: 2 6 23; /* #020617 */
+
+  /* ---- Brand (indigo) --------------------------------------------------
+     The accent keeps its identity in both themes: `--brand-solid-*` is the
+     button and gradient colour, and white text sits on it at 5.4:1 either
+     way. The tinted roles carry the theme instead.
+
+     Every light value below is Tailwind's, unchanged, so the light theme is
+     the theme this app already had. Only the `.dark` block is new. */
+  --brand-surface: 238 242 255; /* 50  tinted panel */
+  --brand-surface-2: 224 231 255; /* 100 */
+  --brand-line-100: 224 231 255; /* #e0e7ff 100 border */
+  --brand-line-200: 199 210 254; /* #c7d2fe 200 border */
+  --brand-line-300: 165 180 252; /* #a5b4fc 300 border */
+  --brand-line-400: 129 140 248; /* #818cf8 400 border, hover */
+  --brand-solid-500: 99 102 241; /* #6366f1 */
+  --brand-solid-600: 79 70 229; /* #4f46e5 */
+  --brand-solid-700: 67 56 202; /* #4338ca */
+  --brand-text-500: 99 102 241; /* 500  text */
+  --brand-text-600: 79 70 229; /* 600  text, links */
+  --brand-text-700: 67 56 202; /* 700  text */
+
+  --rose-surface: 255 241 242; /* 50 */
+  --rose-surface-2: 255 228 230; /* 100 */
+  --rose-line: 254 205 211; /* 200 */
+  --rose-solid-500: 244 63 94; /* #f43f5e */
+  --rose-solid-600: 225 29 72; /* #e11d48 */
+  --rose-solid-700: 190 18 60; /* #be123c */
+  --rose-text-400: 251 113 133; /* 400  focus ring */
+  --rose-text-500: 244 63 94; /* #f43f5e 500 */
+  --rose-text-600: 225 29 72; /* 600 */
+  --rose-text-700: 190 18 60; /* 700 */
+
+  --emerald-surface: 236 253 245; /* 50 */
+  --emerald-surface-2: 209 250 229; /* 100 */
+  --emerald-line: 167 243 208; /* 200 */
+  --emerald-solid-500: 16 185 129; /* #10b981 */
+  --emerald-solid-600: 5 150 105; /* #059669 */
+  --emerald-text-600: 5 150 105; /* 600 */
+  --emerald-text-700: 4 120 87; /* 700 */
+  --emerald-text-800: 6 95 70; /* 800 */
+  --emerald-text-900: 6 78 59; /* 900 */
+
+  --amber-surface: 255 251 235; /* 50 */
+  --amber-surface-2: 254 243 199; /* 100 */
+  --amber-line-100: 254 243 199; /* #fef3c7 100 */
+  --amber-line-200: 253 230 138; /* #fde68a 200 */
+  --amber-solid-500: 245 158 11; /* #f59e0b */
+  --amber-text-500: 245 158 11; /* 500 */
+  --amber-text-600: 217 119 6; /* 600 */
+  --amber-text-700: 180 83 9; /* 700 */
+  --amber-text-800: 146 64 14; /* 800 */
+  --amber-text-900: 120 53 15; /* 900 */
+
+  --sky-surface: 240 249 255; /* 50 */
+  --sky-surface-2: 224 242 254; /* 100 */
+  --sky-line: 186 230 253; /* 200 */
+  --sky-solid-500: 14 165 233; /* #0ea5e9 */
+  --sky-solid-600: 2 132 199; /* #0284c7 */
+  --sky-text-600: 2 132 199; /* 600 */
+  --sky-text-700: 3 105 161; /* 700 */
+
+  --indigo-surface: 238 242 255; /* 50 */
+  --indigo-line: 224 231 255; /* 200 */
+  --indigo-text-600: 79 70 229; /* 600 */
+
+  /* Violet and cyan carry the two informational callouts - the upload
+     instructions and the format list. Rare enough to be listed last, but
+     listed rather than left on Tailwind's defaults, which are light-mode
+     colours and would leave a near-white panel in the dark theme. */
+  --violet-surface: 245 243 255; /* #f5f3ff 50 */
+  --violet-surface-2: 237 233 254; /* 100 */
+  --violet-line: 221 214 254; /* #ddd6fe 200 */
+  --violet-solid-600: 124 58 237; /* #7c3aed */
+  --violet-text-500: 139 92 246; /* 500 */
+  --violet-text-600: 124 58 237; /* 600 */
+  --violet-text-700: 109 40 217; /* #6d28d9 700 */
+  --violet-text-800: 91 33 182; /* #5b21b6 800 */
+
+  --cyan-surface: 236 254 255; /* #ecfeff 50 */
+  --cyan-surface-2: 206 250 254; /* 100 */
+  --cyan-line: 165 243 252; /* #a5f3fc 200 */
+  --cyan-text-700: 14 116 144; /* #0e7490 700 */
+
+  /* ---- Elevation -------------------------------------------------------
+     A shadow darkens what is behind it, which is invisible on a dark
+     surface. The dark theme raises the opacity so panels still read as
+     raised, while the card border does most of the separating work. */
+  --shadow-soft: 0 1px 2px 0 rgb(15 23 42 / 0.04), 0 1px 3px 0 rgb(15 23 42 / 0.06);
+  --shadow-card: 0 1px 2px 0 rgb(15 23 42 / 0.05), 0 4px 12px -2px rgb(15 23 42 / 0.06);
+  --shadow-pop: 0 4px 6px -1px rgb(15 23 42 / 0.08), 0 12px 24px -8px rgb(15 23 42 / 0.12);
+}
+
+/* --------------------------------------------------------------------------
+   Dark theme.
+
+   Applied by a class on <html> so a single attribute drives the whole app,
+   and so the preference can be flipped before React mounts (see the inline
+   script in index.html) without a flash of the wrong theme.
+
+   The neutrals invert: slate-50 becomes the page, slate-900 the text. The
+   dark values are not the light ones flipped — they are hand-picked so that
+   muted text clears 4.5:1 on the page and on a card, and so that surfaces
+   are a visible step apart rather than a flat field of near-black.
+   -------------------------------------------------------------------------- */
+.dark {
+  color-scheme: dark;
+
+  --surface: 21 29 45; /* #151d2d cards, inputs, menus */
+
+  --scrim: 0 0 0;
+
+  /* Unchanged: this panel is dark in both themes by design. */
+  --surface-inverse: 15 23 42;
+  --surface-inverse-2: 30 41 59;
+
+  /* Neutrals, lightest-shade-first → darkest. Nothing here is pure black:
+     the page is a deep blue-slate that keeps the indigo accent harmonious. */
+  --slate-50: 9 14 26; /* #090e1a page background */
+  --slate-100: 17 24 39; /* #111827 subtle fill, hover */
+  --slate-200: 30 41 59; /* #1e293b hairline border */
+  --slate-300: 92 109 133; /* #5c6d85 control border (3.2:1 on a card, 3.7:1 on the page) */
+  --slate-400: 125 141 163; /* #7d8da3 muted text (5.3:1 on the page) */
+  --slate-500: 143 160 181; /* #8fa0b5 secondary text */
+  --slate-600: 169 184 202; /* #a9b8ca body text */
+  --slate-700: 203 213 225; /* #cbd5e1 */
+  --slate-800: 226 232 240; /* #e2e8f0 */
+  --slate-900: 241 245 249; /* #f1f5f9 strongest text */
+  --slate-950: 248 250 252; /* #f8fafc */
+
+  --brand-surface: 30 27 75; /* #1e1b4b */
+  --brand-surface-2: 38 38 96; /* #262660 */
+  --brand-line-100: 55 48 163; /* #3730a3 */
+  --brand-line-200: 55 48 163; /* #3730a3 */
+  --brand-line-300: 74 65 190; /* brighter: this is a hover border */
+  --brand-line-400: 99 102 241; /* #6366f1 */
+  --brand-solid-500: 99 102 241; /* unchanged: it is a button fill */
+  --brand-solid-600: 79 70 229; /* unchanged: white text sits on it at 5.4:1 */
+  --brand-solid-700: 67 56 202; /* unchanged: gradient stop */
+  --brand-text-500: 129 140 248; /* #818cf8 */
+  --brand-text-600: 165 180 252; /* #a5b4fc */
+  --brand-text-700: 199 210 254; /* #c7d2fe */
+
+  --rose-surface: 43 17 25; /* #2b1119 */
+  --rose-surface-2: 61 22 34; /* #3d1622 */
+  --rose-line: 127 29 58; /* #7f1d3a */
+  --rose-solid-500: 244 63 94; /* unchanged: badge fill under white text */
+  --rose-solid-600: 225 29 72; /* unchanged: white text sits on it at 4.9:1 */
+  --rose-solid-700: 190 18 60; /* unchanged: hover fill */
+  --rose-text-400: 251 113 133; /* #fb7185 focus ring */
+  --rose-text-500: 251 113 133; /* #fb7185 */
+  --rose-text-600: 253 164 175; /* #fda4af */
+  --rose-text-700: 254 205 211; /* #fecdd3 */
+
+  --emerald-surface: 6 40 31; /* #06281f */
+  --emerald-surface-2: 10 58 44; /* #0a3a2c */
+  --emerald-line: 6 95 70; /* #065f46 */
+  --emerald-solid-500: 16 185 129; /* unchanged */
+  --emerald-solid-600: 5 150 105; /* unchanged */
+  --emerald-text-600: 110 231 183; /* #6ee7b7 */
+  --emerald-text-700: 167 243 208; /* #a7f3d0 */
+  --emerald-text-800: 209 250 229; /* #d1fae5 */
+  --emerald-text-900: 236 253 245; /* #ecfdf5 */
+
+  --amber-surface: 43 30 5; /* #2b1e05 */
+  --amber-surface-2: 61 44 7; /* #3d2c07 */
+  --amber-line-100: 120 53 15; /* #78350f */
+  --amber-line-200: 120 53 15; /* #78350f */
+  --amber-solid-500: 245 158 11; /* unchanged */
+  --amber-text-500: 251 191 36; /* #fbbf24 */
+  --amber-text-600: 252 211 77; /* #fcd34d */
+  --amber-text-700: 253 230 138; /* #fde68a */
+  --amber-text-800: 254 243 199; /* #fef3c7 */
+  --amber-text-900: 255 251 235; /* #fffbeb */
+
+  --sky-surface: 8 47 73; /* #082f49 */
+  --sky-surface-2: 12 74 110; /* #0c4a6e */
+  --sky-line: 7 89 133; /* #075985 */
+  --sky-solid-500: 14 165 233; /* unchanged */
+  --sky-solid-600: 2 132 199; /* unchanged */
+  --sky-text-600: 125 211 252; /* #7dd3fc */
+  --sky-text-700: 186 230 253; /* #bae6fd */
+
+  --indigo-surface: 30 27 75; /* #1e1b4b */
+  --indigo-line: 55 48 163; /* #3730a3 */
+  --indigo-text-600: 165 180 252; /* #a5b4fc */
+
+  /* The callout panels keep a violet/cyan tint on a dark surface rather than
+     going neutral, so they still read as the informational block they were. */
+  --violet-surface: 31 22 51; /* #1f1633 */
+  --violet-surface-2: 46 33 73; /* #2e2149 */
+  --violet-line: 76 58 122; /* #4c3a7a */
+  --violet-solid-600: 124 58 237; /* unchanged: it is a badge fill */
+  --violet-text-500: 167 139 250; /* #a78bfa 6.3:1 on the panel */
+  --violet-text-600: 196 181 253; /* #c4b5fd 9.3:1 */
+  --violet-text-700: 221 214 254; /* #ddd6fe 12.4:1 */
+  --violet-text-800: 237 233 254; /* #ede9fe 14.5:1 */
+
+  --cyan-surface: 8 47 51; /* #082f33 */
+  --cyan-surface-2: 11 63 70; /* #0b3f46 */
+  --cyan-line: 21 94 107; /* #155e6b */
+  --cyan-text-700: 103 232 249; /* #67e8f9 9.9:1 on the panel */
+
+  --shadow-soft: 0 1px 2px 0 rgb(0 0 0 / 0.32), 0 1px 3px 0 rgb(0 0 0 / 0.28);
+  --shadow-card: 0 1px 2px 0 rgb(0 0 0 / 0.4), 0 4px 14px -2px rgb(0 0 0 / 0.34);
+  --shadow-pop: 0 4px 6px -1px rgb(0 0 0 / 0.5), 0 14px 28px -8px rgb(0 0 0 / 0.5);
 }
 
 html {
@@ -33,13 +296,13 @@ pre {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #cbd5e1;
+  background: rgb(var(--slate-300));
   border-radius: 9999px;
   border: 2px solid transparent;
   background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #94a3b8;
+  background: rgb(var(--slate-400));
   border: 2px solid transparent;
   background-clip: content-box;
 }
@@ -92,5 +355,42 @@ pre {
 
   .table-td {
     @apply px-4 py-3 text-sm text-slate-700 whitespace-nowrap;
+  }
+}
+
+/* ---------- Theme utilities ----------
+   A few roles do not map onto a Tailwind colour key: an always-dark brand
+   panel, and a translucent white that must stay white on top of a coloured
+   surface. They are declared here so components reach for a class, not a
+   hex. */
+@layer utilities {
+  .surface-inverse {
+    background-color: rgb(var(--surface-inverse));
+    color: #fff;
+  }
+
+  .on-accent {
+    background-color: rgb(var(--on-accent));
+  }
+
+  .on-accent-soft {
+    background-color: rgb(var(--on-accent-soft) / 0.2);
+  }
+}
+
+/* The scrim behind modals, the mobile drawer and the auth panel. Remapping the
+   neutral ramp would otherwise turn slate-900 light and wash these overlays
+   out, so the alpha forms of it are repointed at the scrim token. */
+@layer utilities {
+  .bg-slate-900\/40 {
+    background-color: rgb(var(--scrim) / 0.4);
+  }
+  .from-slate-900\/40 {
+    --tw-gradient-from: rgb(var(--scrim) / 0.4) var(--tw-gradient-from-position);
+    --tw-gradient-to: rgb(var(--scrim) / 0) var(--tw-gradient-to-position);
+    --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to);
+  }
+  .to-slate-900\/60 {
+    --tw-gradient-to: rgb(var(--scrim) / 0.6) var(--tw-gradient-to-position);
   }
 }

@@ -8,7 +8,6 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
-  Legend,
   PieChart,
   Pie,
   Cell,
@@ -18,15 +17,46 @@ import {
   ReferenceLine,
 } from 'recharts';
 import { formatNumber } from '../lib/utils';
+import { useChartTokens } from '../theme/chartTokens';
 
 // Shared chart theming -------------------------------------------------------
+//
+// Colours come from the theme rather than being written into each chart, so the
+// axis text, grid lines, series and warning markers all stay legible in the dark
+// theme without a per-theme branch anywhere below. See src/theme/chartTokens.js.
 
-const AXIS_TICK = { fontSize: 11, fill: '#64748b' };
-const GRID = { stroke: '#e2e8f0', strokeDasharray: '3 3', vertical: false };
+function useChartTheme() {
+  const t = useChartTokens();
+  return {
+    ...t,
+    axisTick: { fontSize: 11, fill: t.axis },
+    axisLine: { stroke: t.grid },
+    grid: { stroke: t.grid, strokeDasharray: '3 3', vertical: false },
+  };
+}
 
-export const ACTUAL_COLOR = '#334155';
-export const FORECAST_COLOR = '#4f46e5';
-export const BAND_COLOR = '#818cf8';
+/**
+ * A legend drawn from the series the chart is about to paint.
+ *
+ * recharts' own Legend takes each label's colour from the series it belongs to,
+ * which conflates two different things: the band is filled in a light indigo, so
+ * its label was rendered in that same light indigo - readable on white, not on a
+ * dark surface. Listing the series here keeps the swatch tied to the series
+ * colour while the label follows the theme's text, which is what makes the
+ * legend readable in both.
+ */
+function ChartLegend({ entries }) {
+  return (
+    <ul className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1 pt-2 text-[11px]">
+      {entries.map((entry) => (
+        <li key={entry.label} className="flex items-center gap-1.5 text-slate-500">
+          <span className="h-0.5 w-4 rounded-full" style={{ background: entry.color }} aria-hidden />
+          {entry.label}
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 function ChartTip({ active, payload, label, formatter }) {
   if (!active || !payload?.length) return null;
@@ -55,6 +85,7 @@ export function DemandChart({
   formatter,
   footer,
 }) {
+  const c = useChartTheme();
   const combined = [
     ...actuals.map((a) => ({ date: a.date, 'Actual Demand': a.units })),
     ...forecast.map((f) => ({
@@ -69,11 +100,10 @@ export function DemandChart({
     <div>
       <ResponsiveContainer width="100%" height={height}>
         <ComposedChart data={combined} margin={{ top: 8, right: 8, bottom: 0, left: -12 }}>
-          <CartesianGrid {...GRID} />
-          <XAxis dataKey="date" tick={AXIS_TICK} tickLine={false} axisLine={{ stroke: '#e2e8f0' }} minTickGap={28} />
-          <YAxis tick={AXIS_TICK} tickLine={false} axisLine={false} />
+          <CartesianGrid {...c.grid} />
+          <XAxis dataKey="date" tick={c.axisTick} tickLine={false} axisLine={c.axisLine} minTickGap={28} />
+          <YAxis tick={c.axisTick} tickLine={false} axisLine={false} />
           <Tooltip content={<ChartTip formatter={formatter} />} />
-          <Legend wrapperStyle={{ fontSize: 11, paddingTop: 8 }} iconType="plainline" />
           {showBand && forecast.length > 0 && (
             <>
               <Area
@@ -81,7 +111,7 @@ export function DemandChart({
                 dataKey="upper"
                 name="Upper Bound"
                 stroke="none"
-                fill={BAND_COLOR}
+                fill={c.band}
                 fillOpacity={0.12}
               />
               <Area
@@ -89,14 +119,18 @@ export function DemandChart({
                 dataKey="lower"
                 name="Lower Bound"
                 stroke="none"
-                fill="rgba(255,255,255,0)"
+                // Painted by the Area above, so this one contributes nothing to
+                // the plot - the pair of Areas is how recharts draws a band
+                // between two bounds. The legend above names the band once
+                // rather than listing two half-empty entries.
+                fill="transparent"
               />
             </>
           )}
           <Line
             type="monotone"
             dataKey="Actual Demand"
-            stroke={ACTUAL_COLOR}
+            stroke={c.actual}
             strokeWidth={2}
             dot={false}
             activeDot={{ r: 3 }}
@@ -104,7 +138,7 @@ export function DemandChart({
           <Line
             type="monotone"
             dataKey="Forecast Demand"
-            stroke={FORECAST_COLOR}
+            stroke={c.forecast}
             strokeWidth={2}
             strokeDasharray="6 3"
             dot={false}
@@ -112,6 +146,15 @@ export function DemandChart({
           />
         </ComposedChart>
       </ResponsiveContainer>
+      <ChartLegend
+        entries={[
+          ...(showBand && forecast.length > 0
+            ? [{ label: 'Confidence band', color: c.band }]
+            : []),
+          { label: 'Actual demand', color: c.actual },
+          { label: 'Forecast demand', color: c.forecast },
+        ]}
+      />
       {footer && <div className="mt-2">{footer}</div>}
     </div>
   );
@@ -120,17 +163,18 @@ export function DemandChart({
 // Inventory health donut ----------------------------------------------------
 
 export function HealthDonut({ healthy, atRisk, critical, size = 180 }) {
+  const c = useChartTheme();
   const data = [
-    { name: 'Healthy', value: healthy, color: '#10b981' },
-    { name: 'At Risk', value: atRisk, color: '#f59e0b' },
-    { name: 'Critical', value: critical, color: '#f43f5e' },
+    { name: 'Healthy', value: healthy, color: c.healthy },
+    { name: 'At Risk', value: atRisk, color: c.risk },
+    { name: 'Critical', value: critical, color: c.critical },
   ].filter((d) => d.value > 0);
   const total = healthy + atRisk + critical;
 
   const legend = [
-    { label: 'Healthy', value: healthy, color: '#10b981' },
-    { label: 'At Risk', value: atRisk, color: '#f59e0b' },
-    { label: 'Critical', value: critical, color: '#f43f5e' },
+    { label: 'Healthy', value: healthy, color: c.healthy },
+    { label: 'At Risk', value: atRisk, color: c.risk },
+    { label: 'Critical', value: critical, color: c.critical },
   ];
 
   return (
@@ -197,12 +241,13 @@ export function StockLineChart({
   inTransitKey = null,
   lostKey = null,
 }) {
+  const c = useChartTheme();
   return (
     <ResponsiveContainer width="100%" height={height}>
       <LineChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: -12 }}>
-        <CartesianGrid {...GRID} />
-        <XAxis dataKey="date" tick={AXIS_TICK} tickLine={false} axisLine={{ stroke: '#e2e8f0' }} minTickGap={30} />
-        <YAxis tick={AXIS_TICK} tickLine={false} axisLine={false} />
+        <CartesianGrid {...c.grid} />
+        <XAxis dataKey="date" tick={c.axisTick} tickLine={false} axisLine={c.axisLine} minTickGap={30} />
+        <YAxis tick={c.axisTick} tickLine={false} axisLine={false} />
         <Tooltip content={<ChartTip formatter={formatter} />} />
         {inTransitKey && (
           <Area
@@ -210,7 +255,7 @@ export function StockLineChart({
             dataKey={inTransitKey}
             name="In transit"
             stroke="none"
-            fill={BAND_COLOR}
+            fill={c.band}
             fillOpacity={0.18}
             stackId="none"
           />
@@ -219,7 +264,7 @@ export function StockLineChart({
           type="monotone"
           dataKey="stock"
           name="Stock level"
-          stroke={FORECAST_COLOR}
+          stroke={c.forecast}
           strokeWidth={2}
           dot={false}
           activeDot={{ r: 3 }}
@@ -229,7 +274,7 @@ export function StockLineChart({
             type="stepAfter"
             dataKey={lostKey}
             name="Demand not met"
-            stroke="#f43f5e"
+            stroke={c.lost}
             strokeWidth={1.5}
             strokeDasharray="3 3"
             dot={false}
@@ -237,7 +282,7 @@ export function StockLineChart({
           />
         )}
         {reference !== null && (
-          <ReferenceLine y={reference} stroke="#f59e0b" strokeDasharray="4 4" label={{ value: 'Reorder point', fontSize: 10, fill: '#b45309', position: 'insideBottomRight' }} />
+          <ReferenceLine y={reference} stroke={c.reorder} strokeDasharray="4 4" label={{ value: 'Reorder point', fontSize: 10, fill: c.reorderLabel, position: 'insideBottomRight' }} />
         )}
       </LineChart>
     </ResponsiveContainer>
@@ -246,15 +291,16 @@ export function StockLineChart({
 
 // Simple bars (used for channel/period breakdowns) ---------------------------
 
-export function SimpleBars({ data, dataKey = 'value', nameKey = 'name', height = 220, color = '#4f46e5' }) {
+export function SimpleBars({ data, dataKey = 'value', nameKey = 'name', height = 220, color }) {
+  const c = useChartTheme();
   return (
     <ResponsiveContainer width="100%" height={height}>
       <BarChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: -12 }}>
-        <CartesianGrid {...GRID} />
-        <XAxis dataKey={nameKey} tick={AXIS_TICK} tickLine={false} axisLine={{ stroke: '#e2e8f0' }} />
-        <YAxis tick={AXIS_TICK} tickLine={false} axisLine={false} />
+        <CartesianGrid {...c.grid} />
+        <XAxis dataKey={nameKey} tick={c.axisTick} tickLine={false} axisLine={c.axisLine} />
+        <YAxis tick={c.axisTick} tickLine={false} axisLine={false} />
         <Tooltip content={<ChartTip />} />
-        <Bar dataKey={dataKey} fill={color} radius={[4, 4, 0, 0]} maxBarSize={42} />
+        <Bar dataKey={dataKey} fill={color || c.bar} radius={[4, 4, 0, 0]} maxBarSize={42} />
       </BarChart>
     </ResponsiveContainer>
   );
