@@ -1,11 +1,10 @@
 // What the simulation page actually asks the server to run.
 //
-// The policy used to be a browser-only concept: the form offered "Conservative"
-// and "Aggressive", but the request carried neither, so api mode always replayed
-// the production rule while the page showed the user a different policy's name.
-// The policy is now part of the request, and these tests pin what is sent —
-// including the two things that must *not* be sent, because the server refuses
-// them: custom parameters on a fixed preset, and a scope wider than one product.
+// One request now covers every strategy, so these tests pin the list the page
+// sends and the two things that must *not* travel with it: custom parameters
+// without the custom arm, and a scope wider than one product. Both are refused
+// server-side, and the point of sending them correctly is that the page never
+// discovers the rule by hitting a 422.
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -23,7 +22,52 @@ const { runSimulation } = await import('./intelligence');
 
 const USER = { id: 'tenant-a' };
 
-/** The smallest response the shaper accepts without inventing anything. */
+function comparisonRow(key, overrides = {}) {
+  return {
+    key,
+    label: key,
+    description: `${key} description`,
+    safety_stock: 20,
+    coverage_days: 7,
+    average_reorder_point: 74.5,
+    average_order_up_to: 74.5,
+    stockout_days: 2,
+    stockout_units: 14,
+    service_level: 96.4,
+    average_inventory: 41.5,
+    maximum_inventory: 88,
+    excess_inventory: 21.5,
+    number_of_orders: 6,
+    total_units_ordered: 310,
+    holding_cost: 1200,
+    ordering_cost: 3000,
+    stockout_cost: 14000,
+    total_inventory_cost: 18200,
+    ...overrides,
+  };
+}
+
+function timeline(key) {
+  return [
+    {
+      date: '2025-01-01',
+      demand: 11,
+      arrival_qty: 0,
+      units_fulfilled: 11,
+      stockout_units: 0,
+      closing_stock: 50,
+      open_order_units: 0,
+      inventory_position: 50,
+      order_qty: 40,
+      reorder_required: true,
+      reorder_point: 74.5,
+      target_inventory: 74.5,
+      safety_stock: 20,
+    },
+  ].map((point) => ({ ...point, reorder_point: key === 'aggressive' ? 64.5 : 74.5 }));
+}
+
+/** A response shaped exactly as `TenantWorkspace.backtest` returns one. */
 function response(overrides = {}) {
   return {
     product_id: 'P001',
@@ -37,6 +81,7 @@ function response(overrides = {}) {
     forecast_error_std: 4.2,
     lead_time_days: 7,
     scope: 'single_product',
+    policies_evaluated: ['current', 'conservative', 'aggressive'],
     policy: {
       key: 'current',
       label: 'Current Policy',
@@ -46,11 +91,19 @@ function response(overrides = {}) {
       average_order_up_to: 74.5,
       parameters: {},
     },
-    policy_comparison: [],
+    policy_comparison: [
+      comparisonRow('current'),
+      comparisonRow('conservative'),
+      comparisonRow('aggressive'),
+    ],
+    policy_timelines: {
+      current: timeline('current'),
+      conservative: timeline('conservative'),
+      aggressive: timeline('aggressive'),
+    },
     xgb_metrics: { stockout_days: 2, service_level: 96.4, average_inventory: 41.5 },
     baseline_metrics: { stockout_days: 4, service_level: 92, average_inventory: 33 },
     cost_comparison: { recommended_strategy: 'xgboost', expected_savings: 100 },
-    daily_trajectory: [],
     ...overrides,
   };
 }
@@ -58,8 +111,8 @@ function response(overrides = {}) {
 function config(overrides = {}) {
   return {
     productIds: ['P001'],
-    policy: 'current',
-    policyParams: null,
+    customEnabled: false,
+    customParams: null,
     startDate: '',
     endDate: '',
     periodIsDefault: true,
@@ -97,50 +150,63 @@ describe('scope', () => {
   });
 });
 
-describe('the policy in the request', () => {
-  it('sends the policy the user chose', async () => {
-    for (const policy of ['current', 'conservative', 'aggressive', 'custom']) {
-      http.postBacktest.mockClear();
-      await runSimulation(USER, config({ policy }));
-      expect(body().policy).toBe(policy);
-    }
+describe('the strategies in the request', () => {
+  it('asks for every preset, in one request', async () => {
+    // The user chooses no strategy, so the page must not choose one for them:
+    // the whole comparison has to come back from a single run.
+    await runSimulation(USER, config());
+    expect(body().policies).toEqual(['current', 'conservative', 'aggressive']);
+    expect(http.postBacktest).toHaveBeenCalledTimes(1);
   });
 
-  it('defaults to the current policy rather than sending nothing', async () => {
-    await runSimulation(USER, config({ policy: undefined }));
+  it('sends no preset selection of its own, because the user made none', async () => {
+    await runSimulation(USER, config());
     expect(body().policy).toBe('current');
   });
 
-  it('sends the custom parameters when the custom policy is chosen', async () => {
-    await runSimulation(
-      USER,
-      config({ policy: 'custom', policyParams: { safety_stock: 45, coverage_days: 14 } }),
-    );
-    expect(body().policy_params).toEqual({ safety_stock: 45, coverage_days: 14 });
+  it('adds the custom arm only when the experiment is enabled', async () => {
+    await runSimulation(USER, config({ customEnabled: true }));
+    expect(body().policies).toEqual(['current', 'conservative', 'aggressive', 'custom']);
   });
 
-  it('sends nothing for a preset, which the server refuses rather than ignores', async () => {
-    // A preset given parameters is a 400. Sending null keeps a stale value from
-    // a previous custom run out of a fixed-policy request.
+  it('sends the custom parameters, naming the custom arm as the primary', async () => {
     await runSimulation(
       USER,
-      config({ policy: 'aggressive', policyParams: { safety_stock: 45 } }),
+      config({ customEnabled: true, customParams: { safety_stock: 45, coverage_days: 14 } }),
+    );
+    expect(body().policy_params).toEqual({ safety_stock: 45, coverage_days: 14 });
+    // The primary has to be the custom arm, or the server's top-level detail
+    // metrics would describe a strategy the user did not type numbers for.
+    expect(body().policy).toBe('custom');
+  });
+
+  it('sends no custom parameters when the experiment is off', async () => {
+    // A preset-only run carrying parameters is a 422. Sending null keeps a value
+    // typed into a closed panel out of the request.
+    await runSimulation(
+      USER,
+      config({ customEnabled: false, customParams: { safety_stock: 45 } }),
     );
     expect(body().policy_params).toBeNull();
   });
 
+  it('can add the custom arm with no parameters, using the server defaults', async () => {
+    await runSimulation(USER, config({ customEnabled: true, customParams: null }));
+    expect(body().policy_params).toBeNull();
+    expect(body().policies).toContain('custom');
+  });
+
   it('lets the server reject an unknown policy rather than quietly substituting', async () => {
     // No local allow-list: the server owns the catalogue, and its error names
-    // the policies it does support. Guessing here would hide a mismatch.
+    // the strategies it does support. Guessing here would hide a mismatch.
     http.postBacktest.mockRejectedValueOnce(
       new Error(
         "'wild' is not a supported inventory policy. Choose one of: current, conservative, aggressive, custom.",
       ),
     );
-    await expect(runSimulation(USER, config({ policy: 'wild' }))).rejects.toThrow(
+    await expect(runSimulation(USER, config())).rejects.toThrow(
       /not a supported inventory policy/i,
     );
-    expect(body().policy).toBe('wild');
   });
 });
 
@@ -180,8 +246,28 @@ describe('what comes back', () => {
     const result = await runSimulation(USER, config());
     expect(result.mode).toBe('api');
     expect(result.productId).toBe('P001');
-    expect(result.policy.key).toBe('current');
-    expect(result.forecastComparison).toHaveLength(2);
+    expect(result.strategies.map((entry) => entry.key)).toEqual([
+      'current',
+      'conservative',
+      'aggressive',
+    ]);
+    expect(result.tabKeys).toEqual(['current', 'conservative', 'aggressive']);
+  });
+
+  it('hands back a timeline per strategy, so the tabs need no second request', async () => {
+    const result = await runSimulation(USER, config());
+    expect(Object.keys(result.strategiesByKey)).toEqual([
+      'current',
+      'conservative',
+      'aggressive',
+    ]);
+    expect(result.strategiesByKey.aggressive.chart[0].reorderPoint).toBe(64.5);
+  });
+
+  it('keeps the model evaluation out of the inventory result', async () => {
+    const result = await runSimulation(USER, config());
+    expect(result.modelDetails.methods).toHaveLength(2);
+    expect(JSON.stringify(result.strategies)).not.toMatch(/recommended_strategy/);
   });
 
   it('carries no winner, even though the response names one', async () => {

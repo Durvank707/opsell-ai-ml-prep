@@ -1,11 +1,14 @@
-// The browser-only demo engine, and the replenishment rule it replays.
+// The browser-only demo engine, the replenishment rule it replays, and the
+// promise that one run covers every strategy.
 //
-// Mock mode is what a tenant sees with no backend, and it used to be a
-// different formula wearing the same policy names: it sized the order from the
-// whole 30-day forecast instead of the live replenishment rule (lead-time
-// demand + safety stock, reorder point, order up to that point). These tests pin
-// the corrected rule, and pin that a policy choice actually changes the outcome —
-// a policy that does not change anything is a label, not a policy.
+// Mock mode is what a tenant sees with no backend, and it used to be a different
+// formula wearing the same policy names: it sized the order from the whole
+// 30-day forecast instead of the live replenishment rule (lead-time demand +
+// safety stock, reorder point, order up to that point). These tests pin the
+// corrected rule, pin that a strategy actually changes the outcome — a strategy
+// that does not change anything is a label, not a strategy — and pin that a
+// strategy nobody chose is still simulated, because the demo has to behave like
+// the server it stands in for.
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -55,11 +58,12 @@ function seed(product = PRODUCT, rows = series()) {
   return db;
 }
 
+/** The run the form produces: no strategy chosen, no custom experiment. */
 function config(overrides = {}) {
   return {
     productIds: [PRODUCT.id],
-    policy: 'current',
-    policyParams: null,
+    customEnabled: false,
+    customParams: null,
     startDate: '2025-01-15',
     endDate: '2025-03-31',
     periodIsDefault: false,
@@ -104,6 +108,43 @@ describe('scope', () => {
   });
 });
 
+describe('one run covers every strategy', () => {
+  it('simulates all three presets even though the user chose none', async () => {
+    // The demo has to behave like the endpoint it stands in for. If it only
+    // replayed one, the tabs would be showing the same line three times.
+    const result = await runSimulation(USER, config());
+    expect(result.strategies.map((row) => row.key)).toEqual([
+      'current',
+      'conservative',
+      'aggressive',
+    ]);
+    expect(result.tabKeys).toEqual(['current', 'conservative', 'aggressive']);
+  });
+
+  it('hands back a separate history per strategy, over the same days', async () => {
+    const result = await runSimulation(USER, config());
+    const { current, conservative, aggressive } = result.strategiesByKey;
+    const dates = result.strategies.map((row) => row.chart.map((point) => point.date));
+    expect(dates[1]).toEqual(dates[0]);
+    expect(dates[2]).toEqual(dates[0]);
+    // Different buffers, so different order levels: otherwise the tabs would
+    // be three copies of one line.
+    expect(conservative.chart[0].reorderPoint).toBeGreaterThan(current.chart[0].reorderPoint);
+    expect(aggressive.chart[0].reorderPoint).toBeLessThan(current.chart[0].reorderPoint);
+  });
+
+  it('opens on Current Policy, because that is what the user already runs', async () => {
+    const result = await runSimulation(USER, config());
+    expect(result.initialPolicyKey).toBe('current');
+  });
+
+  it('records what it replayed, so the activity feed can say so', async () => {
+    const db = seed();
+    await runSimulation(USER, config());
+    expect(db.activity[0].description).toMatch(/across 3 inventory strategies/i);
+  });
+});
+
 describe('the replenishment rule', () => {
   const levels = (profile, overrides) =>
     resolvePolicyLevels(profile, {
@@ -130,7 +171,7 @@ describe('the replenishment rule', () => {
     expect(resolved.orderUpTo).toBeLessThan(10 * 30);
   });
 
-  it('keeps the order-up-to level equal to the reorder point under every policy', () => {
+  it('keeps the order-up-to level equal to the reorder point under every strategy', () => {
     for (const profile of INVENTORY_POLICIES) {
       expect(levels(profile).orderUpTo).toBe(levels(profile).reorderPoint);
     }
@@ -157,7 +198,7 @@ describe('the replenishment rule', () => {
     expect(resolved.reorderPoint).toBe(185);
   });
 
-  it('falls back to the current policy for a field the custom policy omits', () => {
+  it('falls back to the current strategy for a field the custom one omits', () => {
     // Custom with only a buffer is "current, but hold 45 units" — not a guess at
     // what the missing value should have been.
     const onlySafety = levels(POLICY_LOOKUP.custom, { custom: { safety_stock: 45 } });
@@ -184,115 +225,152 @@ describe('the replenishment rule', () => {
 
 describe('custom parameters are checked the way the server checks them', () => {
   it('accepts nothing at all', () => {
-    expect(validateCustomParams(POLICY_LOOKUP.custom, {})).toBeNull();
-    expect(validateCustomParams(POLICY_LOOKUP.custom, null)).toBeNull();
-  });
-
-  it('refuses parameters on a fixed preset instead of ignoring them', () => {
-    expect(validateCustomParams(POLICY_LOOKUP.current, { safety_stock: 5 })).toMatch(
-      /fixed policy and takes no custom parameters/i,
-    );
+    expect(validateCustomParams({})).toBeNull();
+    expect(validateCustomParams(null)).toBeNull();
   });
 
   it('refuses a parameter the server does not apply', () => {
-    expect(
-      validateCustomParams(POLICY_LOOKUP.custom, { min_stock: 10 }),
-    ).toMatch(/accepts only safety_stock and coverage_days/i);
+    // A third knob would be accepted by the form, ignored by the server, and
+    // then shown on the results panel as if it had been simulated.
+    expect(validateCustomParams({ min_stock: 10 })).toMatch(
+      /accepts only safety_stock and coverage_days/i,
+    );
   });
 
   it('refuses a value that is not a number', () => {
-    expect(validateCustomParams(POLICY_LOOKUP.custom, { safety_stock: 'lots' })).toMatch(
-      /must be a number/i,
-    );
+    expect(validateCustomParams({ safety_stock: 'lots' })).toMatch(/must be a number/i);
   });
 
   it('refuses a negative buffer but accepts zero', () => {
-    expect(validateCustomParams(POLICY_LOOKUP.custom, { safety_stock: -1 })).toMatch(
-      /zero or more/i,
-    );
-    expect(validateCustomParams(POLICY_LOOKUP.custom, { safety_stock: 0 })).toBeNull();
+    expect(validateCustomParams({ safety_stock: -1 })).toMatch(/zero or more/i);
+    expect(validateCustomParams({ safety_stock: 0 })).toBeNull();
   });
 
   it('refuses a zero-day order, which would never arrive', () => {
-    expect(validateCustomParams(POLICY_LOOKUP.custom, { coverage_days: 0 })).toMatch(
-      /greater than zero/i,
-    );
+    expect(validateCustomParams({ coverage_days: 0 })).toMatch(/greater than zero/i);
   });
 
-  it('surfaces the refusal to the caller instead of running a different policy', async () => {
+  it('surfaces the refusal to the caller instead of running something else', async () => {
     await expect(
-      runSimulation(USER, config({ policy: 'aggressive', policyParams: { safety_stock: 5 } })),
-    ).rejects.toThrow(/fixed policy/i);
+      runSimulation(
+        USER,
+        config({ customEnabled: true, customParams: { min_stock: 10 } }),
+      ),
+    ).rejects.toThrow(/accepts only safety_stock and coverage_days/i);
+  });
+
+  it('ignores parameters typed while the experiment was closed', async () => {
+    // The panel is hidden, so its values are stale text the user never
+    // submitted. Simulating them anyway would add a strategy nobody asked for.
+    const result = await runSimulation(
+      USER,
+      config({ customEnabled: false, customParams: { safety_stock: 200 } }),
+    );
+    expect(result.hasCustom).toBe(false);
+    expect(result.strategies.map((row) => row.key)).not.toContain('custom');
   });
 });
 
-describe('a policy actually changes the outcome', () => {
-  const run = (policy) => runSimulation(USER, config({ policy }));
+describe('the custom strategy, when the experiment is enabled', () => {
+  const customRun = (customParams) =>
+    runSimulation(USER, config({ customEnabled: true, customParams }));
 
-  it('holds more stock under a conservative policy and less under an aggressive one', async () => {
-    const [aggressive, current, conservative] = await Promise.all([
-      run('aggressive'),
-      run('current'),
-      run('conservative'),
-    ]);
-    expect(aggressive.kpis.averageInventory).toBeLessThan(current.kpis.averageInventory);
-    expect(current.kpis.averageInventory).toBeLessThan(conservative.kpis.averageInventory);
-  });
-
-  it('trades stockouts the other way, which is the whole point of the comparison', async () => {
-    const [aggressive, conservative] = await Promise.all([run('aggressive'), run('conservative')]);
-    expect(conservative.kpis.stockoutDays).toBeLessThanOrEqual(aggressive.kpis.stockoutDays);
-    expect(conservative.kpis.serviceLevel).toBeGreaterThanOrEqual(aggressive.kpis.serviceLevel);
-  });
-
-  it('reports the buffer each policy actually used', async () => {
-    const result = await run('conservative');
-    expect(result.policy.safetyStock).toBe(30);
-    expect(result.policyComparison.find((row) => row.key === 'conservative').safetyStock).toBe(30);
-    expect(result.policyComparison.find((row) => row.key === 'aggressive').safetyStock).toBe(10);
-  });
-
-  it('compares only the three fixed presets, in the order the table lists them', async () => {
-    const result = await run('custom');
-    expect(result.policyComparison.map((row) => row.key)).toEqual([
+  it('is simulated beside the presets, not instead of them', async () => {
+    const result = await customRun({ safety_stock: 60 });
+    expect(result.strategies.map((row) => row.key)).toEqual([
       'current',
       'conservative',
       'aggressive',
+      'custom',
     ]);
   });
 
-  it('orders up to the reorder point, not to a month of demand', async () => {
-    const result = await run('current');
-    // 7 days of demand at ~10 units plus a 20-unit buffer is about 90 units.
-    // The 30-day forecast is about 300, and the old engine ordered that.
-    expect(result.policy.averageOrderUpTo).toBeCloseTo(result.policy.averageReorderPoint, 5);
-    expect(result.policy.averageOrderUpTo).toBeLessThan(200);
+  it('gets a tab of its own and a history of its own', async () => {
+    const result = await customRun({ safety_stock: 60 });
+    expect(result.tabKeys).toContain('custom');
+    expect(result.strategiesByKey.custom.chart[0].reorderPoint).toBeGreaterThan(
+      result.strategiesByKey.current.chart[0].reorderPoint,
+    );
   });
 
-  it('carries a custom buffer all the way into the reported policy', async () => {
-    const result = await runSimulation(
-      USER,
-      config({ policy: 'custom', policyParams: { safety_stock: 60 } }),
+  it('carries the supplied buffer all the way into the reported numbers', async () => {
+    const result = await customRun({ safety_stock: 60 });
+    expect(result.strategiesByKey.custom.safetyStock).toBe(60);
+    expect(result.customParameters).toEqual({ safety_stock: 60 });
+    // Still an order-up-to at the reorder point, with the bigger buffer.
+    expect(result.strategiesByKey.custom.orderUpTo).toBeCloseTo(
+      result.strategiesByKey.custom.reorderPoint,
+      5,
     );
-    expect(result.policy.key).toBe('custom');
-    expect(result.policy.safetyStock).toBe(60);
-    expect(result.policy.parameters).toMatchObject([{ name: 'safety_stock', value: 60 }]);
-    // Still an order-up-to at the reorder point, three times over.
-    expect(result.policy.averageOrderUpTo).toBeCloseTo(result.policy.averageReorderPoint, 5);
+  });
+
+  it('honours a supplied order coverage as well as a buffer', async () => {
+    const result = await customRun({ safety_stock: 45, coverage_days: 14 });
+    expect(result.strategiesByKey.custom.coverageDays).toBe(14);
+  });
+
+  it('is the primary arm, so the detail metrics describe what was typed', async () => {
+    const result = await customRun({ safety_stock: 60 });
+    expect(result.modelDetails.primaryKey).toBe('custom');
+  });
+
+  it('adds the arm even with no parameters, using the current strategy own values', async () => {
+    const result = await customRun(null);
+    expect(result.strategiesByKey.custom.safetyStock).toBe(20);
+    expect(result.customParameters).toEqual({});
   });
 });
 
-describe('the forecast comparison', () => {
-  it('scores both methods under the policy that was chosen', async () => {
-    const result = await runSimulation(USER, config({ policy: 'conservative' }));
-    expect(result.forecastComparison.map((row) => row.key)).toEqual(['xgboost', 'baseline']);
-    // The conservative 30-unit buffer is in force for both arms, so the two
-    // rows are comparable rather than two different policies measured together.
-    expect(result.policy.safetyStock).toBe(30);
-    for (const row of result.forecastComparison) {
+describe('a strategy actually changes the outcome', () => {
+  it('holds more stock under Conservative and less under Aggressive', async () => {
+    const { current, conservative, aggressive } = (
+      await runSimulation(USER, config())
+    ).strategiesByKey;
+    expect(aggressive.averageInventory).toBeLessThan(current.averageInventory);
+    expect(current.averageInventory).toBeLessThan(conservative.averageInventory);
+  });
+
+  it('trades stockouts the other way, which is the whole point of the comparison', async () => {
+    const { conservative, aggressive } = (
+      await runSimulation(USER, config())
+    ).strategiesByKey;
+    expect(conservative.stockoutDays).toBeLessThanOrEqual(aggressive.stockoutDays);
+    expect(conservative.serviceLevel).toBeGreaterThanOrEqual(aggressive.serviceLevel);
+  });
+
+  it('reports the buffer each strategy actually used', async () => {
+    const { strategiesByKey } = await runSimulation(USER, config());
+    expect(strategiesByKey.current.safetyStock).toBe(20);
+    expect(strategiesByKey.conservative.safetyStock).toBe(30);
+    expect(strategiesByKey.aggressive.safetyStock).toBe(10);
+  });
+
+  it('orders up to the reorder point, not to a month of demand', async () => {
+    const { current } = (await runSimulation(USER, config())).strategiesByKey;
+    // 7 days of demand at ~10 units plus a 20-unit buffer is about 90 units.
+    // The 30-day forecast is about 300, and the old engine ordered that.
+    expect(current.orderUpTo).toBeCloseTo(current.reorderPoint, 5);
+    expect(current.orderUpTo).toBeLessThan(200);
+  });
+
+  it('leaves Current Policy unscaled, so it reproduces the live rule', async () => {
+    const { current } = (await runSimulation(USER, config())).strategiesByKey;
+    // The product's own configured buffer, with no multiplier applied.
+    expect(current.safetyStock).toBe(PRODUCT.safetyStock);
+  });
+});
+
+describe('the forecast evaluation', () => {
+  it('scores both methods under the same strategy', async () => {
+    const result = await runSimulation(USER, config());
+    expect(result.modelDetails.methods.map((row) => row.key)).toEqual(['xgboost', 'baseline']);
+    // Both arms ran under Current Policy, so the rows differ by the forecasting
+    // method and nothing else.
+    for (const row of result.modelDetails.methods) {
       expect(row.stockoutDays).toBeGreaterThanOrEqual(0);
       expect(row.serviceLevel).toBeGreaterThanOrEqual(0);
     }
+    expect(result.modelDetails.primaryKey).toBe('current');
   });
 
   it('declares no winner', async () => {
@@ -307,9 +385,11 @@ describe('reproducibility', () => {
       runSimulation(USER, config()),
       runSimulation(USER, config()),
     ]);
-    expect(second.kpis).toEqual(first.kpis);
-    expect(second.policyComparison).toEqual(first.policyComparison);
-    expect(second.chart).toEqual(first.chart);
+    expect(second.strategies).toEqual(first.strategies);
+    expect(second.chart).toBeUndefined();
+    expect(second.strategiesByKey.current.chart).toEqual(
+      first.strategiesByKey.current.chart,
+    );
   });
 
   it('replays the window it was given, day by day', async () => {
@@ -317,7 +397,7 @@ describe('reproducibility', () => {
     expect(result.start).toBe('2025-01-15');
     expect(result.end).toBe('2025-03-31');
     expect(result.durationDays).toBe(76);
-    expect(result.chart).toHaveLength(76);
+    expect(result.strategiesByKey.current.chart).toHaveLength(76);
   });
 
   it('refuses a window that ends before it starts', async () => {
@@ -344,7 +424,9 @@ describe('reproducibility', () => {
 describe('the period', () => {
   it('includes both ends of the window', async () => {
     const result = await runSimulation(USER, config({ startDate: '2025-03-01', endDate: '2025-03-05' }));
-    expect(result.chart.map((point) => point.date)).toEqual([
+    expect(
+      result.strategiesByKey.current.chart.map((point) => point.date),
+    ).toEqual([
       '2025-03-01',
       '2025-03-02',
       '2025-03-03',
@@ -354,12 +436,12 @@ describe('the period', () => {
   });
 
   it('prices the stockouts at the cost the caller supplied', async () => {
-    const cheap = await runSimulation(USER, config({ stockoutCost: 1 }));
-    const dear = await runSimulation(USER, config({ stockoutCost: 5000 }));
-    expect(dear.kpis.stockoutCost).toBeGreaterThan(cheap.kpis.stockoutCost);
+    const cheap = (await runSimulation(USER, config({ stockoutCost: 1 }))).strategiesByKey.current;
+    const dear = (await runSimulation(USER, config({ stockoutCost: 5000 }))).strategiesByKey.current;
+    expect(dear.stockoutCost).toBeGreaterThan(cheap.stockoutCost);
     // The cost assumptions are what is being priced, not what is being
     // replayed, so the operational metrics are untouched.
-    expect(dear.kpis.stockoutDays).toBe(cheap.kpis.stockoutDays);
-    expect(dear.kpis.averageInventory).toBe(cheap.kpis.averageInventory);
+    expect(dear.stockoutDays).toBe(cheap.stockoutDays);
+    expect(dear.averageInventory).toBe(cheap.averageInventory);
   });
 });

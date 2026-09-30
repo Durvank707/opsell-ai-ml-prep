@@ -723,10 +723,23 @@ def test_backtest_rejects_an_unknown_policy_key():
 
 
 def test_backtest_rejects_custom_parameters_a_preset_does_not_accept():
-    """A preset must not silently accept a custom value it never applied."""
+    """A run must not accept a custom value it would never apply.
+
+    A preset-only run refuses custom parameters outright. A run that does
+    include the custom arm still refuses a parameter outside the two the server
+    honours, so an accepted value is always one the engine really used.
+    """
     ws = _workspace_with_history()
-    with pytest.raises(ValueError, match="fixed policy"):
-        ws.backtest("P1", policy="current", policy_params={"pack_size": 12})
+    with pytest.raises(ValueError, match="takes no custom parameters"):
+        ws.backtest("P1", policies=["current"], policy_params={"pack_size": 12})
+
+    with pytest.raises(ValueError, match="accepts only"):
+        ws.backtest(
+            "P1",
+            policies=["current", "custom"],
+            policy="custom",
+            policy_params={"pack_size": 12},
+        )
 
 
 def test_backtest_reports_the_effective_policy_values():
@@ -765,20 +778,22 @@ def test_backtest_compares_the_three_standard_policies():
 
 
 def test_backtest_policies_run_against_the_same_forecast():
-    """Like-for-like: only the policy differs between the three columns."""
+    """Like-for-like: only the policy differs between the compared columns."""
     ws = _workspace_with_history()
     result = ws.backtest("P1")
-    # Same starting stock and same length for every column.
+    # Same starting stock, and the same number of days in every timeline, so
+    # no column can be quietly comparing a different window.
     assert result["starting_stock"] > 0
-    assert result["duration_days"] == len(result["daily_trajectory"])
+    for key in result["policies_evaluated"]:
+        assert len(result["policy_timelines"][key]) == result["duration_days"]
 
 
 def test_backtest_policy_comparison_changes_with_the_selected_policy():
     ws = _workspace_with_history()
     current = ws.backtest("P1", policy="current")
     conservative = ws.backtest("P1", policy="conservative")
-    # The same three columns are always compared; only the *selected* policy
-    # changes which replay the main metrics came from.
+    # The same three columns are always compared; only the *primary* policy
+    # changes which replay the top-level detail metrics came from.
     assert [r["key"] for r in current["policy_comparison"]] == [
         r["key"] for r in conservative["policy_comparison"]
     ]
@@ -786,18 +801,100 @@ def test_backtest_policy_comparison_changes_with_the_selected_policy():
     assert conservative["policy"]["key"] == "conservative"
 
 
-def test_backtest_method_comparison_runs_under_one_policy():
-    """The XGBoost/moving-average arms share the selected policy."""
+def test_the_primary_policy_must_be_one_of_the_policies_simulated():
+    """A response may not headline a strategy the engine did not run."""
+    ws = _workspace_with_history()
+    with pytest.raises(ValueError, match="cannot be reported as the primary"):
+        ws.backtest("P1", policy="aggressive", policies=["current", "conservative"])
+
+
+def test_backtest_runs_every_preset_in_one_call():
+    """One request is enough; the caller never loops over the policies."""
+    ws = _workspace_with_history()
+    result = ws.backtest("P1")
+
+    assert result["policies_evaluated"] == list(COMPARABLE_POLICY_KEYS)
+    assert [row["key"] for row in result["policy_comparison"]] == list(
+        COMPARABLE_POLICY_KEYS
+    )
+    assert set(result["policy_timelines"]) == set(COMPARABLE_POLICY_KEYS)
+    assert all(
+        len(points) == result["duration_days"]
+        for points in result["policy_timelines"].values()
+    )
+
+
+def test_every_simulated_policy_gets_its_own_timeline():
+    """Each strategy's history is its own, not a copy of the primary's."""
+    ws = _workspace_with_history()
+    result = ws.backtest("P1")
+    timelines = result["policy_timelines"]
+    by_key = {row["key"]: row for row in result["policy_comparison"]}
+
+    for key in COMPARABLE_POLICY_KEYS:
+        points = timelines[key]
+        # Same days, so the tabs are showing the same window.
+        assert [p["date"] for p in points] == [p["date"] for p in timelines["current"]]
+        # Each timeline carries the safety buffer that strategy actually used.
+        assert {p["safety_stock"] for p in points} == {by_key[key]["safety_stock"]}
+    # Different buffers must produce different order levels, or the tabs would
+    # be showing the same line three times.
+    assert [p["reorder_point"] for p in timelines["conservative"]] != [
+        p["reorder_point"] for p in timelines["aggressive"]
+    ]
+
+
+def test_the_custom_policy_is_simulated_beside_the_presets_not_instead():
+    """Custom is an extra column, so the presets still get compared."""
+    ws = _workspace_with_history()
+    result = ws.backtest(
+        "P1",
+        policies=["current", "conservative", "aggressive", "custom"],
+        policy="custom",
+        policy_params={"safety_stock": 200, "coverage_days": 12},
+    )
+    assert result["policies_evaluated"] == [
+        "current",
+        "conservative",
+        "aggressive",
+        "custom",
+    ]
+    assert set(result["policy_timelines"]) == set(result["policies_evaluated"])
+    custom = [r for r in result["policy_comparison"] if r["key"] == "custom"][0]
+    assert custom["safety_stock"] == 200
+    assert custom["coverage_days"] == 12
+
+
+def test_custom_parameters_are_refused_when_no_custom_policy_was_simulated():
+    """A fixed-policy run may not carry a parameter it would never apply."""
+    ws = _workspace_with_history()
+    with pytest.raises(ValueError, match="takes no custom parameters"):
+        ws.backtest("P1", policies=["current"], policy_params={"safety_stock": 5})
+
+
+def test_an_unknown_policy_in_the_requested_list_is_refused():
+    ws = _workspace_with_history()
+    with pytest.raises(ValueError, match="not a supported inventory policy"):
+        ws.backtest("P1", policies=["current", "vibes"])
+
+
+def test_an_empty_policy_list_is_refused_rather_than_silently_simulating():
+    ws = _workspace_with_history()
+    with pytest.raises(ValueError, match="at least one inventory policy"):
+        ws.backtest("P1", policies=[])
+
+
+def test_the_method_comparison_runs_under_the_primary_policy():
+    """The forecasting arms are model evaluation, not an inventory strategy."""
     ws = _workspace_with_history()
     result = ws.backtest("P1", policy="aggressive")
 
-    trajectory = result["daily_trajectory"]
-    assert len(trajectory) > 0
-    # Both arms recorded their reorder point on the same days.
-    assert all(
-        "xgb_reorder_point" in point and "baseline_reorder_point" in point
-        for point in trajectory
-    )
+    # Both arms saw the same demand over the same window, under one policy.
+    assert result["baseline_metrics"]["total_demand"] == result["xgb_metrics"][
+        "total_demand"
+    ]
+    aggressive = [r for r in result["policy_comparison"] if r["key"] == "aggressive"][0]
+    assert result["xgb_metrics"]["service_level"] == aggressive["service_level"]
 
 
 def test_backtest_exposes_what_the_ui_needs_to_explain_itself():
@@ -810,16 +907,27 @@ def test_backtest_exposes_what_the_ui_needs_to_explain_itself():
         assert text
 
 
-def test_backtest_trajectory_reports_in_transit_stock():
+def test_backtest_timelines_report_in_transit_stock_and_reorder_activity():
+    """The order activity the inventory chart draws is really in the payload."""
     ws = _workspace_with_history()
     result = ws.backtest("P1")
-    for point in result["daily_trajectory"]:
-        assert point["xgb_open_order_units"] >= 0
-        assert point["baseline_open_order_units"] >= 0
-        assert (
-            point["xgb_inventory_position"]
-            == point["xgb_closing_stock"] + point["xgb_open_order_units"]
-        )
+    for key in COMPARABLE_POLICY_KEYS:
+        for point in result["policy_timelines"][key]:
+            assert point["open_order_units"] >= 0
+            assert point["order_qty"] >= 0
+            assert point["stockout_units"] >= 0
+            # Inventory position is stock plus what is already on order; the
+            # identity the live recommendation relies on has to hold daily.
+            assert point["inventory_position"] == (
+                point["closing_stock"] + point["open_order_units"]
+            )
+    # At least one strategy must actually have ordered, otherwise the timeline
+    # proves nothing about replenishment.
+    assert any(
+        point["order_qty"] > 0
+        for points in result["policy_timelines"].values()
+        for point in points
+    )
 
 
 def test_backtest_is_deterministic():
@@ -829,7 +937,7 @@ def test_backtest_is_deterministic():
 
     assert first["xgb_metrics"] == second["xgb_metrics"]
     assert first["policy_comparison"] == second["policy_comparison"]
-    assert first["daily_trajectory"] == second["daily_trajectory"]
+    assert first["policy_timelines"] == second["policy_timelines"]
 
 
 def test_a_custom_policy_changes_the_replay_not_just_the_label():
@@ -993,17 +1101,82 @@ def test_the_api_refuses_a_custom_parameter_it_does_not_apply():
 
 
 def test_the_api_passes_custom_parameters_to_a_preset_and_it_fails():
-    """Sending a custom value to a preset must not be silently ignored."""
+    """Sending a custom value to a fixed-policy run must not be ignored.
+
+    The rule is now about the *set* of strategies rather than about the primary
+    one: `policy_params` are the custom arm's parameters, so they are refused
+    unless the custom arm is part of the run.
+    """
     response = _api(
         _workspace_with_history(),
         {
             "product_id": "P1",
-            "policy": "current",
+            "policies": ["current", "conservative"],
             "policy_params": {"safety_stock": 5},
         },
     )
     assert response.status_code == 422
-    assert "fixed policy" in response.text
+    assert "takes no custom parameters" in response.text
+
+
+def test_the_api_runs_every_preset_in_one_request():
+    """The form asks once; the response already holds every strategy."""
+    response = _api(_workspace_with_history(), {"product_id": "P1"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["policies_evaluated"] == ["current", "conservative", "aggressive"]
+    assert set(body["policy_timelines"]) == set(body["policies_evaluated"])
+    assert all(
+        len(points) == body["duration_days"]
+        for points in body["policy_timelines"].values()
+    )
+
+
+def test_the_api_returns_a_timeline_for_the_custom_arm_only_when_asked():
+    """Custom is an extra column, never a fabricated one."""
+    without = _api(_workspace_with_history(), {"product_id": "P1"}).json()
+    assert "custom" not in without["policy_timelines"]
+
+    with_custom = _api(
+        _workspace_with_history(),
+        {
+            "product_id": "P1",
+            "policies": ["current", "conservative", "aggressive", "custom"],
+            "policy": "custom",
+            "policy_params": {"safety_stock": 200},
+        },
+    ).json()
+    assert set(with_custom["policy_timelines"]) == {
+        "current",
+        "conservative",
+        "aggressive",
+        "custom",
+    }
+    custom = [r for r in with_custom["policy_comparison"] if r["key"] == "custom"][0]
+    assert custom["safety_stock"] == 200
+
+
+def test_the_api_refuses_an_unknown_policy_in_the_requested_list():
+    response = _api(
+        _workspace_with_history(),
+        {"product_id": "P1", "policies": ["current", "vibes"]},
+    )
+    assert response.status_code == 422
+    assert "not a supported inventory policy" in response.text
+
+
+def test_the_api_refuses_an_empty_policy_list():
+    response = _api(_workspace_with_history(), {"product_id": "P1", "policies": []})
+    assert response.status_code == 422
+
+
+def test_the_api_refuses_a_primary_policy_it_did_not_simulate():
+    response = _api(
+        _workspace_with_history(),
+        {"product_id": "P1", "policy": "aggressive", "policies": ["current"]},
+    )
+    assert response.status_code == 422
+    assert "cannot be reported as the primary" in response.text
 
 
 def test_the_api_returns_the_explanations_the_ui_needs():
@@ -1027,8 +1200,9 @@ def test_the_api_compares_three_policies_and_two_methods():
         "aggressive",
     ]
     assert "xgb_metrics" in body and "baseline_metrics" in body
-    # Both method arms ran over the same days.
-    assert len(body["daily_trajectory"]) == body["duration_days"]
+    # Every strategy reported its own history over the same window.
+    for points in body["policy_timelines"].values():
+        assert len(points) == body["duration_days"]
 
 
 def test_the_api_response_is_audited_with_the_policy_actually_run():
@@ -1038,6 +1212,13 @@ def test_the_api_response_is_audited_with_the_policy_actually_run():
     entry = ws.audit[-1]
     assert entry.action == "simulation_backtested"
     assert entry.detail["policy"] == "aggressive"
+    # A single run can now cover several strategies, so the trail records all
+    # of them rather than only the primary one.
+    assert entry.detail["policies_evaluated"] == [
+        "current",
+        "conservative",
+        "aggressive",
+    ]
 
 
 # ---------------------------------------------------------------------------

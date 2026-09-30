@@ -22,10 +22,10 @@ import { toSimulationResult } from './simulationResult';
 import {
   COMPARABLE_POLICY_KEYS,
   CUSTOM_POLICY_FIELDS,
+  CUSTOM_POLICY_KEY,
   INVENTORY_POLICIES,
   POLICY_LOOKUP,
   SIMULATION_SCOPE,
-  policyLabel,
 } from './simulationPolicy';
 
 /** Mirrors `calculate_financial_metrics`'s default annual holding rate. */
@@ -36,6 +36,11 @@ const BASELINE_WINDOW = 7;
 const BACKTEST_WINDOW_DAYS = 89;
 const BACKTEST_LEAD_IN_DAYS = 28;
 const WEEKDAY_FACTOR = [0.9, 0.95, 0.98, 1.0, 1.05, 1.18, 1.1];
+
+/** Two decimals, the precision the server reports its money and levels in. */
+function round2(value) {
+  return Math.round((Number(value) || 0) * 100) / 100;
+}
 
 export async function runSimulation(user, config) {
   if (usingApi()) return api.runSimulation(user, config);
@@ -60,9 +65,12 @@ export async function runSimulation(user, config) {
   const result = toSimulationResult(payload, { ...config, mode: 'mock' });
 
   db.simulations = [result, ...(db.simulations || [])].slice(0, 5);
+  // The activity line names what was replayed, not which one the user picked:
+  // they picked none, and the run covered several.
   db.pushActivity(
     'simulation_completed',
-    `Inventory policy simulation completed for ${product.name} (${result.policy.label}).`,
+    `Inventory simulation completed for ${product.name} across ` +
+      `${result.strategies.length} inventory strategies.`,
   );
   return result;
 }
@@ -312,15 +320,12 @@ function excessAbove(rows, safetyStock) {
  * The custom parameters the server accepts, checked with the server's rules.
  *
  * The demo engine has to refuse the same inputs the API refuses, or a value that
- * would be a 400 in api mode silently produces a result here — which is the
+ * would be a 422 in api mode silently produces a result here — which is the
  * whole class of problem the policy layer exists to close.
  */
-export function validateCustomParams(profile, custom) {
+export function validateCustomParams(custom) {
   const supplied = custom || {};
   if (!Object.keys(supplied).length) return null;
-  if (!profile.acceptsCustom) {
-    return `'${profile.key}' is a fixed policy and takes no custom parameters.`;
-  }
 
   const unknown = Object.keys(supplied).filter(
     (key) => !CUSTOM_POLICY_FIELDS.some((field) => field.name === key),
@@ -371,110 +376,111 @@ function buildPayload(db, product, config) {
   const unitCost = Number(product.unitCost) || 0;
   const orderingCostPerOrder = Number(config.orderingCost) || 500;
   const stockoutCostPerUnit = Number(config.stockoutCost) || 1000;
-  // Whatever was handed over is validated against the chosen policy, so a
-  // preset given parameters is refused exactly as the server refuses them
-  // rather than quietly dropping them.
-  const custom = config.policyParams || {};
 
-  const profile = POLICY_LOOKUP[config.policy];
-  if (!profile) {
-    throw randomError(`'${config.policy}' is not a supported inventory policy.`);
-  }
-  const customError = validateCustomParams(profile, custom);
+  // Which strategies this run replays. Every preset always, because the user
+  // picks none of them — the comparison is the point. Custom joins them when the
+  // optional experiment is switched on.
+  const customEnabled = Boolean(config.customEnabled);
+  const requested = customEnabled
+    ? [...COMPARABLE_POLICY_KEYS, CUSTOM_POLICY_KEY]
+    : [...COMPARABLE_POLICY_KEYS];
+  const primaryKey = customEnabled ? CUSTOM_POLICY_KEY : 'current';
+
+  const supplied = customEnabled ? config.customParams || {} : {};
+  const customError = validateCustomParams(supplied);
   if (customError) throw randomError(customError);
-  const applied = profile.acceptsCustom ? custom : {};
 
   const days = buildDays(db, product, start, end);
   const costs = { unitCost, orderingCostPerOrder, stockoutCostPerUnit };
+  const dailyForecast = mean(days.map((day) => day.xgbDaily));
 
-  const xgbRows = replay(days, {
-    startingStock: product.currentStock,
-    safetyStock,
-    leadTimeDays,
-    profile,
-    custom: applied,
-    method: 'xgboost',
-  });
-  const baselineRows = replay(days, {
-    startingStock: product.currentStock,
-    safetyStock,
-    leadTimeDays,
-    profile,
-    custom: applied,
-    method: 'baseline',
-  });
-
-  const xgbMetrics = metricsFor(xgbRows, costs);
-  const baselineMetrics = metricsFor(baselineRows, costs);
-
-  // The comparison columns are always the three fixed presets, so a custom run
-  // compares itself against them rather than replacing one of them.
-  const policyComparison = COMPARABLE_POLICY_KEYS.map((key) => {
-    const rows =
-      key === profile.key
-        ? xgbRows
-        : replay(days, {
-            startingStock: product.currentStock,
-            safetyStock,
-            leadTimeDays,
-            profile: POLICY_LOOKUP[key],
-            custom: {},
-            method: 'xgboost',
-          });
-    const metrics = metricsFor(rows, costs);
-    const levels = resolvePolicyLevels(POLICY_LOOKUP[key], {
+  /**
+   * One strategy's own replay, metrics and comparison row.
+   *
+   * Every strategy is replayed against the same `days`, the same starting stock
+   * and the same lead time, so the only thing that differs between the rows is
+   * the strategy — which is what makes the comparison honest.
+   */
+  const runStrategy = (key, method = 'xgboost') => {
+    const profile = POLICY_LOOKUP[key];
+    const custom = profile.acceptsCustom ? supplied : {};
+    const rows = replay(days, {
+      startingStock: product.currentStock,
       safetyStock,
-      dailyForecast: mean(days.map((day) => day.xgbDaily)),
       leadTimeDays,
-      custom: {},
+      profile,
+      custom,
+      method,
+    });
+    const metrics = metricsFor(rows, costs);
+    const levels = resolvePolicyLevels(profile, {
+      safetyStock,
+      dailyForecast,
+      leadTimeDays,
+      custom,
     });
     return {
+      rows,
+      metrics,
+      levels,
+      row: {
+        key,
+        label: profile.label,
+        description: profile.description,
+        safety_stock: levels.safety,
+        coverage_days: Math.round(levels.coverageDays * 100) / 100,
+        average_reorder_point: round2(mean(rows.map((r) => r.reorder_point))),
+        average_order_up_to: round2(mean(rows.map((r) => r.target_inventory))),
+        stockout_days: metrics.stockout_days,
+        stockout_units: metrics.lost_sales_units,
+        service_level: metrics.service_level,
+        average_inventory: metrics.average_inventory,
+        maximum_inventory: metrics.maximum_inventory,
+        excess_inventory: round2(excessAbove(rows, levels.safety)),
+        number_of_orders: metrics.number_of_orders,
+        total_units_ordered: metrics.total_units_ordered,
+        holding_cost: metrics.holding_cost,
+        ordering_cost: metrics.ordering_cost,
+        stockout_cost: metrics.stockout_cost,
+        total_inventory_cost: metrics.total_inventory_cost,
+      },
+    };
+  };
+
+  const strategyRuns = new Map(
+    requested.map((key) => [key, runStrategy(key)]),
+  );
+  const primary = strategyRuns.get(primaryKey);
+  // The forecasting arms run under the primary strategy, so the model
+  // comparison isolates the model rather than mixing a strategy change in.
+  const baselineRun = runStrategy(primaryKey, 'baseline');
+
+  const policyComparison = requested.map((key) => strategyRuns.get(key).row);
+  const policyTimelines = Object.fromEntries(
+    requested.map((key) => [
       key,
-      label: policyLabel(key),
-      description: POLICY_LOOKUP[key].description,
-      safety_stock: levels.safety,
-      coverage_days: Math.round(levels.coverageDays * 100) / 100,
-      average_reorder_point: mean(rows.map((row) => row.reorder_point)),
-      average_order_up_to: mean(rows.map((row) => row.target_inventory)),
-      stockout_days: metrics.stockout_days,
-      stockout_units: metrics.lost_sales_units,
-      service_level: metrics.service_level,
-      average_inventory: metrics.average_inventory,
-      excess_inventory: Math.round(excessAbove(rows, levels.safety) * 100) / 100,
-      number_of_orders: metrics.number_of_orders,
-      total_units_ordered: metrics.total_units_ordered,
-      total_inventory_cost: metrics.total_inventory_cost,
-    };
-  });
+      strategyRuns.get(key).rows.map((row) => ({
+        date: row.date,
+        demand: row.demand,
+        arrival_qty: row.arrival_qty,
+        units_fulfilled: row.units_fulfilled,
+        stockout_units: row.stockout_units,
+        closing_stock: row.closing_stock,
+        open_order_units: row.open_order_units,
+        inventory_position: row.inventory_position,
+        order_qty: row.order_qty,
+        reorder_required: row.order_qty > 0,
+        reorder_point: round2(row.reorder_point),
+        target_inventory: round2(row.target_inventory),
+        safety_stock: row.safety_stock,
+      })),
+    ]),
+  );
 
-  const trajectory = xgbRows.map((row, index) => {
-    const base = baselineRows[index];
-    return {
-      date: row.date,
-      actual_demand: row.demand,
-      xgb_closing_stock: row.closing_stock,
-      baseline_closing_stock: base.closing_stock,
-      xgb_order_qty: row.order_qty,
-      baseline_order_qty: base.order_qty,
-      xgb_stockout_units: row.stockout_units,
-      baseline_stockout_units: base.stockout_units,
-      xgb_inventory_position: row.inventory_position,
-      baseline_inventory_position: base.inventory_position,
-      xgb_open_order_units: row.open_order_units,
-      baseline_open_order_units: base.open_order_units,
-      xgb_reorder_point: row.reorder_point,
-      baseline_reorder_point: base.reorder_point,
-    };
-  });
-
-  const selectedLevels = resolvePolicyLevels(profile, {
-    safetyStock,
-    dailyForecast: mean(days.map((day) => day.xgbDaily)),
-    leadTimeDays,
-    custom: applied,
-  });
-  const selectedRows = xgbRows;
-  const costDifference = xgbMetrics.total_inventory_cost - baselineMetrics.total_inventory_cost;
+  const xgbMetrics = primary.metrics;
+  const baselineMetrics = baselineRun.metrics;
+  const costDifference =
+    xgbMetrics.total_inventory_cost - baselineMetrics.total_inventory_cost;
 
   return {
     product_id: product.id,
@@ -488,17 +494,23 @@ function buildPayload(db, product, config) {
     forecast_error_std: Math.round((Number(product.sigma) || 0) * 1000) / 1000,
     lead_time_days: leadTimeDays,
     scope: SIMULATION_SCOPE,
+    policies_evaluated: requested,
     policy: {
-      key: profile.key,
-      label: profile.label,
-      description: profile.description,
-      safety_stock: selectedLevels.safety,
-      coverage_days: Math.round(selectedLevels.coverageDays * 100) / 100,
-      average_reorder_point: mean(selectedRows.map((row) => row.reorder_point)),
-      average_order_up_to: mean(selectedRows.map((row) => row.target_inventory)),
-      parameters: applied,
+      key: primaryKey,
+      label: POLICY_LOOKUP[primaryKey].label,
+      description: POLICY_LOOKUP[primaryKey].description,
+      safety_stock: primary.levels.safety,
+      coverage_days: round2(primary.levels.coverageDays),
+      average_reorder_point: round2(
+        mean(primary.rows.map((row) => row.reorder_point)),
+      ),
+      average_order_up_to: round2(
+        mean(primary.rows.map((row) => row.target_inventory)),
+      ),
+      parameters: POLICY_LOOKUP[primaryKey].acceptsCustom ? supplied : {},
     },
     policy_comparison: policyComparison,
+    policy_timelines: policyTimelines,
     available_policies: INVENTORY_POLICIES.map((entry) => ({
       key: entry.key,
       label: entry.label,
@@ -509,15 +521,15 @@ function buildPayload(db, product, config) {
     ),
     xgb_metrics: xgbMetrics,
     baseline_metrics: baselineMetrics,
-    // Reported for parity with the API. The results panel deliberately does not
-    // turn it into a verdict — a lower cost on a shorter replay is not proof one
-    // forecasting method is better.
+    // Reported for parity with the API. The results panel deliberately keeps
+    // this inside the collapsed model section and does not turn it into a
+    // verdict — a lower cost on one replay is not proof one forecasting method
+    // is better.
     cost_comparison: {
       recommended_strategy: costDifference <= 0 ? 'xgboost' : 'baseline',
       expected_savings: Math.abs(costDifference),
       cost_difference: costDifference,
     },
-    daily_trajectory: trajectory,
     mode: 'mock',
   };
 }

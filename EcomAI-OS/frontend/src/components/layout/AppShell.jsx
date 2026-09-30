@@ -44,7 +44,11 @@ export default function AppShell() {
   };
 
   return (
-    <div className="flex min-h-screen bg-slate-50">
+    // Not a flex row. The sidebar is `position: fixed`, so it is out of flow and
+    // the content column is the only in-flow child; the column reserves the
+    // sidebar's width as left padding rather than as a sibling box, which is what
+    // keeps a long page from giving the panel any height to stretch into.
+    <div className="min-h-screen bg-slate-50">
       {/* Desktop sidebar */}
       <Sidebar
         collapsed={collapsed}
@@ -64,7 +68,13 @@ export default function AppShell() {
         }}
       />
 
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div
+        data-testid="app-content"
+        className={cn(
+          'flex min-w-0 flex-col transition-[padding] duration-200 ease-in-out',
+          collapsed ? 'lg:pl-[72px]' : 'lg:pl-64',
+        )}
+      >
         <Header onMenuClick={() => setMobileOpen(true)} onLogout={() => setLogoutOpen(true)} />
 
         {/* Mobile search row */}

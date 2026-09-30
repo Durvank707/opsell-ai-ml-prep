@@ -1,16 +1,27 @@
-// The simulation form: five steps, one product, and two separate questions.
+// The simulation form: four steps, one product, and no strategy to choose.
 //
-// The form used to lead with a scope control offering the whole catalog, which
-// the engine cannot run — choosing it either failed in api mode or quietly
-// simulated a single product in mock mode, which is worse because it looks like
-// it worked. The form now evaluates one product, says why, and keeps the
-// inventory-policy choice and the forecast comparison as two distinct things
-// with two distinct headings.
+// The form used to ask two questions the user should not have been asked before
+// seeing any data — which inventory policy to replay, and which forecasting
+// method to compare. Neither is a decision the customer can make usefully: the
+// run exists to answer "how would each of these have behaved?", so the form now
+// asks only what it has to (which product, which period, what costs) and states
+// the custom experiment as an optional extra below the main action.
+//
+// These tests pin the *absence* as much as the presence: no radio group, no
+// pre-run strategy selection, and a payload that never carries a strategy
+// selection at all.
 
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import SimulationConfig from './SimulationConfig';
-import { SIMULATION_DISCLAIMER, SIMULATION_SCOPE_NOTE } from '../services/simulationPolicy';
+import {
+  COST_ASSUMPTIONS,
+  FORECASTING_ROLE_NOTE,
+  INVENTORY_POLICIES,
+  SIMULATION_DISCLAIMER,
+  SIMULATION_PURPOSE,
+  SIMULATION_SCOPE_NOTE,
+} from '../services/simulationPolicy';
 
 const PRODUCTS = [
   { id: 'P001', name: 'Wireless Headphones', sku: 'AUD-100', category: 'Electronics', leadTimeDays: 7, currentStock: 60 },
@@ -31,7 +42,8 @@ function renderForm(props = {}) {
 }
 
 const productField = () => screen.getByLabelText(/^product$/i);
-const runButton = () => screen.getByRole('button', { name: /run simulation/i });
+const runButton = () => screen.getByRole('button', { name: /^run simulation$/i });
+const customToggle = () => screen.getByRole('button', { name: /\+ test custom policy/i });
 
 /** Click into the picker, which lists the whole catalog over the selection. */
 function openPicker() {
@@ -49,47 +61,83 @@ function chooseProduct(query) {
   fireEvent.mouseDown(screen.getAllByRole('option')[0]);
 }
 
-function choosePolicy(label) {
-  fireEvent.click(screen.getByRole('radio', { name: new RegExp(label, 'i') }));
-}
-
 function run() {
   fireEvent.click(runButton());
 }
+
+function setCustomField(label, value) {
+  fireEvent.change(screen.getByLabelText(label), { target: { value } });
+}
+
+/** Open the optional experiment, as a user would: a single secondary click. */
+function openCustomPanel() {
+  fireEvent.click(customToggle());
+}
+
+const safetyField = /safety stock \(units\)/i;
+const coverageField = /order coverage \(days\)/i;
 
 beforeEach(() => {
   vi.spyOn(console, 'error').mockImplementation(() => {});
 });
 
-describe('the five steps', () => {
+describe('the four steps', () => {
   it('walks the user from product to run, in order', () => {
     renderForm();
-    const headings = ['Product to simulate', 'Inventory policy', 'Historical period to replay', 'Cost assumptions (optional)', 'Run the simulation'];
+    const headings = [
+      'Product to simulate',
+      'Simulation period',
+      'Cost assumptions',
+      'Run the simulation',
+    ];
     for (const heading of headings) {
       expect(screen.getByText(heading)).toBeInTheDocument();
     }
-    // Numbered 1..5, so a new user can see how much is left to do.
-    for (const number of ['1', '2', '3', '4', '5']) {
+    // Numbered 1..4, so a new user can see how much is left to do.
+    for (const number of ['1', '2', '3', '4']) {
       expect(screen.getByText(number)).toBeInTheDocument();
     }
+    // The old fifth step — picking a policy — is gone, and nothing took its
+    // place as a hidden question.
+    expect(screen.queryAllByRole('radio')).toHaveLength(0);
   });
 
-  it('asks the policy question in plain words', () => {
+  it('says what the page is for, in one sentence, at the top', () => {
     renderForm();
-    expect(screen.getByText('How should inventory be managed?')).toBeInTheDocument();
+    expect(screen.getAllByText(SIMULATION_PURPOSE).length).toBeGreaterThan(0);
+    expect(SIMULATION_PURPOSE).toMatch(/replays your historical inventory/i);
   });
 
-  it('ends in a call to action that says what running it does', () => {
+  it('offers exactly one action that starts a run', () => {
+    // Two "Run Simulation" buttons would let a user believe they had run twice.
     renderForm();
-    expect(
-      screen.getAllByText('Replay historical sales and see how this policy would have performed.')
-        .length,
-    ).toBeGreaterThan(0);
+    expect(screen.getAllByRole('button', { name: /run simulation/i })).toHaveLength(1);
+  });
+
+  it('previews the strategies the run will cover, so the comparison is no surprise', () => {
+    renderForm();
+    expect(screen.getByText(/one run replays all of these/i)).toBeInTheDocument();
+    for (const key of ['current', 'conservative', 'aggressive']) {
+      const policy = INVENTORY_POLICIES.find((entry) => entry.key === key);
+      expect(screen.getByText(policy.label)).toBeInTheDocument();
+      expect(screen.getByText(policy.description)).toBeInTheDocument();
+    }
+    // Not selectable: the preview exists to tell the user what will happen, and
+    // a clickable version would recreate the pre-run choice this design removed.
+    expect(screen.queryByText('Custom')).toBeNull();
   });
 
   it('says the run changes nothing real', () => {
     renderForm();
     expect(screen.getAllByText(SIMULATION_DISCLAIMER).length).toBeGreaterThan(0);
+  });
+
+  it('says forecasting is an input, not a choice made here', () => {
+    renderForm();
+    // The old form had a "Forecast comparison" block with two method names. The
+    // comparison still happens, but on the results panel and behind a collapse.
+    expect(screen.queryByText(/forecast comparison/i)).toBeNull();
+    expect(screen.getAllByText(FORECASTING_ROLE_NOTE).length).toBeGreaterThan(0);
   });
 });
 
@@ -121,16 +169,15 @@ describe('one product at a time', () => {
     expect(document.body.textContent).not.toMatch(/all products/i);
   });
 
-  it('explains why the portfolio is not offered, rather than omitting it silently', () => {
+  it('explains the one-product limit, rather than omitting it silently', () => {
     renderForm();
     expect(screen.getByText(SIMULATION_SCOPE_NOTE)).toBeInTheDocument();
-    expect(SIMULATION_SCOPE_NOTE).toMatch(/one product at a time/i);
+    expect(SIMULATION_SCOPE_NOTE).toMatch(/like-for-like/i);
   });
 
   it('holds exactly one product, so a second choice replaces the first', async () => {
-    // The restriction used to be expressed by a single-select element. The
-    // picker is a text box now, so the same guarantee is expressed by the
-    // payload: choosing again replaces the product instead of adding one.
+    // The picker is a text box, so the guarantee is expressed by the payload:
+    // choosing again replaces the product instead of adding one.
     const { onRun } = renderForm();
     chooseProduct('Desk Lamp');
     chooseProduct('Wireless Headphones');
@@ -148,11 +195,10 @@ describe('one product at a time', () => {
   });
 
   it('does not run the simulation while the product is being searched for', () => {
-    // Typing is a search, not a decision. Nothing is sent until the user picks a
-    // product and asks for the run.
+    // Typing is a search, not a decision. Nothing is sent until the user asks
+    // for the run.
     const { onRun } = renderForm();
     fireEvent.change(productField(), { target: { value: 'd' } });
-    fireEvent.change(productField(), { target: { value: 'de' } });
     fireEvent.change(productField(), { target: { value: 'desk lamp' } });
     expect(onRun).not.toHaveBeenCalled();
   });
@@ -170,58 +216,64 @@ describe('one product at a time', () => {
   });
 });
 
-describe('the inventory policy', () => {
-  it('offers the four policies the server accepts', () => {
-    renderForm();
-    expect(screen.getAllByRole('radio')).toHaveLength(4);
-    // Matched by accessible name, so this also proves each option is labelled.
-    for (const label of [/^Current Policy/, /^Conservative/, /^Aggressive/, /^Custom/]) {
-      expect(screen.getByRole('radio', { name: label })).toBeInTheDocument();
-    }
-  });
-
-  it('gives each one a sentence saying what it does', () => {
-    renderForm();
-    expect(screen.getByText('Uses the standard EcomAI-OS replenishment rules.')).toBeInTheDocument();
-    expect(screen.getByText(/keep more safety inventory/i)).toBeInTheDocument();
-    expect(screen.getByText(/keep leaner inventory/i)).toBeInTheDocument();
-  });
-
-  it('starts on the current policy, which is the one live EcomAI-OS already runs', () => {
-    renderForm();
-    expect(screen.getByRole('radio', { name: /current policy/i })).toBeChecked();
-  });
-
-  it('sends the policy the user chose', async () => {
+describe('one run evaluates every strategy', () => {
+  it('sends no strategy selection at all, because the user made none', async () => {
     const { onRun } = renderForm();
-    choosePolicy('Aggressive');
     run();
     await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
-    expect(onRun.mock.calls[0][0].policy).toBe('aggressive');
+    const config = onRun.mock.calls[0][0];
+    // The service layer derives the full preset list. A `policy` here would be
+    // a selection the user never made, and the server would headline it.
+    expect(config.policy).toBeUndefined();
+    expect(config.policies).toBeUndefined();
   });
 
-  it('sends no parameters for a fixed preset, which the server refuses', async () => {
+  it('turns the custom experiment off unless it was switched on', async () => {
     const { onRun } = renderForm();
-    choosePolicy('Conservative');
     run();
     await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
-    expect(onRun.mock.calls[0][0].policyParams).toBeNull();
+    expect(onRun.mock.calls[0][0].customEnabled).toBe(false);
+    expect(onRun.mock.calls[0][0].customParams).toBeNull();
   });
 });
 
-describe('the custom policy', () => {
-  it('hides the parameters until the custom policy is chosen', () => {
+describe('the optional custom experiment', () => {
+  it('is offered as a secondary action, below the main one', () => {
     renderForm();
-    expect(screen.queryByLabelText(/safety stock \(units\)/i)).toBeNull();
-    choosePolicy('Custom');
-    expect(screen.getByLabelText(/safety stock \(units\)/i)).toBeInTheDocument();
+    // Placement is the design: the presets are the answer the page exists to
+    // give, so the experiment is offered after them, not above them.
+    const buttons = screen.getAllByRole('button');
+    const runIndex = buttons.findIndex((b) => b === runButton());
+    const customIndex = buttons.findIndex((b) => b === customToggle());
+    expect(customIndex).toBeGreaterThan(runIndex);
+  });
+
+  it('keeps its parameters hidden until it is asked for', () => {
+    renderForm();
+    expect(screen.queryByLabelText(safetyField)).toBeNull();
+    openCustomPanel();
+    expect(screen.getByLabelText(safetyField)).toBeInTheDocument();
+  });
+
+  it('can be closed again, and takes its values with it', async () => {
+    const { onRun } = renderForm();
+    openCustomPanel();
+    setCustomField(safetyField, '45');
+    fireEvent.click(screen.getByRole('button', { name: /close custom policy experiment/i }));
+    expect(screen.queryByLabelText(safetyField)).toBeNull();
+    run();
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+    // The typed value belonged to a panel that is no longer open, so it must
+    // not reappear as a strategy the user no longer asked for.
+    expect(onRun.mock.calls[0][0].customEnabled).toBe(false);
+    expect(onRun.mock.calls[0][0].customParams).toBeNull();
   });
 
   it('offers only the two parameters the server actually applies', () => {
     renderForm();
-    choosePolicy('Custom');
-    expect(screen.getByLabelText(/safety stock \(units\)/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/order coverage \(days\)/i)).toBeInTheDocument();
+    openCustomPanel();
+    expect(screen.getByLabelText(safetyField)).toBeInTheDocument();
+    expect(screen.getByLabelText(coverageField)).toBeInTheDocument();
     // A third knob would be accepted here, ignored by the server, and then
     // reported on the results panel as though it had been simulated.
     expect(screen.queryByLabelText(/minimum stock/i)).toBeNull();
@@ -229,42 +281,73 @@ describe('the custom policy', () => {
     expect(screen.queryByLabelText(/order quantity/i)).toBeNull();
   });
 
-  it('says a blank field falls back to the current policy\'s own value', () => {
+  it('says it adds a strategy beside the others, not instead of them', () => {
     renderForm();
-    choosePolicy('Custom');
-    expect(screen.getByText(/leave a\s+field blank to use the current policy/i)).toBeInTheDocument();
+    openCustomPanel();
+    expect(
+      screen.getByText(/adds one more strategy to the comparison, alongside current, conservative and aggressive/i),
+    ).toBeInTheDocument();
   });
 
-  it('sends the values the user entered', async () => {
+  it('says a blank field falls back to the current strategy\'s own value', () => {
+    renderForm();
+    openCustomPanel();
+    expect(
+      screen.getByText(/leave a\s+field blank to use the current\s+policy's own value/i),
+    ).toBeInTheDocument();
+  });
+
+  it('lists Custom in the run preview only while it is switched on', () => {
+    renderForm();
+    expect(screen.queryByText('Custom')).toBeNull();
+    openCustomPanel();
+    expect(screen.getAllByText('Custom').length).toBeGreaterThan(0);
+  });
+
+  it('sends the values the user entered, marked as an experiment', async () => {
     const { onRun } = renderForm();
-    choosePolicy('Custom');
-    fireEvent.change(screen.getByLabelText(/safety stock \(units\)/i), { target: { value: '45' } });
-    fireEvent.change(screen.getByLabelText(/order coverage \(days\)/i), { target: { value: '14' } });
+    openCustomPanel();
+    setCustomField(safetyField, '45');
+    setCustomField(coverageField, '14');
     run();
     await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
     expect(onRun.mock.calls[0][0]).toMatchObject({
-      policy: 'custom',
-      policyParams: { safety_stock: 45, coverage_days: 14 },
+      customEnabled: true,
+      customParams: { safety_stock: 45, coverage_days: 14 },
     });
+    // No strategy is named alongside the parameters: there is no preset
+    // selection for a custom value to contradict.
+    expect(onRun.mock.calls[0][0].policy).toBeUndefined();
+  });
+
+  it('adds the arm with no parameters when the fields are left blank', async () => {
+    const { onRun } = renderForm();
+    openCustomPanel();
+    run();
+    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
+    // The server then uses the current strategy's own values, which is the same
+    // thing the field being blank already means.
+    expect(onRun.mock.calls[0][0].customEnabled).toBe(true);
+    expect(onRun.mock.calls[0][0].customParams).toBeNull();
   });
 
   it('omits a field the user left blank rather than sending zero', async () => {
     // Zero safety stock is a real (and risky) answer; a blank field means "use
     // the current policy's value", and the two must not collapse into one.
     const { onRun } = renderForm();
-    choosePolicy('Custom');
-    fireEvent.change(screen.getByLabelText(/safety stock \(units\)/i), { target: { value: '45' } });
+    openCustomPanel();
+    setCustomField(safetyField, '45');
     run();
     await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
-    expect(onRun.mock.calls[0][0].policyParams).toEqual({ safety_stock: 45 });
+    expect(onRun.mock.calls[0][0].customParams).toEqual({ safety_stock: 45 });
   });
 
   it('refuses text a number field cannot represent, rather than reading it as blank', async () => {
     // Blank means "use the current policy's value", so a field that silently
-    // became blank would run a different policy than the one on screen.
+    // became blank would run a different strategy than the one on screen.
     const { onRun } = renderForm();
-    choosePolicy('Custom');
-    const field = screen.getByLabelText(/safety stock \(units\)/i);
+    openCustomPanel();
+    const field = screen.getByLabelText(safetyField);
     fireEvent.change(field, { target: { value: 'loads' } });
     if (field.validity && field.validity.badInput) {
       run();
@@ -280,8 +363,8 @@ describe('the custom policy', () => {
 
   it('refuses a negative buffer, naming the field', async () => {
     const { onRun } = renderForm();
-    choosePolicy('Custom');
-    fireEvent.change(screen.getByLabelText(/safety stock \(units\)/i), { target: { value: '-5' } });
+    openCustomPanel();
+    setCustomField(safetyField, '-5');
     run();
     await waitFor(() => expect(screen.getByText(/zero or more/i)).toBeInTheDocument());
     expect(onRun).not.toHaveBeenCalled();
@@ -289,15 +372,14 @@ describe('the custom policy', () => {
 
   it('clears the complaint once the value is fixed', async () => {
     const { onRun } = renderForm();
-    choosePolicy('Custom');
-    const field = screen.getByLabelText(/safety stock \(units\)/i);
-    fireEvent.change(field, { target: { value: '-5' } });
+    openCustomPanel();
+    setCustomField(safetyField, '-5');
     run();
     await waitFor(() => expect(screen.getByText(/zero or more/i)).toBeInTheDocument());
-    fireEvent.change(field, { target: { value: '30' } });
+    setCustomField(safetyField, '30');
     run();
     await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
-    expect(onRun.mock.calls[0][0].policyParams).toEqual({ safety_stock: 30 });
+    expect(onRun.mock.calls[0][0].customParams).toEqual({ safety_stock: 30 });
   });
 });
 
@@ -333,14 +415,14 @@ describe('the cost assumptions', () => {
   it('explains what each cost is, because a user is guessing otherwise', () => {
     renderForm();
     expect(screen.getByLabelText(/ordering cost/i)).toBeInTheDocument();
-    expect(screen.getByText(/fixed cost of placing one purchase order/i)).toBeInTheDocument();
+    expect(screen.getByText(COST_ASSUMPTIONS[0].meaning)).toBeInTheDocument();
     expect(screen.getByLabelText(/stockout cost/i)).toBeInTheDocument();
-    expect(screen.getByText(/margin lost when a unit of demand cannot be fulfilled/i)).toBeInTheDocument();
+    expect(screen.getByText(COST_ASSUMPTIONS[1].meaning)).toBeInTheDocument();
   });
 
   it('marks them optional and starts them on the server defaults', async () => {
     const { onRun } = renderForm();
-    expect(screen.getByText('Cost assumptions (optional)')).toBeInTheDocument();
+    expect(screen.getByText(/used only to price the simulated inventory/i)).toBeInTheDocument();
     run();
     await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
     expect(onRun.mock.calls[0][0]).toMatchObject({ orderingCost: 500, stockoutCost: 1000 });
@@ -356,43 +438,9 @@ describe('the cost assumptions', () => {
   });
 });
 
-describe('the forecast comparison', () => {
-  it('is its own section, not part of the policy step', () => {
-    renderForm();
-    expect(
-      screen.getByText('Forecast comparison: which forecast performed better?'),
-    ).toBeInTheDocument();
-  });
-
-  it('says it is a different question from the policy choice', () => {
-    renderForm();
-    expect(
-      screen.getByText(/compares forecasting methods, and is separate from the policy/i),
-    ).toBeInTheDocument();
-  });
-
-  it('names the two methods without offering a control to pick one', () => {
-    renderForm();
-    expect(screen.getByText('XGBoost')).toBeInTheDocument();
-    expect(screen.getByText('Moving Average')).toBeInTheDocument();
-    // The engine replays both on every run, so a control here would be a choice
-    // the user appears to have made and the server never received.
-    expect(screen.getAllByRole('radio')).toHaveLength(4);
-  });
-
-  it('cannot change the policy that is sent', async () => {
-    const { onRun } = renderForm();
-    run();
-    await waitFor(() => expect(onRun).toHaveBeenCalledTimes(1));
-    expect(onRun.mock.calls[0][0].policy).toBe('current');
-  });
-});
-
 describe('while a run is in flight', () => {
   it('disables the button so the same period is not replayed twice', () => {
     renderForm({ running: true });
-    // The label says what is happening, and the control is unavailable: a
-    // second click would replay the same window and overwrite the first result.
     const busy = screen.getByRole('button', { name: /running simulation/i });
     expect(busy).toBeDisabled();
     expect(screen.queryByRole('button', { name: /^run simulation$/i })).toBeNull();

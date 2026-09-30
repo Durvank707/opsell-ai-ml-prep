@@ -138,6 +138,33 @@ export function upperFirst(str = '') {
   return str.charAt(0).toUpperCase() + str.slice(1);
 }
 
+// Nouns that do not take a plain "s". Appending one gives "2 strategys", which
+// reads as a typo and undermines a page whose whole job is being legible to
+// someone new to the topic.
+const IRREGULAR_PLURALS = {
+  strategy: 'strategies',
+  policy: 'policies',
+  company: 'companies',
+  analysis: 'analyses',
+  episode: 'episodes',
+  day: 'days',
+};
+
+/**
+ * `plural(2, 'strategy')` → `"2 strategies"`.
+ *
+ * Only the last word of a phrase is inflected, so `plural(3, 'stockout day')`
+ * becomes "3 stockout days" while `plural(1, 'stockout day')` stays singular.
+ */
+export function plural(count, noun) {
+  const n = Number(count) || 0;
+  const words = String(noun).split(' ');
+  const last = words[words.length - 1];
+  if (n === 1) return `${n} ${words.join(' ')}`;
+  words[words.length - 1] = IRREGULAR_PLURALS[last] || `${last}s`;
+  return `${n} ${words.join(' ')}`;
+}
+
 export function downloadFile(filename, content, mime = 'text/plain') {
   const blob = new Blob([content], { type: mime });
   const url = URL.createObjectURL(blob);

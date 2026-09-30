@@ -12,8 +12,13 @@
 //
 // The page's own loads (the catalog and the recorded demand range) happen once
 // on mount. Everything after that is local.
+//
+// The layout tests at the end pin the page's shape: setup stacked above results,
+// no split-screen grid, and no scroll container of its own. jsdom computes no
+// layout, so those assert the structure and the classes that produce the
+// behaviour rather than measuring boxes.
 
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const USER = { id: 'tenant-a', email: 'a@example.com' };
@@ -43,9 +48,19 @@ vi.mock('../services/simulationService', () => simulation);
 
 // The results panel has its own tests and needs a full backtest payload to
 // render. What is under test here is what happens *before* a result exists —
-// which product the run is scoped to — so the panel is stubbed out.
+// which product the run is scoped to — and the page's shape around it, so the
+// panel is stubbed with a deliberately long block of content: a real run's
+// results are several screens tall, and that height is the whole reason the old
+// split-screen layout misbehaved.
 vi.mock('../components/SimulationResults', () => ({
-  default: () => <div>simulation results</div>,
+  default: () => (
+    <div data-testid="results-panel">
+      <p>simulation results</p>
+      {Array.from({ length: 30 }, (_, i) => (
+        <div key={i} style={{ height: 200 }} data-testid={`result-block-${i}`} />
+      ))}
+    </div>
+  ),
 }));
 
 import SimulationPage from './SimulationPage';
@@ -81,6 +96,17 @@ const RESULT = { ok: true };
 
 const box = () => screen.getByLabelText(/^product$/i);
 const runButton = () => screen.getByRole('button', { name: /run simulation/i });
+
+// The two labelled sections the page is now built from. A `<section>` with an
+// `aria-labelledby` is a `region` landmark, so these are also how a screen reader
+// jumps straight to the part it needs.
+const setupRegion = () => screen.getByRole('region', { name: /configure simulation/i });
+const resultsRegion = () => screen.getByRole('region', { name: /view results/i });
+
+/** True when `a` comes earlier in the document than `b`. */
+function before(a, b) {
+  return Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+}
 
 /** Search the picker and take the first match, as a user would. */
 function chooseProduct(query) {
@@ -216,16 +242,32 @@ describe('the run the picker produces', () => {
   it('leaves every other part of the payload as the form set it', async () => {
     await renderPage();
     chooseProduct('Desk Lamp');
-    fireEvent.click(screen.getByRole('radio', { name: /conservative/i }));
     fireEvent.click(runButton());
     await waitFor(() => expect(simulation.runSimulation).toHaveBeenCalled());
     const config = simulation.runSimulation.mock.calls[0][1];
+    // No `policy`: the form asks the user to choose none, so the payload cannot
+    // name one either. The service layer derives the full preset list.
     expect(config).toMatchObject({
       productIds: ['P002'],
-      policy: 'conservative',
-      policyParams: null,
+      customEnabled: false,
+      customParams: null,
       orderingCost: 500,
       stockoutCost: 1000,
+    });
+    expect(config.policy).toBeUndefined();
+  });
+
+  it('carries the custom experiment through, and only when it was switched on', async () => {
+    await renderPage();
+    fireEvent.click(screen.getByRole('button', { name: /\+ test custom policy/i }));
+    fireEvent.change(screen.getByLabelText(/safety stock \(units\)/i), {
+      target: { value: '45' },
+    });
+    fireEvent.click(runButton());
+    await waitFor(() => expect(simulation.runSimulation).toHaveBeenCalled());
+    expect(simulation.runSimulation.mock.calls[0][1]).toMatchObject({
+      customEnabled: true,
+      customParams: { safety_stock: 45 },
     });
   });
 
@@ -238,5 +280,183 @@ describe('the run the picker produces', () => {
     fireEvent.click(runButton());
     await waitFor(() => expect(simulation.runSimulation).toHaveBeenCalledTimes(1));
     expect(simulation.runSimulation.mock.calls[0][1].productIds).toEqual(['P003']);
+  });
+});
+
+// The page used to be a five-column grid: the form pinned into the first two
+// columns, the results in the other three. A real run's results run several
+// screens long, so the grid row was as tall as the results, the pinned column
+// scrolled out of view leaving a tall empty column beside it, and the inventory
+// graph was confined to three fifths of the width.
+//
+// jsdom has no layout engine, so these tests cannot measure a column's width.
+// What they can do — and what actually caused the bug — is check the structure:
+// that the two sections are stacked block-level siblings, that nothing pins or
+// scrolls the setup on its own, and that no result content is ever placed beside
+// the form.
+describe('the page runs top to bottom', () => {
+  it('names both sections, so the order is the page’s structure', async () => {
+    await renderPage();
+    // A labelled <section> is a landmark. Configure → run → read is now
+    // something a screen reader can navigate directly to.
+    expect(setupRegion()).toBeInTheDocument();
+    expect(resultsRegion()).toBeInTheDocument();
+  });
+
+  it('puts the setup section above the results section', async () => {
+    await renderPage();
+    expect(before(setupRegion(), resultsRegion())).toBe(true);
+  });
+
+  it('keeps the setup at the top and the results below it after a run', async () => {
+    await renderPage();
+    fireEvent.click(runButton());
+    await waitFor(() => expect(screen.getByTestId('results-panel')).toBeInTheDocument());
+
+    // The bug: the form sat in a sticky column that stayed put while the results
+    // grew, so the two were level with each other for most of the scroll.
+    expect(before(setupRegion(), screen.getByTestId('results-panel'))).toBe(true);
+    expect(before(setupRegion(), resultsRegion())).toBe(true);
+    expect(resultsRegion().contains(screen.getByTestId('results-panel'))).toBe(true);
+  });
+
+  it('shows the setup and an instruction state when nothing has been run', async () => {
+    await renderPage();
+    expect(setupRegion()).toBeInTheDocument();
+    expect(screen.getByText(/ready to simulate/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('results-panel')).toBeNull();
+  });
+
+  it('tells the user where the product picker is, now that nothing is beside it', async () => {
+    await renderPage();
+    // "on the left" described the split screen. The picker is above, and saying
+    // otherwise sends the user looking for a column that no longer exists.
+    expect(screen.getByText(/ready to simulate/i).parentElement.textContent).toMatch(
+      /choose a product above/i,
+    );
+    expect(document.body.textContent).not.toMatch(/choose a product on the left/i);
+  });
+
+  it('has no split-screen grid anywhere on the page', async () => {
+    await renderPage();
+    // The old wrapper was `grid ... xl:grid-cols-5` with `col-span-2` and
+    // `col-span-3` children. Nothing places content in a column now.
+    const offenders = Array.from(document.querySelectorAll('*')).filter(
+      (node) =>
+        /xl:grid-cols-5|col-span-2|col-span-3/.test(node.className || ''),
+    );
+    expect(offenders).toHaveLength(0);
+  });
+
+  it('stacks the two sections as siblings in one vertical flow', async () => {
+    await renderPage();
+    // Same parent, in order, as block-level flow. Siblings in a grid are what let
+    // one column be as tall as the other.
+    expect(setupRegion().parentElement).toBe(resultsRegion().parentElement);
+    expect(before(setupRegion(), resultsRegion())).toBe(true);
+  });
+});
+
+describe('nothing on the page scrolls on its own', () => {
+  it('does not pin the setup section', async () => {
+    await renderPage();
+    // `sticky` plus `max-h-[calc(100vh-6rem)]` plus `overflow-y-auto` was a
+    // scroll container inside a grid cell — the source of both the empty column
+    // and the nested scrollbar.
+    const offenders = Array.from(setupRegion().querySelectorAll('*')).filter((node) => {
+      const cls = node.className || '';
+      return /sticky|overflow-y-auto|overflow-auto|max-h-\[calc/.test(cls);
+    });
+    expect(offenders).toHaveLength(0);
+  });
+
+  it('leaves vertical scrolling to the page', async () => {
+    await renderPage();
+    fireEvent.click(runButton());
+    await waitFor(() => expect(screen.getByTestId('results-panel')).toBeInTheDocument());
+
+    // No element between the page root and the results declares its own height
+    // or a vertical scroller, so a long run makes the document taller and the
+    // browser scrolls once, at the page level.
+    const offenders = Array.from(document.querySelectorAll('*')).filter((node) => {
+      const cls = node.className || '';
+      return /overflow-y-auto|overflow-auto|100vh|h-screen|max-h-\[/.test(cls);
+    });
+    expect(offenders.map((node) => node.className)).toEqual([]);
+  });
+
+  it('leaves long results to stack under a setup section of its own height', async () => {
+    await renderPage();
+    fireEvent.click(runButton());
+    await waitFor(() => expect(screen.getByTestId('results-panel')).toBeInTheDocument());
+
+    // The empty-column symptom needed the form to share a row with tall content:
+    // a flex or grid item stretches, a block child does not. Nothing on either
+    // side asks to be as tall as the other.
+    const setup = setupRegion();
+    const results = resultsRegion();
+    for (const region of [setup, results]) {
+      const cls = region.className || '';
+      expect(cls).not.toMatch(/grid|flex|items-stretch|self-stretch|h-full/);
+    }
+    // And no wrapper places them in a shared row.
+    const parent = setup.parentElement;
+    expect(parent.className || '').not.toMatch(/\bflex\b|\bgrid\b/);
+  });
+});
+
+describe('the results get the full width', () => {
+  it('constrains only the form, which is a reading column', async () => {
+    await renderPage();
+    // A form stretched across a wide screen is harder to read, not easier, so
+    // the setup keeps a measure of its own. The results get everything else.
+    expect(setupRegion().querySelector('.max-w-4xl')).not.toBeNull();
+    expect(resultsRegion().querySelector('.max-w-4xl')).toBeNull();
+  });
+
+  it('puts no width cap between the results and the content area', async () => {
+    await renderPage();
+    fireEvent.click(runButton());
+    await waitFor(() => expect(screen.getByTestId('results-panel')).toBeInTheDocument());
+
+    // No `max-w-*` and no `w-*` on the results section or the panel stub, so the
+    // comparison table and the inventory graph fill the content width — which is
+    // what the old three-of-five-columns grid took away from them.
+    for (const node of [resultsRegion(), screen.getByTestId('results-panel')]) {
+      expect(node.className || '').not.toMatch(/max-w-|w-\[/);
+    }
+  });
+});
+
+describe('the setup is not repeated with the results', () => {
+  it('renders the form once, in the setup section only', async () => {
+    await renderPage();
+    fireEvent.click(runButton());
+    await waitFor(() => expect(screen.getByTestId('results-panel')).toBeInTheDocument());
+
+    // One form, not a summary of it inside the results: the reader has just used
+    // it, and a second copy below the fold is a second thing to keep in sync.
+    expect(within(setupRegion()).getByLabelText(/^product$/i)).toBeInTheDocument();
+    expect(within(resultsRegion()).queryByLabelText(/^product$/i)).toBeNull();
+    expect(screen.getAllByLabelText(/^product$/i)).toHaveLength(1);
+    expect(
+      within(resultsRegion()).queryByText(/set up a simulation/i),
+    ).toBeNull();
+  });
+
+  it('keeps the four steps and the one action after the move', async () => {
+    await renderPage();
+    // The layout change must not quietly drop a step or a second CTA.
+    const setup = setupRegion();
+    for (const step of [
+      'Product to simulate',
+      'Simulation period',
+      'Cost assumptions',
+      'Run the simulation',
+    ]) {
+      expect(within(setup).getByText(step)).toBeInTheDocument();
+    }
+    expect(within(setup).getAllByRole('button', { name: /run simulation/i })).toHaveLength(1);
+    expect(within(setup).getByRole('button', { name: /\+ test custom policy/i })).toBeInTheDocument();
   });
 });

@@ -100,9 +100,16 @@ export function Sidebar({ collapsed, onToggleCollapse, user, onLogout }) {
   }, [profileOpen]);
 
   return (
+    // Fixed to the viewport rather than laid out as a column beside the content.
+    // As a flex child it inherited the content column's height, so on a long page
+    // — the Simulation results especially — the panel grew to the full page and
+    // the page scrolled instead of the panel. `inset-y-0` pins it to the screen
+    // and the nav's own `overflow-y-auto` gives it an internal scrollbar when the
+    // viewport is too short, which is the one case where it must scroll itself.
     <aside
+      data-testid="app-sidebar"
       className={cn(
-        'hidden lg:flex flex-col border-r border-slate-200 bg-white transition-[width] duration-200 ease-in-out',
+        'fixed inset-y-0 left-0 z-40 hidden flex-col overflow-hidden border-r border-slate-200 bg-white transition-[width] duration-200 ease-in-out lg:flex',
         collapsed ? 'w-[72px]' : 'w-64',
       )}
     >
@@ -121,6 +128,11 @@ export function Sidebar({ collapsed, onToggleCollapse, user, onLogout }) {
 
       <button
         onClick={onToggleCollapse}
+        // The visible label is dropped along with the panel width, which would
+        // leave the control with no accessible name exactly when it is smallest.
+        // The aria-label keeps it announced, and matches the visible text while
+        // that text is still on screen.
+        aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
         className={cn(
           'mx-3 mb-3 flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold text-slate-400 hover:bg-slate-100 hover:text-slate-600',
           collapsed && 'justify-center px-0',
@@ -177,25 +189,60 @@ export function Sidebar({ collapsed, onToggleCollapse, user, onLogout }) {
 }
 
 export function MobileDrawer({ open, onClose, user, onLogout }) {
+  // Escape closes the drawer. It is an overlay that covers the page, so leaving
+  // it open with no keyboard way out makes the links behind it unreachable by
+  // keyboard alone. The trigger button keeps focus, so returning there is what
+  // the user expects rather than dropping focus on the body.
+  const closeRef = useRef(null);
+  const previouslyFocused = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    previouslyFocused.current = document.activeElement;
+    closeRef.current?.focus();
+    const onKeyDown = (e) => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      onClose();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      if (previouslyFocused.current instanceof HTMLElement) {
+        previouslyFocused.current.focus();
+      }
+    };
+  }, [open, onClose]);
+
   return (
     <>
       {open && (
         <div className="fixed inset-0 z-40 bg-slate-900/40 lg:hidden animate-fade-in" onClick={onClose} aria-hidden />
       )}
       <aside
+        data-testid="app-mobile-drawer"
+        // `inert` is what stops a hidden drawer being tabbed into; the open
+        // drawer stays a plain focusable region rather than a focus trap, so
+        // Tab still walks out of it and back into the page.
+        inert={open ? undefined : ''}
         className={cn(
-          'fixed inset-y-0 left-0 z-50 flex w-72 -translate-x-full flex-col border-r border-slate-200 bg-white transition-transform duration-200 lg:hidden',
+          'fixed inset-y-0 left-0 z-50 flex w-72 max-w-[85vw] -translate-x-full flex-col border-r border-slate-200 bg-white transition-transform duration-200 lg:hidden',
           open && 'translate-x-0',
         )}
       >
-        <div className="flex h-16 items-center justify-between border-b border-slate-100 px-5">
+        <div className="flex h-16 shrink-0 items-center justify-between border-b border-slate-100 px-5">
           <span className="flex items-center gap-2.5">
             <Logo />
             <span className="text-[17px] font-extrabold tracking-tight text-slate-900">
               EcomAI<span className="text-brand-600">-OS</span>
             </span>
           </span>
-          <button onClick={onClose} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100" aria-label="Close menu">
+          <button
+            ref={closeRef}
+            onClick={onClose}
+            className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100"
+            aria-label="Close menu"
+          >
             <X className="h-5 w-5" />
           </button>
         </div>
@@ -210,7 +257,7 @@ export function MobileDrawer({ open, onClose, user, onLogout }) {
             </button>
           </div>
         </div>
-        <div className="flex items-center gap-3 border-t border-slate-100 p-4">
+        <div className="flex shrink-0 items-center gap-3 border-t border-slate-100 p-4">
           <Avatar name={user?.name} size="sm" />
           <div className="min-w-0">
             <p className="truncate text-sm font-semibold text-slate-800">{user?.name}</p>

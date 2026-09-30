@@ -1081,9 +1081,18 @@ class V2BacktestRequest(BaseModel):
     ordering_cost_per_order: float = Field(default=500.0, ge=0)
     stockout_cost_per_unit: float = Field(default=1000.0, ge=0)
     inventory_days: int = Field(default=5, ge=1, le=180)
-    # Which replenishment policy to replay. Resolved against the known keys
-    # server-side; an unknown key is a 400, not a silent fallback.
+    # Which inventory strategies to replay, all in one run. Omitted means every
+    # preset, because a caller asking how their inventory would have behaved
+    # wants the comparison rather than one column of it. An unknown key is
+    # refused server-side, never silently dropped.
+    policies: Optional[List[str]] = Field(default=None, min_length=1)
+    # The strategy whose detail metrics and forecasting comparison are reported
+    # at the top level. It must be one of `policies`, so a response can never
+    # headline a strategy the engine did not actually run.
     policy: str = Field(default="current", min_length=1)
+    # The custom strategy's parameters, accepted only when `custom` is among
+    # `policies`; supplying them for a fixed-policy run is a 422 rather than a
+    # value the engine would quietly ignore.
     policy_params: Optional[Dict[str, Any]] = None
 
 
@@ -1093,10 +1102,12 @@ async def simulation_backtest_v2(
     principal: AuthPrincipal = Depends(require_auth),
     user_id: str = Query(..., min_length=1),
 ):
-    """Backtest the ML replenishment policy against a moving-average baseline.
+    """Replay a product's recorded days under every inventory strategy asked for.
 
     Runs on this tenant's own sales history, so the comparison reflects their
-    demand rather than a shared demo dataset.
+    demand rather than a shared demo dataset. One request evaluates all the
+    requested strategies against the identical forecast, starting stock and cost
+    assumptions, and returns a per-strategy timeline for each.
     """
     ws = _principal_workspace(principal, user_id)
     try:
@@ -1110,6 +1121,7 @@ async def simulation_backtest_v2(
             inventory_days=body.inventory_days,
             policy=body.policy,
             policy_params=body.policy_params,
+            policies=body.policies,
         )
     except Exception as exc:  # noqa: BLE001 - mapped to an honest status below
         raise _intelligence_error(exc) from exc
@@ -1117,6 +1129,9 @@ async def simulation_backtest_v2(
         "start_date": result["start_date"],
         "end_date": result["end_date"],
         "duration_days": result["duration_days"],
+        # Every strategy that was replayed, not just the primary one: a single
+        # run can now cover several, and the trail has to say which.
+        "policies_evaluated": result["policies_evaluated"],
         "policy": result["policy"]["key"],
         "recommended_strategy": result["cost_comparison"]["recommended_strategy"],
     })

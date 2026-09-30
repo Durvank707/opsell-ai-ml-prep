@@ -2167,6 +2167,7 @@ class TenantWorkspace:
         inventory_days: int = 5,
         policy: str = "current",
         policy_params: Optional[Dict[str, Any]] = None,
+        policies: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Historical backtest for one of this tenant's products.
 
@@ -2179,18 +2180,29 @@ class TenantWorkspace:
         differs from V1 — it is this tenant's own sales history and this
         tenant's own error spread, never the global CSV.
 
-        Two independent comparisons come out of one run, over the same product
-        and the same days:
+        **Every strategy is evaluated in one call.** ``policies`` names the
+        strategies to replay; omitting it evaluates all three presets. A caller
+        therefore never has to run the same product three times to see a
+        comparison, which is what made the old form's policy selector redundant:
+        the results already contained every column it appeared to choose.
 
-        * **Policy** — the same XGBoost forecast replayed under each standard
-          policy. The forecast is identical across those replays, so the only
-          difference between their numbers is the policy.
-        * **Forecasting method** — the selected policy replayed once per method.
-          Same product, same days, same starting stock, same policy, so the
-          only difference is how demand was forecast.
+        Everything except the strategy is held identical across the strategies —
+        the same product, the same recorded days, the same prepared forecast,
+        the same starting stock and the same cost assumptions. The forecast is
+        a function of the recorded history alone, so one pass of it is prepared
+        up front and replayed per policy. That is what makes the columns
+        comparable: the only thing that differs between them is the policy.
 
-        The forecast is prepared once and replayed for every combination, so a
-        policy comparison costs one XGBoost pass rather than one per policy.
+        Each replayed strategy gets its own daily timeline in
+        ``policy_timelines``, so a caller can chart each one without a second
+        request. ``policy`` names the *primary* strategy — the one whose detail
+        metrics and forecasting comparison are reported at the top level — and
+        it must be one of the strategies actually replayed, so a response can
+        never headline a policy the engine did not run.
+
+        The XGBoost/moving-average comparison is a separate question about
+        forecasting, evaluated under the primary policy, and reported as model
+        evaluation rather than as an inventory strategy.
         """
 
         import pandas as pd
@@ -2220,11 +2232,43 @@ class TenantWorkspace:
         # immediately rather than after a full forecast pass.
         profile = get_profile(policy)
         custom = dict(policy_params or {})
-        if custom and not profile.accepts_custom:
+
+        # Which strategies this run replays. Every preset by default, because a
+        # caller asking "how would my inventory have behaved?" wants the
+        # comparison, not one column of it. An unknown key is refused here by
+        # the same `get_profile` that refuses it everywhere else.
+        if policies is None:
+            requested: List[str] = list(COMPARABLE_POLICY_KEYS)
+            if custom:
+                # Parameters with nowhere to apply are refused below; adding the
+                # custom arm here is what makes a supplied parameter mean
+                # something instead of being a silent no-op.
+                requested.append("custom")
+        else:
+            requested = []
+            for key in policies:
+                resolved = get_profile(key)
+                if resolved.key not in requested:
+                    requested.append(resolved.key)
+            if not requested:
+                raise ValueError(
+                    "Choose at least one inventory policy to simulate."
+                )
+
+        if custom and "custom" not in requested:
             raise ValueError(
-                f"'{profile.key}' is a fixed policy and takes no custom "
-                "parameters. Choose the custom policy to set safety_stock or "
-                "coverage_days."
+                "A run over fixed policies ("
+                + ", ".join(COMPARABLE_POLICY_KEYS)
+                + ") takes no custom parameters, so a supplied value would never "
+                "be applied. Include the custom policy in the run to set "
+                "safety_stock or coverage_days."
+            )
+
+        if profile.key not in requested:
+            raise ValueError(
+                f"'{profile.key}' was not among the policies simulated "
+                f"({', '.join(requested)}), so it cannot be reported as the "
+                "primary policy."
             )
 
         # The backtest simulates one product's inventory day by day, so it needs
@@ -2306,10 +2350,23 @@ class TenantWorkspace:
                 method=method,
             )
 
-        # The two method arms both run under the *selected* policy, so the
-        # forecasting comparison isolates the forecasting method.
-        xgb_results = replay("xgboost", profile.key, custom)
-        baseline_results = replay("baseline", profile.key, custom)
+        # One replay per requested policy, all against the identical prepared
+        # forecast above. Replaying here rather than in a loop over separate
+        # requests is what makes the comparison like-for-like: the days, the
+        # demand series, the opening stock and the lead time are literally the
+        # same objects, so nothing but the policy can differ between them.
+        replays: Dict[str, Any] = {
+            key: replay("xgboost", key, custom if key == "custom" else None)
+            for key in requested
+        }
+
+        # The forecasting arms run under the *primary* policy, so the model
+        # comparison isolates the forecasting method rather than mixing a
+        # policy change into it.
+        primary_replay = replays[profile.key]
+        baseline_results = replay(
+            "baseline", profile.key, custom if profile.key == "custom" else None
+        )
 
         cost_kwargs = dict(
             unit_cost=float(product.unit_cost or 0.0),
@@ -2317,12 +2374,12 @@ class TenantWorkspace:
             ordering_cost_per_order=ordering_cost_per_order,
             stockout_cost_per_unit=stockout_cost_per_unit,
         )
-        xgb_metrics = calculate_inventory_metrics(xgb_results, **cost_kwargs)
+        xgb_metrics = calculate_inventory_metrics(primary_replay, **cost_kwargs)
         baseline_metrics = calculate_inventory_metrics(baseline_results, **cost_kwargs)
 
         comparison = compare_inventory_strategies(
             strategy_a_name="xgboost",
-            strategy_a_results=xgb_results,
+            strategy_a_results=primary_replay,
             strategy_b_name="baseline",
             strategy_b_results=baseline_results,
             **cost_kwargs,
@@ -2356,47 +2413,57 @@ class TenantWorkspace:
                 float((results["closing_stock"] - buffer).clip(lower=0).mean()), 2
             )
 
-        # Policy comparison: identical forecast, one column per policy.
+        def _timeline(results) -> List[Dict[str, Any]]:
+            """One strategy's own day-by-day inventory history.
+
+            Every field the inventory chart and its hover details need, for this
+            strategy alone: what was on hand, what arrived, what was demanded,
+            what could not be fulfilled, what was still in transit, what was
+            ordered, and the level the policy was holding to. Unprefixed because
+            the key of ``policy_timelines`` already says which strategy it is.
+            """
+            points: List[Dict[str, Any]] = []
+            for row in results.itertuples(index=False):
+                points.append({
+                    "date": str(pd.Timestamp(row.date).date()),
+                    "demand": int(row.demand),
+                    "arrival_qty": int(row.arrival_qty),
+                    "units_fulfilled": int(row.units_fulfilled),
+                    "stockout_units": int(row.stockout_units),
+                    "closing_stock": int(row.closing_stock),
+                    "open_order_units": int(row.open_order_units),
+                    "inventory_position": int(row.inventory_position),
+                    "order_qty": int(row.order_qty),
+                    "reorder_required": bool(row.reorder_required),
+                    "reorder_point": round(float(row.reorder_point), 2),
+                    "target_inventory": round(float(row.target_inventory), 2),
+                    "safety_stock": round(float(row.safety_stock), 2),
+                })
+            return points
+
+        # One row per strategy actually replayed, in the order they were asked
+        # for. `custom` appears only when it was run, because a comparison row
+        # for a policy nobody simulated would be a fabricated number.
         policy_comparison: List[Dict[str, Any]] = []
-        for key in COMPARABLE_POLICY_KEYS:
-            if key == profile.key:
-                results = xgb_results
-            else:
-                results = replay("xgboost", key)
+        policy_timelines: Dict[str, List[Dict[str, Any]]] = {}
+        for key in requested:
+            results = replays[key]
             metrics = calculate_inventory_metrics(results, **cost_kwargs)
+            policy_timelines[key] = _timeline(results)
             policy_comparison.append({
                 **_effective_policy(key, results),
                 "stockout_days": metrics["stockout_days"],
                 "stockout_units": metrics["lost_sales_units"],
                 "service_level": metrics["service_level"],
                 "average_inventory": round(metrics["average_inventory"], 2),
+                "maximum_inventory": round(metrics["maximum_inventory"], 2),
                 "excess_inventory": _excess_inventory(results),
                 "number_of_orders": metrics["number_of_orders"],
                 "total_units_ordered": metrics["total_units_ordered"],
+                "holding_cost": metrics["holding_cost"],
+                "ordering_cost": metrics["ordering_cost"],
+                "stockout_cost": metrics["stockout_cost"],
                 "total_inventory_cost": metrics["total_inventory_cost"],
-            })
-
-        trajectory: List[Dict[str, Any]] = []
-        for index in range(len(xgb_results)):
-            xgb_row = xgb_results.iloc[index]
-            base_row = baseline_results.iloc[index]
-            trajectory.append({
-                "date": str(pd.Timestamp(xgb_row["date"]).date()),
-                "actual_demand": int(xgb_row["demand"]),
-                "xgb_closing_stock": int(xgb_row["closing_stock"]),
-                "baseline_closing_stock": int(base_row["closing_stock"]),
-                "xgb_order_qty": int(xgb_row["order_qty"]),
-                "baseline_order_qty": int(base_row["order_qty"]),
-                "xgb_stockout_units": int(xgb_row["stockout_units"]),
-                "baseline_stockout_units": int(base_row["stockout_units"]),
-                "xgb_inventory_position": int(xgb_row["inventory_position"]),
-                "baseline_inventory_position": int(base_row["inventory_position"]),
-                # Units bought but not yet delivered on the selected policy's
-                # arm, so the chart and the table can show in-transit stock.
-                "xgb_open_order_units": int(xgb_row["open_order_units"]),
-                "baseline_open_order_units": int(base_row["open_order_units"]),
-                "xgb_reorder_point": round(float(xgb_row["reorder_point"]), 2),
-                "baseline_reorder_point": round(float(base_row["reorder_point"]), 2),
             })
 
         return {
@@ -2413,13 +2480,19 @@ class TenantWorkspace:
             # Stated, not implied: the engine replays one product's recorded
             # days and has no notion of a portfolio total.
             "scope": "single_product",
+            "policies_evaluated": list(requested),
             "policy": {
-                **_effective_policy(profile.key, xgb_results),
-                "parameters": custom if profile.accepts_custom else {},
+                **_effective_policy(profile.key, primary_replay),
+                "parameters": custom if profile.key == "custom" else {},
             },
             "policy_comparison": policy_comparison,
+            "policy_timelines": policy_timelines,
             "available_policies": list(describe_profiles()),
             "custom_parameters": describe_custom_fields(),
+            # The forecasting arms are model evaluation, not an inventory
+            # strategy: both ran under the same primary policy, over the same
+            # days, so the only difference between them is how demand was
+            # forecast. Reported here for evaluation, not as a choice.
             "xgb_metrics": xgb_metrics,
             "baseline_metrics": baseline_metrics,
             "cost_comparison": {
@@ -2427,7 +2500,6 @@ class TenantWorkspace:
                 "expected_savings": comparison["expected_savings"],
                 "cost_difference": comparison["cost_difference"],
             },
-            "daily_trajectory": trajectory,
         }
 
     def _recommendation_row(self, product_id: str) -> Dict[str, Any]:

@@ -8,6 +8,7 @@
 import * as http from './http';
 import { toRecommendation } from './adapters';
 import { toSimulationResult } from '../simulationResult';
+import { COMPARABLE_POLICY_KEYS, CUSTOM_POLICY_KEY } from '../simulationPolicy';
 
 // ---------------------------------------------------------------- recommendations
 
@@ -38,14 +39,18 @@ function countByType(items) {
 /**
  * Backtest one product's replenishment over its own recorded history.
  *
- * Two different things are sent, and the server reports them separately:
+ * The user chooses no inventory strategy before running. One request asks the
+ * server to replay every preset, and — when the optional custom experiment is
+ * enabled — the custom strategy as well, so the whole comparison comes back at
+ * once with a timeline per strategy:
  *
- * * ``policy`` — which replenishment rule to replay. The server resolves it
- *   against its own catalogue, so an unsupported key is refused rather than
- *   silently treated as the production rule.
- * * ``policy_params`` — the two values the custom policy accepts. Sent only for
- *   the custom policy; a fixed preset refuses them rather than ignoring what it
- *   would never apply.
+ * * ``policies`` — the strategies to replay. An unsupported key is refused
+ *   server-side rather than silently dropped, so a typo cannot shrink the
+ *   comparison without the page noticing.
+ * * ``policy_params`` — the two values the custom strategy accepts. Sent only
+ *   when the custom strategy is part of the run; a fixed-policy run refuses
+ *   them rather than ignoring what it would never apply. This is what stops a
+ *   preset and a custom value from travelling together.
  *
  * The engine replays a single product's own days, so a wider scope is refused
  * here rather than quietly answered for one of the products in it. That is the
@@ -53,6 +58,7 @@ function countByType(items) {
  */
 export async function runSimulation(user, config) {
   const productId = resolveProductId(config);
+  const custom = Boolean(config.customEnabled);
 
   const result = await http.postBacktest(user, {
     product_id: productId,
@@ -63,8 +69,14 @@ export async function runSimulation(user, config) {
     end_date: config.periodIsDefault ? null : config.endDate || null,
     ordering_cost_per_order: Number(config.orderingCost) || 500,
     stockout_cost_per_unit: Number(config.stockoutCost) || 1000,
-    policy: config.policy || 'current',
-    policy_params: config.policy === 'custom' ? config.policyParams || null : null,
+    policies: custom
+      ? [...COMPARABLE_POLICY_KEYS, CUSTOM_POLICY_KEY]
+      : [...COMPARABLE_POLICY_KEYS],
+    // The custom arm's parameters. The custom strategy is also named as the
+    // primary so the server's top-level detail metrics describe the same arm the
+    // user typed the numbers for.
+    policy: custom ? CUSTOM_POLICY_KEY : 'current',
+    policy_params: custom ? config.customParams || null : null,
   });
 
   return toSimulationResult(result, { ...config, mode: 'api' });

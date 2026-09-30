@@ -179,7 +179,24 @@ export function HealthDonut({ healthy, atRisk, critical, size = 180 }) {
 
 // Stock over time (inventory timeline) --------------------------------------
 
-export function StockLineChart({ points, height = 260, reference = null, formatter }) {
+/**
+ * Stock on hand across the days, with the reorder level as a reference.
+ *
+ * The plain version plots the stock line and nothing else, which is what the
+ * product page wants. Passing `inTransitKey` adds the units already bought but
+ * not yet delivered, and `lostKey` marks the days demand could not be met — the
+ * simulation needs both to be readable, because without them a dip in stock
+ * looks like a strategy that stopped ordering and an empty day looks like a
+ * rounding error.
+ */
+export function StockLineChart({
+  points,
+  height = 260,
+  reference = null,
+  formatter,
+  inTransitKey = null,
+  lostKey = null,
+}) {
   return (
     <ResponsiveContainer width="100%" height={height}>
       <LineChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: -12 }}>
@@ -187,6 +204,17 @@ export function StockLineChart({ points, height = 260, reference = null, formatt
         <XAxis dataKey="date" tick={AXIS_TICK} tickLine={false} axisLine={{ stroke: '#e2e8f0' }} minTickGap={30} />
         <YAxis tick={AXIS_TICK} tickLine={false} axisLine={false} />
         <Tooltip content={<ChartTip formatter={formatter} />} />
+        {inTransitKey && (
+          <Area
+            type="monotone"
+            dataKey={inTransitKey}
+            name="In transit"
+            stroke="none"
+            fill={BAND_COLOR}
+            fillOpacity={0.18}
+            stackId="none"
+          />
+        )}
         <Line
           type="monotone"
           dataKey="stock"
@@ -196,6 +224,18 @@ export function StockLineChart({ points, height = 260, reference = null, formatt
           dot={false}
           activeDot={{ r: 3 }}
         />
+        {lostKey && (
+          <Line
+            type="stepAfter"
+            dataKey={lostKey}
+            name="Demand not met"
+            stroke="#f43f5e"
+            strokeWidth={1.5}
+            strokeDasharray="3 3"
+            dot={false}
+            activeDot={{ r: 3 }}
+          />
+        )}
         {reference !== null && (
           <ReferenceLine y={reference} stroke="#f59e0b" strokeDasharray="4 4" label={{ value: 'Reorder point', fontSize: 10, fill: '#b45309', position: 'insideBottomRight' }} />
         )}

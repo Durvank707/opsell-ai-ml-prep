@@ -1,19 +1,19 @@
 import React, { useMemo, useState } from 'react';
-import { Play, FlaskConical, Info } from 'lucide-react';
+import { Play, FlaskConical, Info, X } from 'lucide-react';
 import Button from './ui/Button';
 import Card from './ui/Card';
 import ProductCombobox from './ProductCombobox';
 import { Field, Input } from './ui/form';
-import { cn } from '../lib/utils';
 import {
+  COST_ASSUMPTIONS,
   CUSTOM_POLICY_FIELDS,
-  CUSTOM_POLICY_KEY,
-  FORECAST_COMPARISON_NOTE,
-  FORECAST_METHODS,
+  FORECASTING_ROLE_NOTE,
   INVENTORY_POLICIES,
   SIMULATION_DISCLAIMER,
+  SIMULATION_PURPOSE,
   SIMULATION_SCOPE_NOTE,
   customPolicyParams,
+  policyLabel,
 } from '../services/simulationPolicy';
 
 // The window the form previews when the user has not chosen one.
@@ -64,6 +64,11 @@ function Step({ number, title, description, children }) {
   );
 }
 
+/** The cost field's plain-language meaning, looked up by its request key. */
+function costMeaning(name) {
+  return COST_ASSUMPTIONS.find((entry) => entry.name === name)?.meaning || '';
+}
+
 export default function SimulationConfig({
   products,
   dataRange = null,
@@ -77,7 +82,7 @@ export default function SimulationConfig({
   const defaultEnd = preview.end || fallback.end;
 
   const [productId, setProductId] = useState(products.length > 0 ? products[0].id : '');
-  const [policy, setPolicy] = useState('current');
+  const [customEnabled, setCustomEnabled] = useState(false);
   const [customValues, setCustomValues] = useState(() =>
     Object.fromEntries(CUSTOM_POLICY_FIELDS.map((field) => [field.name, ''])),
   );
@@ -91,48 +96,49 @@ export default function SimulationConfig({
   const selectedProduct = products.find((p) => p.id === productId) || null;
 
   const handleRun = () => {
-    if (policy === CUSTOM_POLICY_KEY) {
-      const { params, error } = customPolicyParams(customValues);
-      if (error) {
-        setCustomError(error);
-        return;
-      }
-      setCustomError(null);
-      onRun({
-        productIds: productId ? [productId] : [],
-        policy,
-        policyParams: Object.keys(params).length ? params : null,
-        startDate,
-        endDate,
-        periodIsDefault,
-        orderingCost: Number(orderingCost) || 0,
-        stockoutCost: Number(stockoutCost) || 0,
-      });
-      return;
-    }
-
-    onRun({
+    const base = {
       productIds: productId ? [productId] : [],
-      policy,
-      policyParams: null,
       startDate,
       endDate,
       periodIsDefault,
       orderingCost: Number(orderingCost) || 0,
       stockoutCost: Number(stockoutCost) || 0,
-    });
+    };
+
+    // No strategy is chosen here. Every preset runs in the one request, and the
+    // custom strategy is added to that same run when the experiment is switched
+    // on — so the presets are always compared against each other, and a custom
+    // value can never travel alongside a preset selection, because there is no
+    // preset selection to travel with.
+    if (!customEnabled) {
+      onRun({ ...base, customEnabled: false, customParams: null });
+      return;
+    }
+
+    const { params, error } = customPolicyParams(customValues);
+    if (error) {
+      setCustomError(error);
+      return;
+    }
+    setCustomError(null);
+    onRun({ ...base, customEnabled: true, customParams: Object.keys(params).length ? params : null });
+  };
+
+  const toggleCustom = () => {
+    const next = !customEnabled;
+    setCustomEnabled(next);
+    // The error belongs to a panel that is no longer open; leaving it would
+    // surface as a stray red line under the run button.
+    if (!next) setCustomError(null);
   };
 
   return (
-    <Card
-      title="Set up a simulation"
-      subtitle="Replay historical sales and see how an inventory policy would have performed."
-    >
+    <Card title="Set up a simulation" subtitle={SIMULATION_PURPOSE}>
       <div className="space-y-6">
         <Step
           number="1"
           title="Product to simulate"
-          description="Simulation evaluates one product at a time."
+          description={SIMULATION_SCOPE_NOTE}
         >
           {/* A searchable box rather than a select: the catalog is hundreds of
               products long, and the run is scoped to exactly one of them, so
@@ -141,7 +147,7 @@ export default function SimulationConfig({
           <ProductCombobox
             id="sim-product"
             label="Product"
-            hint={SIMULATION_SCOPE_NOTE}
+            hint="Search the catalog to find the product to replay."
             products={products}
             value={productId}
             onChange={setProductId}
@@ -159,86 +165,7 @@ export default function SimulationConfig({
 
         <Step
           number="2"
-          title="Inventory policy"
-          description="How should inventory be managed?"
-        >
-          <div className="space-y-2">
-            {INVENTORY_POLICIES.map((option) => (
-              <label
-                key={option.key}
-                className={cn(
-                  'flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition-colors',
-                  policy === option.key
-                    ? 'border-brand-400 bg-brand-50/60 ring-1 ring-brand-200'
-                    : 'border-slate-200 hover:border-slate-300',
-                )}
-              >
-                <input
-                  type="radio"
-                  name="policy"
-                  className="mt-0.5 accent-brand-600"
-                  checked={policy === option.key}
-                  onChange={() => setPolicy(option.key)}
-                />
-                <span>
-                  <span className="block text-sm font-semibold text-slate-800">
-                    {option.label}
-                  </span>
-                  <span className="block text-xs text-slate-500">{option.description}</span>
-                </span>
-              </label>
-            ))}
-          </div>
-
-          {policy === CUSTOM_POLICY_KEY && (
-            <div className="mt-3 space-y-3 rounded-xl border border-brand-100 bg-brand-50/40 p-4">
-              <p className="flex items-start gap-2 text-xs text-slate-500">
-                <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-brand-500" />
-                These are the only policy parameters the simulator applies. Leave a
-                field blank to use the current policy's own value.
-              </p>
-              <div className="grid gap-3 sm:grid-cols-2">
-                {CUSTOM_POLICY_FIELDS.map((field) => (
-                  <Field
-                    key={field.name}
-                    label={field.label}
-                    hint={field.hint}
-                    htmlFor={`sim-custom-${field.name}`}
-                  >
-                    <Input
-                      id={`sim-custom-${field.name}`}
-                      type="number"
-                      min={field.min}
-                      step={field.integer ? 1 : 0.5}
-                      value={customValues[field.name]}
-                      placeholder={field.placeholder}
-                      onChange={(e) => {
-                        // A number input reports text it cannot represent as an
-                        // empty value, which is indistinguishable from a field the
-                        // user left blank — and blank means "use the current
-                        // policy's value". Without this, pasted nonsense would
-                        // quietly run a different policy than the one on screen.
-                        const badInput = e.target.value === '' && e.target.validity?.badInput;
-                        setCustomError(
-                          badInput ? `${field.label.replace(/\s*\(.*\)$/, '')} must be a number.` : null,
-                        );
-                        setCustomValues((values) => ({
-                          ...values,
-                          [field.name]: e.target.value,
-                        }));
-                      }}
-                    />
-                  </Field>
-                ))}
-              </div>
-              {customError && <p className="text-xs font-semibold text-rose-600">{customError}</p>}
-            </div>
-          )}
-        </Step>
-
-        <Step
-          number="3"
-          title="Historical period to replay"
+          title="Simulation period"
           description="The window of recorded sales the simulation replays."
         >
           <div className="grid gap-3 sm:grid-cols-2">
@@ -275,15 +202,15 @@ export default function SimulationConfig({
         </Step>
 
         <Step
-          number="4"
-          title="Cost assumptions (optional)"
-          description="Used only to price the simulated inventory and stockouts."
+          number="3"
+          title="Cost assumptions"
+          description="Used only to price the simulated inventory and stockouts. Both are optional."
         >
           <div className="grid gap-3 sm:grid-cols-2">
             <Field
               label="Ordering cost (₹ per order)"
               htmlFor="sim-ordering-cost"
-              hint="The fixed cost of placing one purchase order — admin, freight, handling."
+              hint={costMeaning('ordering_cost_per_order')}
             >
               <Input
                 id="sim-ordering-cost"
@@ -296,7 +223,7 @@ export default function SimulationConfig({
             <Field
               label="Stockout cost (₹ per unit)"
               htmlFor="sim-stockout-cost"
-              hint="The margin lost when a unit of demand cannot be fulfilled from stock."
+              hint={costMeaning('stockout_cost_per_unit')}
             >
               <Input
                 id="sim-stockout-cost"
@@ -309,56 +236,131 @@ export default function SimulationConfig({
           </div>
         </Step>
 
-        <Step number="5" title="Run the simulation">
+        <Step number="4" title="Run the simulation">
+          {/* The strategies the run will cover, stated before it happens so the
+              comparison is never a surprise. This is a preview, not a choice:
+              nothing here can be turned off. */}
+          <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3">
+            <p className="text-xs font-semibold text-slate-600">
+              One run replays all of these against the same recorded demand:
+            </p>
+            <ul className="mt-2 space-y-1.5">
+              {INVENTORY_POLICIES.filter((entry) => !entry.acceptsCustom).map((entry) => (
+                <li key={entry.key} className="flex items-baseline gap-2 text-xs">
+                  <span className="font-semibold text-slate-800">{entry.label}</span>
+                  <span className="text-slate-500">{entry.description}</span>
+                </li>
+              ))}
+              {customEnabled && (
+                <li className="flex items-baseline gap-2 text-xs">
+                  <span className="font-semibold text-brand-700">
+                    {policyLabel('custom')}
+                  </span>
+                  <span className="text-slate-500">
+                    {INVENTORY_POLICIES.find((e) => e.key === 'custom')?.description}
+                  </span>
+                </li>
+              )}
+            </ul>
+          </div>
+
           <Button
             onClick={handleRun}
             loading={running}
             icon={running ? undefined : Play}
             disabled={!productId}
-            className="w-full sm:w-auto"
+            className="mt-3 w-full sm:w-auto"
           >
             {running ? 'Running simulation…' : 'Run Simulation'}
           </Button>
-          <p className="mt-2 text-xs text-slate-500">
-            Replay historical sales and see how this policy would have performed.
-          </p>
-          {running && progressStep && <p className="mt-1 text-xs text-slate-400">{progressStep}</p>}
-        </Step>
+          {running && progressStep && <p className="mt-2 text-xs text-slate-400">{progressStep}</p>}
 
-        {/* A different question from the policy above, so it gets its own
-            heading rather than sitting inside the policy step. */}
-        <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4">
-          <div className="flex items-start gap-3">
-            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white text-brand-600 ring-1 ring-slate-200">
-              <FlaskConical className="h-4 w-4" />
-            </span>
-            <div>
-              <p className="text-sm font-bold text-slate-900">
-                Forecast comparison: which forecast performed better?
-              </p>
-              <p className="mt-0.5 text-xs text-slate-500">{FORECAST_COMPARISON_NOTE}</p>
-              <div className="mt-2 flex flex-wrap gap-1.5">
-                {FORECAST_METHODS.map((method) => (
-                  <span
-                    key={method.key}
-                    className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-600"
-                    title={method.description}
+          {/* The optional experiment, deliberately below the CTA: it changes what
+              the run contains, so it is offered after the main action rather
+              than as another required decision above it. */}
+          <div className="mt-4 border-t border-slate-100 pt-4">
+            {!customEnabled ? (
+              <button
+                type="button"
+                onClick={toggleCustom}
+                className="inline-flex items-center gap-1.5 text-xs font-semibold text-brand-600 hover:text-brand-700"
+              >
+                <FlaskConical className="h-3.5 w-3.5" />
+                + Test Custom Policy
+              </button>
+            ) : (
+              <div className="space-y-3 rounded-xl border border-brand-100 bg-brand-50/40 p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-sm font-bold text-slate-900">
+                    Custom policy experiment
+                  </p>
+                  <button
+                    type="button"
+                    onClick={toggleCustom}
+                    aria-label="Close custom policy experiment"
+                    className="rounded-md p-1 text-slate-400 hover:bg-white hover:text-slate-600"
                   >
-                    {method.label}
-                  </span>
-                ))}
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+                <p className="text-xs text-slate-500">
+                  Adds one more strategy to the comparison, alongside Current,
+                  Conservative and Aggressive. {INVENTORY_POLICIES.find((e) => e.key === 'custom')?.description}
+                </p>
+                <p className="flex items-start gap-2 text-xs text-slate-500">
+                  <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-brand-500" />
+                  These are the only policy parameters the simulator applies. Leave a
+                  field blank to use the current policy&apos;s own value.
+                </p>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {CUSTOM_POLICY_FIELDS.map((field) => (
+                    <Field
+                      key={field.name}
+                      label={field.label}
+                      hint={field.hint}
+                      htmlFor={`sim-custom-${field.name}`}
+                    >
+                      <Input
+                        id={`sim-custom-${field.name}`}
+                        type="number"
+                        min={field.min}
+                        step={field.integer ? 1 : 0.5}
+                        value={customValues[field.name]}
+                        placeholder={field.placeholder}
+                        onChange={(e) => {
+                          // A number input reports text it cannot represent as an
+                          // empty value, which is indistinguishable from a field the
+                          // user left blank — and blank means "use the current
+                          // policy's value". Without this, pasted nonsense would
+                          // quietly run a different policy than the one on screen.
+                          const badInput = e.target.value === '' && e.target.validity?.badInput;
+                          setCustomError(
+                            badInput ? `${field.label.replace(/\s*\(.*\)$/, '')} must be a number.` : null,
+                          );
+                          setCustomValues((values) => ({
+                            ...values,
+                            [field.name]: e.target.value,
+                          }));
+                        }}
+                      />
+                    </Field>
+                  ))}
+                </div>
+                {customError && (
+                  <p className="text-xs font-semibold text-rose-600">{customError}</p>
+                )}
               </div>
-              <p className="mt-2 text-xs text-slate-400">
-                This compares forecasting methods, and is separate from the policy you
-                choose above. It runs automatically with every simulation.
-              </p>
-            </div>
+            )}
           </div>
-        </div>
+        </Step>
 
         <p className="flex items-start gap-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
           <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           {SIMULATION_DISCLAIMER}
+        </p>
+        <p className="flex items-start gap-2 text-xs text-slate-400">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          {FORECASTING_ROLE_NOTE}
         </p>
       </div>
     </Card>

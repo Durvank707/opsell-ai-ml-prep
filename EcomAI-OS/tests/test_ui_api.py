@@ -557,7 +557,10 @@ def test_backtest_route_compares_the_model_against_a_baseline():
     body = response.json()
     assert body["product_id"] == "P1"
     assert body["duration_days"] > 0
-    assert len(body["daily_trajectory"]) == body["duration_days"]
+    assert all(
+        len(points) == body["duration_days"]
+        for points in body["policy_timelines"].values()
+    )
     assert "total_inventory_cost" in body["xgb_metrics"]
     assert "total_inventory_cost" in body["baseline_metrics"]
     assert body["cost_comparison"]["recommended_strategy"] in {"xgboost", "baseline"}

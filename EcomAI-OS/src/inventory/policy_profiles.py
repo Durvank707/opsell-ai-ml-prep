@@ -37,6 +37,13 @@ demand in both the reorder point and the order-up-to target. Those are the
 only two knobs a custom policy may set, because they are the only two the
 server honours. Anything omitted falls back to the ``current`` profile's own
 value rather than to a guess.
+
+The ``description`` on each profile is shown to someone who has never seen
+inventory simulation before, so it says what the strategy *does* rather than
+which multiplier produces it. The multipliers stay visible in
+:data:`POLICY_PROFILES` for anyone reading the code or the results payload, and
+the results panel reports the effective numbers each run actually used, so the
+plain wording costs no precision.
 """
 
 from __future__ import annotations
@@ -93,25 +100,19 @@ POLICY_PROFILES: Dict[str, PolicyProfile] = {
     "conservative": PolicyProfile(
         key="conservative",
         label="Conservative",
-        description=(
-            "Keep more safety inventory to reduce stockout risk. Uses 1.5x the "
-            "standard safety stock."
-        ),
+        description="Keeps a larger safety buffer to reduce stockout risk.",
         safety_multiplier=CONSERVATIVE_SAFETY_MULTIPLIER,
     ),
     "aggressive": PolicyProfile(
         key="aggressive",
         label="Aggressive",
-        description=(
-            "Keep leaner inventory to reduce holding cost, accepting more "
-            "stockout risk. Uses 0.5x the standard safety stock."
-        ),
+        description="Uses a smaller safety buffer to keep inventory lean.",
         safety_multiplier=AGGRESSIVE_SAFETY_MULTIPLIER,
     ),
     "custom": PolicyProfile(
         key="custom",
         label="Custom",
-        description="Set your own policy parameters.",
+        description="Uses your selected safety parameters.",
         accepts_custom=True,
     ),
 }

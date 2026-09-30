@@ -12,7 +12,10 @@ import { useAuth } from '../context/AuthContext';
 import { useData } from '../context/DataContext';
 import { useToast } from '../context/ToastContext';
 import { LoadingSkeleton } from '../components/ui/Skeleton';
-import { SIMULATION_DISCLAIMER } from '../services/simulationPolicy';
+import {
+  SIMULATION_DISCLAIMER,
+  SIMULATION_PURPOSE,
+} from '../services/simulationPolicy';
 
 export default function SimulationPage() {
   const { user } = useAuth();
@@ -87,7 +90,7 @@ export default function SimulationPage() {
       <div className="space-y-5">
         <PageHeader
           title="Simulation"
-          subtitle="Replay historical sales and see how an inventory policy would have performed."
+          subtitle={SIMULATION_PURPOSE}
         />
         <LoadingSkeleton rows={3} />
       </div>
@@ -99,13 +102,13 @@ export default function SimulationPage() {
       <div className="space-y-5">
         <PageHeader
           title="Simulation"
-          subtitle="Replay historical sales and see how an inventory policy would have performed."
+          subtitle={SIMULATION_PURPOSE}
         />
         <Card className="py-16">
           <EmptyState
             icon={FlaskConical}
             title="Add products to simulate"
-            description="Simulation evaluates an inventory policy against real demand history. Add products and sales data to get started."
+            description="Simulation replays real demand history to compare inventory strategies. Add products and sales data to get started."
             actionLabel="Add Products"
             onAction={() => window.location.assign('/app/products')}
           />
@@ -120,58 +123,74 @@ export default function SimulationPage() {
     products.find((p) => p.id === lastConfig?.productIds?.[0])?.name || 'the selected product';
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-6">
       <PageHeader
         title="Simulation"
-        subtitle="Replay historical sales and see how an inventory policy would have performed."
+        subtitle={SIMULATION_PURPOSE}
       />
       <p className="rounded-lg bg-slate-100 px-3 py-2 text-xs text-slate-600">
         {SIMULATION_DISCLAIMER}
       </p>
 
-      <div className="grid gap-5 xl:grid-cols-5">
-        <div className="xl:col-span-2">
-          <div className="xl:sticky xl:top-20 xl:max-h-[calc(100vh-6rem)] xl:overflow-y-auto xl:pr-1">
-            <SimulationConfig
-              products={products}
-              dataRange={dataRange}
-              onRun={handleRun}
-              running={running}
-              progressStep={
-                running ? 'Replaying demand, reorders and arrivals day by day…' : ''
-              }
-            />
-          </div>
+      {/*
+        One column, top to bottom: configure, then read. This used to be a
+        five-column grid with the form pinned to the first two columns and the
+        results in the other three. On a long run the results column grew well
+        past the viewport, so the page scrolled while the form stayed pinned —
+        leaving a tall empty column beside results the reader was still working
+        through, and giving the timeline a third of the width it needs. Stacking
+        them keeps both in the normal document flow: the form is read once, and
+        the results get the full content width.
+      */}
+      <section aria-labelledby="simulation-setup-heading">
+        <h2 id="simulation-setup-heading" className="sr-only">
+          Configure simulation
+        </h2>
+        {/* A form is a reading column, not a page. Capping the measure keeps the
+            four steps compact and stops a two-field row stretching the width of
+            the content area; the results below are what use the full width. */}
+        <div className="max-w-4xl">
+          <SimulationConfig
+            products={products}
+            dataRange={dataRange}
+            onRun={handleRun}
+            running={running}
+            progressStep={
+              running ? 'Replaying demand, reorders and arrivals day by day…' : ''
+            }
+          />
         </div>
+      </section>
 
-        <div className="xl:col-span-3">
-          {results ? (
-            <SimulationResults results={results} onRunAnother={() => setResults(null)} />
-          ) : running ? (
-            <Card className="flex flex-col items-center justify-center py-24 text-center">
-              <span className="h-10 w-10 animate-spin rounded-full border-4 border-slate-200 border-t-brand-600" />
-              <h3 className="mt-4 text-base font-bold text-slate-900">Running simulation…</h3>
-              <p className="mt-1 max-w-sm text-sm text-slate-500">
-                Replaying {runningProduct} against its own recorded demand. This usually
-                takes a few seconds.
-              </p>
-            </Card>
-          ) : (
-            <Card className="flex flex-col items-center justify-center py-24 text-center">
-              <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-brand-50 text-brand-600">
-                <FlaskConical className="h-7 w-7" />
-              </div>
-              <h3 className="mt-4 text-base font-bold text-slate-900">Ready to simulate</h3>
-              <p className="mt-1 max-w-md text-sm text-slate-500">
-                Choose a product on the left, pick how its inventory should be managed,
-                and replay its historical sales. The results show how the policy would
-                have performed, how the three standard policies compare, and how the two
-                forecasting methods compare.
-              </p>
-            </Card>
-          )}
-        </div>
-      </div>
+      <section aria-labelledby="simulation-results-heading">
+        <h2 id="simulation-results-heading" className="sr-only">
+          View results
+        </h2>
+        {results ? (
+          <SimulationResults results={results} onRunAnother={() => setResults(null)} />
+        ) : running ? (
+          <Card className="flex flex-col items-center justify-center py-24 text-center">
+            <span className="h-10 w-10 animate-spin rounded-full border-4 border-slate-200 border-t-brand-600" />
+            <h3 className="mt-4 text-base font-bold text-slate-900">Running simulation…</h3>
+            <p className="mt-1 max-w-sm text-sm text-slate-500">
+              Replaying {runningProduct} against its own recorded demand, under each
+              inventory strategy. This usually takes a few seconds.
+            </p>
+          </Card>
+        ) : (
+          <Card className="flex flex-col items-center justify-center py-24 text-center">
+            <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-brand-50 text-brand-600">
+              <FlaskConical className="h-7 w-7" />
+            </div>
+            <h3 className="mt-4 text-base font-bold text-slate-900">Ready to simulate</h3>
+            <p className="mt-1 max-w-md text-sm text-slate-500">
+              Choose a product above and replay its historical sales. One run compares
+              how the standard inventory strategies would each have performed, and the
+              results show every strategy side by side.
+            </p>
+          </Card>
+        )}
+      </section>
     </div>
   );
 }

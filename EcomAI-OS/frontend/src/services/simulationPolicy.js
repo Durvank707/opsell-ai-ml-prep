@@ -15,17 +15,35 @@
 export const SIMULATION_SCOPE = 'single_product';
 
 export const SIMULATION_SCOPE_NOTE =
-  'Portfolio simulation is not available yet. Simulation currently evaluates ' +
-  'one product at a time so the comparison remains like-for-like.';
+  'Simulation evaluates one product at a time so the comparison remains ' +
+  'like-for-like.';
+
+/** What the page is actually doing, for someone who has never seen it before. */
+export const SIMULATION_PURPOSE =
+  'Simulation replays your historical inventory to show how different ' +
+  'inventory strategies would have performed.';
+
+/**
+ * Forecasting is an input to the policy, never a policy of its own. Without
+ * this sentence the results look like they contain a model choice the user made,
+ * which they did not: EcomAI-OS decides how demand is forecast.
+ */
+export const FORECASTING_ROLE_NOTE =
+  'Simulation evaluates inventory strategies. Forecasting is an internal input ' +
+  'to those strategies — EcomAI-OS decides how demand is predicted, so ' +
+  'comparing forecast models is evaluation, not something you choose here.';
 
 export const SIMULATION_DISCLAIMER =
   'This is a historical backtest. It does not change your real inventory or ' +
   'place real purchase orders.';
 
 /**
- * The two independent comparisons the page offers. Kept apart because a policy
- * change and a forecasting change look similar in a table but answer different
- * questions.
+ * The inventory strategies the engine can replay.
+ *
+ * The user does not pick one of these before running. Every preset is evaluated
+ * in the same run against the same recorded demand, so the results show the
+ * comparison rather than one column of it; the list is here for the labels and
+ * explanations the comparison and the tabs need.
  *
  * `safetyMultiplier` and `coverageMultiplier` mirror the constants in
  * `src/inventory/policy_profiles.py`. The server is always the authority on
@@ -45,9 +63,7 @@ export const INVENTORY_POLICIES = [
   {
     key: 'conservative',
     label: 'Conservative',
-    description:
-      'Keep more safety inventory to reduce stockout risk. Uses 1.5x the ' +
-      'standard safety stock.',
+    description: 'Keeps a larger safety buffer to reduce stockout risk.',
     safetyMultiplier: 1.5,
     coverageMultiplier: 1,
     acceptsCustom: false,
@@ -55,9 +71,7 @@ export const INVENTORY_POLICIES = [
   {
     key: 'aggressive',
     label: 'Aggressive',
-    description:
-      'Keep leaner inventory to reduce holding cost, accepting more stockout ' +
-      'risk. Uses 0.5x the standard safety stock.',
+    description: 'Uses a smaller safety buffer to keep inventory lean.',
     safetyMultiplier: 0.5,
     coverageMultiplier: 1,
     acceptsCustom: false,
@@ -65,14 +79,14 @@ export const INVENTORY_POLICIES = [
   {
     key: 'custom',
     label: 'Custom',
-    description: 'Set your own policy parameters.',
+    description: 'Uses your selected safety parameters.',
     safetyMultiplier: 1,
     coverageMultiplier: 1,
     acceptsCustom: true,
   },
 ];
 
-/** The policies whose fixed parameters can be compared side by side. */
+/** The presets every run evaluates, in the order the comparison lists them. */
 export const COMPARABLE_POLICY_KEYS = ['current', 'conservative', 'aggressive'];
 
 export const CUSTOM_POLICY_KEY = 'custom';
@@ -106,6 +120,11 @@ export const CUSTOM_POLICY_FIELDS = [
   },
 ];
 
+/**
+ * The forecasting methods, for the collapsed model-details section only. They
+ * are evaluated by the server for model evaluation; they are not options the
+ * user chooses, because EcomAI-OS controls which model forecasts live demand.
+ */
 export const FORECAST_METHODS = [
   {
     key: 'xgboost',
@@ -119,18 +138,103 @@ export const FORECAST_METHODS = [
   },
 ];
 
-export const FORECAST_COMPARISON_NOTE =
-  'Both methods are tested on the same historical product data so their ' +
-  'inventory outcomes can be compared fairly.';
+/** Why model evaluation is not part of the inventory decision. */
+export const MODEL_DETAILS_NOTE =
+  'This section evaluates forecasting performance. It does not change your ' +
+  'inventory policy.';
 
-export const FORECAST_COMPARISON_MEANING =
-  'The comparison shows how the forecasting method affected the simulated ' +
-  'inventory outcome for this product and period.';
+export const MODEL_DETAILS_MEANING =
+  'Both forecast methods were fed the same recorded demand under the same ' +
+  'inventory policy, so the difference between them is the forecasting method ' +
+  'alone.';
 
+/** Why the strategies differ, stated without picking one. */
 export const POLICY_COMPARISON_NOTE =
-  'Use this comparison to understand the trade-off between keeping more ' +
-  'inventory and reducing stockout risk. The user should draw the conclusion ' +
-  'from the numbers.';
+  'Inventory strategies make different trade-offs between carrying more ' +
+  'inventory and reducing stockout risk. Compare the metrics and inventory ' +
+  'timeline to understand how each strategy behaved.';
+
+/** The tab strip, which shows data already returned rather than re-running. */
+export const POLICY_TABS_NOTE =
+  'Use the tabs to see how the same product would have behaved under each ' +
+  'inventory strategy.';
+
+/**
+ * The business metrics in the comparison, each with the sentence that explains
+ * it. Ordered as a customer would read them: what went wrong, how much of demand
+ * was met, what it cost to hold, and what it took to run.
+ */
+export const POLICY_METRICS = [
+  {
+    key: 'stockout_days',
+    label: 'Stockouts',
+    meaning: 'Days when demand could not be fulfilled because inventory was unavailable.',
+    format: 'days',
+  },
+  {
+    key: 'service_level',
+    label: 'Service Level',
+    meaning: 'Percentage of demand fulfilled without a stockout.',
+    format: 'percent',
+  },
+  {
+    key: 'average_inventory',
+    label: 'Average Inventory',
+    meaning: 'Average amount of inventory held during the simulation.',
+    format: 'units',
+  },
+  {
+    key: 'excess_inventory',
+    label: 'Excess Inventory',
+    meaning:
+      'Average stock held above the safety buffer on days when it was not needed.',
+    format: 'units',
+  },
+  {
+    key: 'number_of_orders',
+    label: 'Orders Placed',
+    meaning: 'Number of purchase orders created during the simulation.',
+    format: 'count',
+  },
+  {
+    key: 'total_inventory_cost',
+    label: 'Inventory Cost',
+    meaning: 'Simulated cost under the selected cost assumptions.',
+    format: 'currency',
+  },
+];
+
+/** The cost assumptions, in the words the form asks the user in. */
+export const COST_ASSUMPTIONS = [
+  {
+    name: 'ordering_cost_per_order',
+    label: 'Ordering cost',
+    meaning: 'Estimated cost each time a purchase order is placed.',
+  },
+  {
+    name: 'stockout_cost_per_unit',
+    label: 'Stockout cost',
+    meaning: 'Estimated business cost when demand cannot be fulfilled.',
+  },
+];
+
+/**
+ * Words the results must never contain.
+ *
+ * A backtest can show how strategies behaved; it cannot know which one a
+ * customer should adopt, and a highlighted column would read as advice the
+ * simulation never gave. Pinned by tests over the rendered panel and by the
+ * catalogue below, so new copy cannot reintroduce it.
+ */
+export const FORBIDDEN_RESULT_LANGUAGE = [
+  'winner',
+  'best policy',
+  'recommended strategy',
+  'optimal',
+  'ranking',
+  'you should',
+  'we recommend',
+];
 
 /** The engine's own order of operations, for the "How simulation works" strip. */
 export const SIMULATION_STEPS = [
@@ -142,6 +246,16 @@ export const SIMULATION_STEPS = [
   'Order arrives after lead time',
   'Metrics are calculated',
 ];
+
+/**
+ * The replenishment rule the replay follows, spelled out for a reader who does
+ * not know what a reorder point is. This is the same rule the live
+ * recommendation uses, which is why the Current column is a faithful replay of
+ * production rather than a separate model of it.
+ */
+export const REPLENISHMENT_RULE =
+  '30-day demand forecast → lead-time demand + safety stock → reorder point → ' +
+  'inventory position (stock + open orders) → recommended order quantity.';
 
 /** One day of cover someone might pick, in the order the form offers them. */
 export const POLICY_LOOKUP = Object.fromEntries(
